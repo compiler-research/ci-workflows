@@ -69,6 +69,20 @@ cmake -G Ninja \
   "${cmake_extra[@]}" \
   ../llvm
 
+# RECIPE_QUICK_CHECK=1 builds only the smallest LLVM library (LLVMDemangle)
+# and exits successfully. Used by verify.yml as a PR-time smoke check
+# that catches host-toolchain mismatches in ~3 min — the actual mode
+# this guards against was a real publish failure post-merge where the
+# runner picked up gcc by default and rejected Clang-only UBSan flags.
+# Building LLVMDemangle exercises the same compiler invocation as the
+# first ~30 source files of the full build without paying the rest of
+# the ~30 min.
+if [[ "${RECIPE_QUICK_CHECK:-0}" == "1" ]]; then
+  ninja -j "${NCPUS}" LLVMDemangle
+  echo "build.sh: RECIPE_QUICK_CHECK passed (cmake configure + LLVMDemangle)."
+  exit 0
+fi
+
 ninja -j "${NCPUS}" clang clangInterpreter clangStaticAnalyzerCore
 
 # compiler-rt is enabled solely for the OOP-JIT runtime that CppInterOp's
