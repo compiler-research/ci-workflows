@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
-# Builds an asan+ubsan-instrumented Clang/LLVM tree.
+# Builds an asan+ubsan-instrumented Clang/LLVM install tree.
+#
+# We publish a cmake --install tree (not a build tree). LLVMConfig.cmake
+# in an install tree uses _IMPORT_PREFIX-relative paths
+# (`set(_IMPORT_PREFIX "${CMAKE_CURRENT_LIST_DIR}/../../..")`, generated
+# by cmake's install(EXPORT) — see
+# https://cmake.org/cmake/help/latest/command/install.html#export), so
+# the consumer can extract the asset under any path. Build trees bake
+# in absolute paths from configure-time and are not relocatable; that's
+# what package-manager LLVM avoids and what we copy.
 #
 # Inputs (env):
 #   RECIPE_VERSION         major LLVM version, e.g. 22
 #   WORK_DIR               scratch directory (clone + build live here)
-#   OUT_DIR                final tree is rsync'd here for tar/upload
+#   OUT_DIR                CMAKE_INSTALL_PREFIX is $OUT_DIR/llvm-project;
+#                          the install lands directly there for tar/upload.
 #   NCPUS                  parallelism (default: nproc)
 #   CMAKE_C_COMPILER_LAUNCHER, CMAKE_CXX_COMPILER_LAUNCHER
 #                          optional, e.g. "ccache" — passed through to cmake
@@ -46,6 +56,7 @@ cmake_extra=()
   cmake_extra+=( -DCMAKE_CXX_COMPILER="${CMAKE_CXX_COMPILER}" )
 
 cmake -G Ninja \
+  -DCMAKE_INSTALL_PREFIX="$OUT_DIR/llvm-project" \
   -DLLVM_ENABLE_PROJECTS="clang;compiler-rt" \
   -DLLVM_TARGETS_TO_BUILD="host;NVPTX" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -79,7 +90,24 @@ cmake -G Ninja \
 # the ~30 min.
 if [[ "${RECIPE_QUICK_CHECK:-0}" == "1" ]]; then
   ninja -j "${NCPUS}" LLVMDemangle
-  echo "build.sh: RECIPE_QUICK_CHECK passed (cmake configure + LLVMDemangle)."
+  # Dry-run every install umbrella we depend on. ninja -n parses the
+  # build graph and exits non-zero on an unknown target, without doing
+  # any work — so an upstream LLVM rename of `install-clang-libraries`,
+  # `install-cmake-exports`, etc. fails this 5-second smoke instead of
+  # the ~30-min publish post-merge.
+  ninja -n \
+    install-clang \
+    install-clang-libraries \
+    install-clang-headers \
+    install-clang-cmake-exports \
+    install-clang-resource-headers \
+    install-clangInterpreter \
+    install-llvm-libraries \
+    install-llvm-headers \
+    install-cmake-exports \
+    install-llvm-config \
+    >/dev/null
+  echo "build.sh: RECIPE_QUICK_CHECK passed (cmake configure + LLVMDemangle + install-target dry-run)."
   exit 0
 fi
 
@@ -112,43 +140,38 @@ else
   echo "build.sh: no orc_rt targets matched; OOP-JIT runtime won't be in the artifact." >&2
 fi
 
-# Trim the tree before rsync — keeps Releases asset under the per-asset
-# 2 GB cap and matches what downstream consumers actually link against.
-#
-# What we keep:
-#   - top-level build/, llvm/, clang/ (the only dirs consumers reach into)
-#   - llvm/{include,lib,cmake} and clang/{include,lib,cmake} on the source side
-#   - build/lib/*.{a,so,dylib} (link targets)
-#   - build/lib/cmake/{llvm,clang}/ (find_package(LLVM)/find_package(Clang))
-#   - build/include/ (generated config + tablegen .inc headers)
-#   - build/tools/clang/include/ (clang's generated headers)
-#   - build/bin/ (FileCheck, llvm-config, etc. that downstream tests need)
-#
-# What we drop, beyond the obvious source-side trim:
-#   - build/**/CMakeFiles/   intermediate build state — every per-target
-#                            *.dir/ subdir under here holds .o, .d, and
-#                            cmake metadata. On asan builds these alone
-#                            are 1-2 GB because asan-instrumented .o
-#                            files are 3-5x the size of regular ones.
-#                            Consumers never need them; we don't do
-#                            incremental rebuilds (cache-or-rebuild model),
-#                            so cmake's incremental scaffolding is dead
-#                            weight in the artifact.
-#   - build/.ninja_deps      ninja's incremental dep graph. Hundreds of
-#     build/.ninja_log       MB on big builds; only useful for `ninja`
-#                            re-runs we never do.
-cd ..
+# Install the umbrella components consumers reach into. Each `install-X`
+# is a phony ninja target that copies one component group's headers,
+# libraries, cmake-exports, etc. into $CMAKE_INSTALL_PREFIX. Cherry-
+# picked rather than running plain `ninja install` so the asset doesn't
+# pull in LLVM tooling (opt, llc, llvm-dis, …) we never load. See
+# https://llvm.org/docs/BuildingADistribution.html for the umbrella
+# convention.
+INSTALL_TARGETS=(
+  install-clang
+  install-clang-libraries
+  install-clang-headers
+  install-clang-cmake-exports
+  install-clang-resource-headers
+  install-clangInterpreter
+  install-llvm-libraries
+  install-llvm-headers
+  install-cmake-exports
+  install-llvm-config
+)
+# install-orc_rt_<platform> targets mirror the OOP_TARGETS we just built.
+for tgt in ${OOP_TARGETS}; do
+  INSTALL_TARGETS+=("install-${tgt}")
+done
 
-shopt -s extglob
-rm -rf -- !(build|llvm|clang)
-( cd llvm  && rm -rf -- !(include|lib|cmake) )
-( cd clang && rm -rf -- !(include|lib|cmake) )
-( cd build && \
-  rm -f compile_commands.json build.ninja .ninja_deps .ninja_log
-  find . -name CMakeFiles -type d -prune -exec rm -rf {} + )
-shopt -u extglob
+ninja -j "${NCPUS}" "${INSTALL_TARGETS[@]}"
 
-rsync -a --delete \
-  "$WORK_DIR/llvm-project/" "$OUT_DIR/llvm-project/"
+# llvm-jitlink-executor's CMakeLists registers an install() rule but no
+# `install-llvm-jitlink-executor` umbrella target. Copy by hand into the
+# install bin/ so consumers that need the OOP executor find it next to
+# clang at $LLVM/bin/llvm-jitlink-executor.
+if [[ -x bin/llvm-jitlink-executor ]]; then
+  install -m 0755 bin/llvm-jitlink-executor "$OUT_DIR/llvm-project/bin/"
+fi
 
 echo "build.sh: done. SRC_COMMIT=${SRC_COMMIT}"
