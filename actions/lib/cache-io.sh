@@ -95,6 +95,28 @@ cache_download() {
   esac
 }
 
+# gh_release_url_parse BASE  → emits "OWNER/REPO<TAB>TAG" on stdout.
+#   Returns 1 if BASE is not a github.com Releases URL. Factored out
+#   from cache_upload so verify.yml can unit-test it without invoking
+#   the full upload path (which needs release-write credentials).
+gh_release_url_parse() {
+  local base
+  base="$(_strip_trailing_slash "$1")"
+  case "$base" in
+    https://github.com/*/releases/download/*)
+      # base = https://github.com/OWNER/REPO/releases/download/TAG
+      local rest owner_repo tag
+      rest="${base#https://github.com/}"
+      owner_repo="${rest%%/releases/*}"
+      tag="${rest#*/releases/download/}"
+      printf '%s\t%s\n' "$owner_repo" "$tag"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # cache_upload BASE KEY ASSET MANIFEST
 #   Stores the asset and manifest at the cache backend.
 #     file://         — cp into the directory (creates if missing)
@@ -114,11 +136,13 @@ cache_upload() {
       cp "$manifest" "$dir/${key}.manifest.json"
       ;;
     https://github.com/*/releases/download/*)
-      # base = https://github.com/OWNER/REPO/releases/download/TAG
-      local rest owner_repo tag
-      rest="${base#https://github.com/}"
-      owner_repo="${rest%%/releases/*}"
-      tag="${rest#*/releases/download/}"
+      local owner_repo tag parsed
+      parsed="$(gh_release_url_parse "$base")" || {
+        echo "cache_upload: failed to parse github URL: $base" >&2
+        return 2
+      }
+      owner_repo="${parsed%$'\t'*}"
+      tag="${parsed#*$'\t'}"
       gh release upload "$tag" "$asset" "$manifest" \
         -R "$owner_repo" --clobber
       ;;
