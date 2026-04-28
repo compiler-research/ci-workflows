@@ -3,13 +3,14 @@ name: publish-recipe
 # Two trigger paths:
 #   workflow_dispatch — operator-driven, single cell from inputs.
 #   push to main      — auto-warm the recipe cache after a merge that
-#                       touched the recipe directory or actions. Each
-#                       cell goes through the same publish-recipe
-#                       action, which skip-if-exists internally so the
-#                       steady state cost is one HEAD probe per cell.
-#
-# When cells.yaml lands the push matrix becomes derived from that file
-# rather than hardcoded.
+#                       touched the recipe directory or actions. The
+#                       push matrix is derived from cells.yaml; a
+#                       preflight job reads cells.yaml, probes the
+#                       Releases cache for each cell, and emits *only*
+#                       the cells whose key is missing. So the
+#                       steady-state cost on a no-op push is one
+#                       preflight runner (~30 s) and zero per-cell
+#                       runners.
 on:
   workflow_dispatch:
     inputs:
@@ -37,6 +38,7 @@ on:
   push:
     branches: [main]
     paths:
+      - 'cells.yaml'
       - 'recipes/**'
       - 'actions/setup-recipe/**'
       - 'actions/publish-recipe/**'
@@ -60,17 +62,60 @@ jobs:
           os: ${{ inputs.os }}
           arch: ${{ inputs.arch }}
 
-  publish-on-push:
+  read-cells:
     if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    outputs:
+      # Matrix `include:` JSON. Empty when every cell is already
+      # published — the publish-on-push job skips itself in that case.
+      matrix: ${{ steps.compute.outputs.matrix }}
+      empty: ${{ steps.compute.outputs.empty }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: compute
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          todo=()
+          # `yq -o=json -I=0 '.cells[]'` emits one compact JSON object per
+          # cell, one per line — safe to read with `while IFS= read -r`.
+          while IFS= read -r cell; do
+            [ -z "$cell" ] && continue
+            recipe=$(echo "$cell" | jq -r .recipe)
+            version=$(echo "$cell" | jq -r .version)
+            os=$(echo "$cell"     | jq -r .os)
+            arch=$(echo "$cell"   | jq -r .arch)
+            key=$(bash actions/setup-recipe/compute-key.sh \
+                    "$recipe" "$version" "$os" "$arch" | sed 's/^key=//')
+            url="https://github.com/${REPO}/releases/download/cache/${key}.tar.zst"
+            if curl -fsLI "$url" >/dev/null 2>&1; then
+              echo "::notice::cache hit, skipping: ${key}"
+            else
+              echo "::notice::needs build: ${key}"
+              todo+=("$cell")
+            fi
+          done < <(yq -o=json -I=0 '.cells[]' cells.yaml)
+
+          if [ ${#todo[@]} -eq 0 ]; then
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::all cells already cached; no per-cell jobs to spawn"
+          else
+            matrix=$(printf '%s\n' "${todo[@]}" | jq -s -c '{include: .}')
+            echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${#todo[@]} cell(s) to (re)build"
+          fi
+
+  publish-on-push:
+    needs: read-cells
+    if: github.event_name == 'push' && needs.read-cells.outputs.empty != 'true'
     name: ${{ matrix.recipe }} v${{ matrix.version }} (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # Hardcoded one-cell matrix for now. Replace with a fromJson
-      # over cells.yaml when that lands.
-      matrix:
-        include:
-          - { recipe: llvm-asan, version: '22', os: ubuntu-24.04, arch: x86_64 }
+      matrix: ${{ fromJson(needs.read-cells.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/install-build-deps

@@ -39,7 +39,7 @@ recipe produces, the next push to `main` rebuilds them, the cache
 repopulates. Bump the LLVM version in your client repo's matrix
 from `'22'` to `'23'` — the key changes (different `version`
 input), `publish-recipe` builds the new cell, leaves the old one
-alone until `prune-cache` (TODO) garbage-collects it.
+alone until `prune-cache` garbage-collects it after `caps.grace_days`.
 
 Things that *don't* move the key, deliberately:
 
@@ -188,11 +188,11 @@ priority until then.
 **Recipe builds aren't host-portable for free.** The first cell
 of a new recipe needs verification on each platform you intend to
 publish for — cmake flag differences, ninja target name
-differences, available libraries. `cells.yaml` (TODO) will
-eventually enumerate which combinations are first-class; until
-then, every cell expansion is a manual integration step done by
-adding a row to the matrix in `publish-recipe.yml` and running
-the workflow once.
+differences, available libraries. `cells.yaml` enumerates which
+combinations are first-class; every cell expansion is a manual
+integration step done by adding a row to `cells.yaml` and either
+dispatching `publish-recipe` once for that cell or letting the
+push trigger pick it up.
 
 ## Adding a new recipe
 
@@ -237,7 +237,8 @@ client repo's matrix. The key changes; on the first PR run after
 the bump, the recipe builds inline (`build-on-miss: true` does
 the right thing); on the next push to ci-workflows main the new
 cell gets warmed. The previous version's cell stays cached until
-`prune-cache` (TODO) drops it.
+either it ages past `caps.grace_days` or you remove it from
+`cells.yaml`, at which point `prune-cache` drops it.
 
 ## Inspecting a published asset
 
