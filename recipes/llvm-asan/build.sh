@@ -114,13 +114,38 @@ fi
 
 # Trim the tree before rsync — keeps Releases asset under the per-asset
 # 2 GB cap and matches what downstream consumers actually link against.
+#
+# What we keep:
+#   - top-level build/, llvm/, clang/ (the only dirs consumers reach into)
+#   - llvm/{include,lib,cmake} and clang/{include,lib,cmake} on the source side
+#   - build/lib/*.{a,so,dylib} (link targets)
+#   - build/lib/cmake/{llvm,clang}/ (find_package(LLVM)/find_package(Clang))
+#   - build/include/ (generated config + tablegen .inc headers)
+#   - build/tools/clang/include/ (clang's generated headers)
+#   - build/bin/ (FileCheck, llvm-config, etc. that downstream tests need)
+#
+# What we drop, beyond the obvious source-side trim:
+#   - build/**/CMakeFiles/   intermediate build state — every per-target
+#                            *.dir/ subdir under here holds .o, .d, and
+#                            cmake metadata. On asan builds these alone
+#                            are 1-2 GB because asan-instrumented .o
+#                            files are 3-5x the size of regular ones.
+#                            Consumers never need them; we don't do
+#                            incremental rebuilds (cache-or-rebuild model),
+#                            so cmake's incremental scaffolding is dead
+#                            weight in the artifact.
+#   - build/.ninja_deps      ninja's incremental dep graph. Hundreds of
+#     build/.ninja_log       MB on big builds; only useful for `ninja`
+#                            re-runs we never do.
 cd ..
 
 shopt -s extglob
 rm -rf -- !(build|llvm|clang)
 ( cd llvm  && rm -rf -- !(include|lib|cmake) )
 ( cd clang && rm -rf -- !(include|lib|cmake) )
-( cd build && rm -f compile_commands.json build.ninja )
+( cd build && \
+  rm -f compile_commands.json build.ninja .ninja_deps .ninja_log
+  find . -name CMakeFiles -type d -prune -exec rm -rf {} + )
 shopt -u extglob
 
 rsync -a --delete \
