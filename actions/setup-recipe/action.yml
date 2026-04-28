@@ -1,8 +1,13 @@
 name: 'Setup recipe'
 description: |
-  Probes ci-workflows' Releases cache for a prebuilt recipe artifact
-  (LLVM-asan, LLVM-wasm, cling, ...) keyed by the recipe inputs and
-  downloads it. On miss, builds the recipe inline from source.
+  Probes a recipe cache for a prebuilt artifact (LLVM-asan,
+  LLVM-wasm, cling, ...) keyed by the recipe inputs and downloads
+  it. On miss, builds the recipe inline from source.
+
+  The cache backend is configurable via cache-base — defaults to the
+  compiler-research/ci-workflows Releases cache, but can point at a
+  local directory (file:///path) or a private webserver
+  (https://lab.local/...) for testing or air-gapped use.
 
 inputs:
   recipe:
@@ -27,25 +32,31 @@ inputs:
     required: false
     default: 'true'
     description: 'On cache miss, build the recipe inline. When false, fail with a copy-pasteable publish-recipe invocation.'
-  cache-repo:
+  cache-base:
     required: false
-    default: 'compiler-research/ci-workflows'
-    description: 'Repository hosting the cache Release'
-  cache-release:
-    required: false
-    default: 'cache'
-    description: 'Release tag name where cache assets are attached'
+    default: ''
+    description: |
+      Base URL for the cache backend. Supported schemes:
+        file:///abs/path  — local directory (act/local testing)
+        https://github.com/<owner>/<repo>/releases/download/<tag>/
+        https://lab.local/recipes/  (read-only)
+      When empty, RECIPE_CACHE_BASE env var wins; if that's also
+      empty the baked-in default points at compiler-research/
+      ci-workflows' Releases cache.
   ref:
     required: false
     default: 'main'
-    description: 'Ref of cache-repo to read recipes/ from. Pin to a sha while iterating.'
+    description: |
+      Ref of compiler-research/ci-workflows to read recipes/ from
+      when computing the key. Pin to a sha while iterating; bump to
+      a tag once the contract is stable.
 
 outputs:
   path:
     description: 'Filesystem path to the recipe build tree'
     value: ${{ steps.finalize.outputs.path }}
   cache-hit:
-    description: '"true" when downloaded from Releases, "false" when built inline'
+    description: '"true" when downloaded from the cache, "false" when built inline'
     value: ${{ steps.finalize.outputs.cache-hit }}
   key:
     description: 'Computed cache key'
@@ -72,7 +83,7 @@ runs:
     - name: Checkout ci-workflows recipes
       uses: actions/checkout@v4
       with:
-        repository: ${{ inputs.cache-repo }}
+        repository: compiler-research/ci-workflows
         ref: ${{ inputs.ref }}
         path: __ci_workflows__
         sparse-checkout: |
@@ -97,25 +108,27 @@ runs:
       shell: bash
       env:
         KEY: ${{ steps.compute-key.outputs.key }}
-        REPO: ${{ inputs.cache-repo }}
-        TAG: ${{ inputs.cache-release }}
+        EXPLICIT_BASE: ${{ inputs.cache-base }}
       run: |
-        url="https://github.com/${REPO}/releases/download/${TAG}/${KEY}.tar.zst"
-        if curl -fsLI "$url" >/dev/null 2>&1; then
+        source __ci_workflows__/actions/lib/cache-io.sh
+        base="$(resolve_cache_base "$EXPLICIT_BASE")"
+        echo "base=$base" >> "$GITHUB_OUTPUT"
+        if cache_probe "$base" "$KEY"; then
           echo "hit=true" >> "$GITHUB_OUTPUT"
-          echo "url=$url" >> "$GITHUB_OUTPUT"
         else
           echo "hit=false" >> "$GITHUB_OUTPUT"
         fi
 
-    - name: Download from Releases
+    - name: Download from cache
       if: steps.probe.outputs.hit == 'true'
       shell: bash
       env:
-        URL: ${{ steps.probe.outputs.url }}
+        KEY: ${{ steps.compute-key.outputs.key }}
+        BASE: ${{ steps.probe.outputs.base }}
       run: |
+        source __ci_workflows__/actions/lib/cache-io.sh
         mkdir -p _llvm_dl
-        curl -fsL "$URL" | zstd -d | tar -xf - -C _llvm_dl
+        cache_download "$BASE" "$KEY" _llvm_dl
         # Recipe's tarball root is `llvm-project/`; surface it at $GITHUB_WORKSPACE.
         if [[ -d _llvm_dl/llvm-project ]]; then
           mv _llvm_dl/llvm-project ./
@@ -149,12 +162,12 @@ runs:
         VERSION: ${{ inputs.version }}
         OS: ${{ steps.slugs.outputs.os }}
         ARCH: ${{ steps.slugs.outputs.arch }}
-        REPO: ${{ inputs.cache-repo }}
       run: |
         {
           echo "::error::no prebuilt for key=${KEY}"
           echo "::error::populate by running:"
-          echo "::error::  gh workflow run publish-recipe.yml -R ${REPO} \\"
+          echo "::error::  gh workflow run publish-recipe.yml \\"
+          echo "::error::    -R compiler-research/ci-workflows \\"
           echo "::error::    -f recipe=${RECIPE} -f version=${VERSION} \\"
           echo "::error::    -f os=${OS} -f arch=${ARCH}"
         } >&2

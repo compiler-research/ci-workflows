@@ -1,11 +1,13 @@
 name: 'Publish recipe'
 description: |
-  Builds a recipe locally (under ccache) and uploads
-  cache/<key>.tar.zst + cache/<key>.manifest.json to a single rolling
-  Release on this repo. Skips work when the asset already exists.
+  Builds a recipe locally (under ccache) and writes
+  cache/<key>.tar.zst + cache/<key>.manifest.json to the configured
+  cache backend. Skips work when the asset already exists.
 
-  Only meant to run inside ci-workflows itself, where GITHUB_TOKEN has
-  release-write permission. Never invoked from client repos.
+  Default backend is this repo's Releases (`gh release upload`); set
+  cache-base to a `file:///abs/path/` URL to write to a local
+  directory instead — useful for ad-hoc lab caches and for the
+  push-driven CI on this repo running through act.
 
 inputs:
   recipe:
@@ -18,9 +20,13 @@ inputs:
   arch:
     required: true
     description: 'Arch slug for the cache key (e.g. "x86_64", "arm64").'
-  release-tag:
+  cache-base:
     required: false
-    default: 'cache'
+    default: ''
+    description: |
+      Where to write the asset. Empty (default) uses RECIPE_CACHE_BASE
+      env var if set, otherwise this repo's Releases cache. Supports
+      file:///abs/path and https://github.com/<owner>/<repo>/releases/download/<tag>/
 
 runs:
   using: composite
@@ -59,10 +65,18 @@ runs:
       shell: bash
       env:
         KEY: ${{ steps.compute-key.outputs.key }}
-        TAG: ${{ inputs.release-tag }}
+        EXPLICIT_BASE: ${{ inputs.cache-base }}
+        DEFAULT_GH_BASE: https://github.com/${{ github.repository }}/releases/download/cache/
       run: |
-        url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${KEY}.tar.zst"
-        if curl -fsLI "$url" >/dev/null 2>&1; then
+        source actions/lib/cache-io.sh
+        # The default for the *publish* path is this repo's own Releases,
+        # not the upstream ci-workflows one. resolve_cache_base falls
+        # back to the upstream default when no override is set, which is
+        # wrong for forks; force the github.repository-derived URL when
+        # neither inputs nor env supply one.
+        base="${EXPLICIT_BASE:-${RECIPE_CACHE_BASE:-$DEFAULT_GH_BASE}}"
+        echo "base=$base" >> "$GITHUB_OUTPUT"
+        if cache_probe "$base" "$KEY"; then
           echo "::notice::cache hit; skipping build for key=${KEY}"
           echo "exists=true" >> "$GITHUB_OUTPUT"
         else
@@ -86,15 +100,23 @@ runs:
         key: ${{ inputs.recipe }}-${{ inputs.version }}-${{ steps.slugs.outputs.os }}-${{ steps.slugs.outputs.arch }}
         max-size: 5G
 
-    - name: Ensure rolling Release exists
-      if: steps.skip.outputs.exists != 'true'
+    # Only github-Releases backends need a Release object created up
+    # front. file:// backends just need the directory to exist; the
+    # cache_upload helper handles that.
+    - name: Ensure rolling Release exists (gh backend only)
+      if: steps.skip.outputs.exists != 'true' && startsWith(steps.skip.outputs.base, 'https://github.com/')
       shell: bash
       env:
-        TAG: ${{ inputs.release-tag }}
+        BASE: ${{ steps.skip.outputs.base }}
         GH_TOKEN: ${{ github.token }}
       run: |
-        if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+        # Extract owner/repo and tag from BASE.
+        rest="${BASE#https://github.com/}"
+        owner_repo="${rest%%/releases/*}"
+        tag="${rest#*/releases/download/}"
+        tag="${tag%/}"
+        if ! gh release view "$tag" -R "$owner_repo" >/dev/null 2>&1; then
+          gh release create "$tag" -R "$owner_repo" \
             --title "Recipe cache" \
             --notes "Rolling cache of prebuilt recipe artifacts. Each asset is keyed by sha256 of (recipe.yaml, build.sh, patches, version, os, arch). See <key>.manifest.json for the inputs that produced any given <key>.tar.zst."
         fi
@@ -131,12 +153,11 @@ runs:
       shell: bash
       env:
         KEY: ${{ steps.compute-key.outputs.key }}
-        TAG: ${{ inputs.release-tag }}
+        BASE: ${{ steps.skip.outputs.base }}
         GH_TOKEN: ${{ github.token }}
       run: |
+        source actions/lib/cache-io.sh
         cd "${{ github.workspace }}/_recipe_out"
         tar -cf - llvm-project | zstd -19 --long > "${KEY}.tar.zst"
         ls -lh "${KEY}.tar.zst"
-        gh release upload "$TAG" \
-          "${KEY}.tar.zst" "${KEY}.manifest.json" \
-          -R "$GITHUB_REPOSITORY" --clobber
+        cache_upload "$BASE" "$KEY" "${KEY}.tar.zst" "${KEY}.manifest.json"

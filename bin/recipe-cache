@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# recipe-cache — local CLI for the recipe cache contract.
+#
+# Same key formula and tarball shape as the GitHub-side actions, with
+# a file:// backend by default. Lets a developer build, mock, fetch,
+# and inspect cached recipes on their own machine without GitHub.
+#
+# Examples:
+#   recipe-cache build llvm-asan 22 ubuntu-24.04 x86_64
+#       Run the recipe's build.sh and store the result locally.
+#
+#   recipe-cache pack llvm-asan 22 darwin arm64 --from /path/to/build
+#       Treat /path/to/build as if a recipe build had produced it
+#       (mockup mode for testing the cache layer without a 30-min build).
+#
+#   recipe-cache get llvm-asan 22 ubuntu-24.04 x86_64 --out /tmp/llvm
+#       Fetch from the local cache and extract under /tmp/llvm/.
+#
+#   recipe-cache list
+#       Show every cell currently cached.
+#
+# Env:
+#   RECIPE_CACHE_DIR   local cache directory (default: ~/.cache/recipe-cache)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=../actions/lib/cache-io.sh
+source "$REPO_ROOT/actions/lib/cache-io.sh"
+
+CACHE_DIR="${RECIPE_CACHE_DIR:-$HOME/.cache/recipe-cache}"
+CACHE_BASE="file://$CACHE_DIR"
+
+usage() {
+  cat <<'EOF'
+Usage: recipe-cache <command> [args]
+
+Commands:
+  build  RECIPE VERSION OS ARCH                  Build via the recipe's build.sh and cache the result.
+  pack   RECIPE VERSION OS ARCH --from PATH      Treat PATH as if a recipe build had produced it (mockup).
+  get    RECIPE VERSION OS ARCH [--out DIR] [--build-on-miss]
+                                                 Fetch + extract from the local cache.
+  key    RECIPE VERSION OS ARCH                  Print the cache key for these inputs.
+  list                                           Show cached cells with sizes.
+  rm     KEY                                     Delete a cached cell by full key.
+
+Env:
+  RECIPE_CACHE_DIR    local cache directory (default: ~/.cache/recipe-cache)
+EOF
+}
+
+die() { echo "recipe-cache: $*" >&2; exit 2; }
+
+compute_key() {
+  local recipe="$1" version="$2" os="$3" arch="$4"
+  bash "$REPO_ROOT/actions/setup-recipe/compute-key.sh" \
+    "$recipe" "$version" "$os" "$arch" "$REPO_ROOT/recipes" \
+    | sed 's/^key=//'
+}
+
+cmd_key() {
+  [[ $# -eq 4 ]] || die "key: expected 4 args (recipe version os arch)"
+  compute_key "$1" "$2" "$3" "$4"
+}
+
+cmd_build() {
+  [[ $# -eq 4 ]] || die "build: expected 4 args (recipe version os arch)"
+  local recipe="$1" version="$2" os="$3" arch="$4"
+  local key; key="$(compute_key "$recipe" "$version" "$os" "$arch")"
+
+  if cache_probe "$CACHE_BASE" "$key"; then
+    echo "skip: $key already cached"
+    return 0
+  fi
+
+  mkdir -p "$CACHE_DIR"
+  local work out
+  work="$(mktemp -d)"
+  out="$(mktemp -d)"
+
+  RECIPE_VERSION="$version" \
+  WORK_DIR="$work" \
+  OUT_DIR="$out" \
+    bash "$REPO_ROOT/recipes/$recipe/build.sh"
+
+  ( cd "$out" && tar -cf - llvm-project | zstd -19 --long > "$CACHE_DIR/${key}.tar.zst" )
+
+  ( cd "$REPO_ROOT" && \
+    SRC_COMMIT="${SRC_COMMIT:-unknown}" \
+    bash actions/publish-recipe/build-manifest.sh \
+      "$recipe" "$version" "$os" "$arch" "$key" \
+      > "$CACHE_DIR/${key}.manifest.json" )
+
+  rm -rf "$work" "$out"
+  echo "built: $CACHE_DIR/${key}.tar.zst"
+}
+
+cmd_pack() {
+  local recipe="" version="" os="" arch="" from=""
+  [[ $# -ge 4 ]] || die "pack: expected at least 4 positional args"
+  recipe="$1"; version="$2"; os="$3"; arch="$4"; shift 4
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from) from="$2"; shift 2 ;;
+      *) die "pack: unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "$from" ]]      || die "pack: --from PATH is required"
+  [[ -d "$from" ]]      || die "pack: --from path is not a directory: $from"
+
+  local key abs_from
+  key="$(compute_key "$recipe" "$version" "$os" "$arch")"
+  abs_from="$(cd "$from" && pwd -P)"
+
+  mkdir -p "$CACHE_DIR"
+  local work; work="$(mktemp -d)"
+
+  # Symlink the source into work/llvm-project so the tarball root
+  # matches what build.sh would produce; tar -h dereferences. This
+  # avoids copying gigabytes when a real LLVM tree is being mocked.
+  ln -s "$abs_from" "$work/llvm-project"
+  ( cd "$work" && tar -chf - llvm-project | zstd -3 > "$CACHE_DIR/${key}.tar.zst" )
+
+  # Synthetic manifest — packed assets carry less provenance than
+  # built ones (no source.commit). Mark them clearly so an operator
+  # can distinguish a mockup from a real build.
+  cat > "$CACHE_DIR/${key}.manifest.json" <<EOF
+{
+  "key": "$key",
+  "recipe": "$recipe",
+  "version": "$version",
+  "platform": {
+    "os": "$os",
+    "arch": "$arch",
+    "runner_image": "local-mockup",
+    "runner_image_version": "n/a"
+  },
+  "source": {
+    "repo": "mockup://",
+    "branch": "n/a",
+    "commit": "n/a"
+  },
+  "ci_workflows_sha": "$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)",
+  "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "packed_from": "$abs_from",
+  "kind": "mockup"
+}
+EOF
+
+  rm -rf "$work"
+  local size; size="$(du -h "$CACHE_DIR/${key}.tar.zst" | awk '{print $1}')"
+  echo "packed: $CACHE_DIR/${key}.tar.zst (${size})"
+}
+
+cmd_get() {
+  local recipe="" version="" os="" arch="" out="" build_on_miss=0
+  [[ $# -ge 4 ]] || die "get: expected at least 4 positional args"
+  recipe="$1"; version="$2"; os="$3"; arch="$4"; shift 4
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --out) out="$2"; shift 2 ;;
+      --build-on-miss) build_on_miss=1; shift ;;
+      *) die "get: unknown arg: $1" ;;
+    esac
+  done
+  out="${out:-$PWD}"
+
+  local key; key="$(compute_key "$recipe" "$version" "$os" "$arch")"
+
+  if cache_probe "$CACHE_BASE" "$key"; then
+    cache_download "$CACHE_BASE" "$key" "$out"
+    echo "hit: $key → $out"
+    return 0
+  fi
+
+  if [[ $build_on_miss -eq 1 ]]; then
+    cmd_build "$recipe" "$version" "$os" "$arch"
+    cache_download "$CACHE_BASE" "$key" "$out"
+    echo "built+got: $key → $out"
+    return 0
+  fi
+
+  echo "miss: $key (no asset in $CACHE_DIR)" >&2
+  echo "  to populate: recipe-cache build $recipe $version $os $arch" >&2
+  return 1
+}
+
+cmd_list() {
+  if [[ ! -d "$CACHE_DIR" ]]; then
+    echo "(no cache at $CACHE_DIR)"
+    return
+  fi
+  local any=0
+  for m in "$CACHE_DIR"/*.manifest.json; do
+    [[ -e "$m" ]] || continue
+    any=1
+    local key size kind
+    key="$(basename "$m" .manifest.json)"
+    size="$(du -h "$CACHE_DIR/${key}.tar.zst" 2>/dev/null | awk '{print $1}')"
+    kind="$(grep -E '"kind"' "$m" 2>/dev/null | sed -E 's/.*"kind"\s*:\s*"([^"]+)".*/\1/' || true)"
+    if [[ -n "$kind" ]]; then
+      printf '%-72s %6s  [%s]\n' "$key" "${size:-?}" "$kind"
+    else
+      printf '%-72s %6s\n'        "$key" "${size:-?}"
+    fi
+  done
+  [[ $any -eq 1 ]] || echo "(empty: $CACHE_DIR)"
+}
+
+cmd_rm() {
+  [[ $# -eq 1 ]] || die "rm: expected 1 arg (key)"
+  local key="$1"
+  if [[ ! -f "$CACHE_DIR/${key}.tar.zst" ]]; then
+    die "rm: no such key: $key"
+  fi
+  rm -f "$CACHE_DIR/${key}.tar.zst" "$CACHE_DIR/${key}.manifest.json"
+  echo "removed: $key"
+}
+
+cmd="${1:-}"
+[[ -n "$cmd" ]] && shift
+case "$cmd" in
+  build) cmd_build "$@" ;;
+  pack)  cmd_pack  "$@" ;;
+  get)   cmd_get   "$@" ;;
+  key)   cmd_key   "$@" ;;
+  list)  cmd_list  "$@" ;;
+  rm)    cmd_rm    "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) echo "unknown command: $cmd" >&2; usage; exit 2 ;;
+esac
