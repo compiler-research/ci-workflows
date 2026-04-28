@@ -79,6 +79,17 @@ ninja -j "${NCPUS}" clang clangInterpreter clangStaticAnalyzerCore
 # clang, not what we'd be building here. The orc_rt target name varies
 # per platform (orc_rt_osx, orc_rt_linux_x86_64, …); enumerate via
 # `ninja -t targets` and build whatever matches, plus the executor.
+#
+# Why: `LLVM_USE_SANITIZER=Address;Undefined` propagates to *every* C/C++
+# target in the build, including orc_rt and llvm-jitlink-executor.
+# The OOP runtime artifacts therefore ship with asan/ubsan
+# instrumentation baked in. This works in practice because CppInterOp's
+# pre-existing asan row goes through the same path (see
+# `Build_LLVM/action.yml` in CppInterOp before this migration), but be
+# aware: a future change that lets the OOP runtime call into untrusted
+# JIT'd code could expose double-instrumentation surprises. If a
+# downstream consumer reports doubled asan reports, this is the place
+# to start looking.
 OOP_TARGETS=$(ninja -t targets all 2>/dev/null | \
   awk -F: '/^orc_rt[^:]*:/{print $1}' | sort -u | tr '\n' ' ')
 if [[ -n "${OOP_TARGETS}" ]]; then
