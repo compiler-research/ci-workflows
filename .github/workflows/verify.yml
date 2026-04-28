@@ -164,3 +164,79 @@ jobs:
           grep -q "fake clang built by recipe v1" /tmp/out/llvm-project/build/bin/clang
           # Manifest sanity
           jq -e .recipe "/tmp/cache/$(bin/recipe-cache key __verify_fixture 1 ubuntu-24.04 x86_64).manifest.json"
+      - name: Negative — get on uncached key fails
+        # The CLI's get without --build-on-miss is the same code shape
+        # as setup-recipe's "fail on miss when build-on-miss=false"
+        # path. Exercising it via the CLI keeps the test self-contained
+        # (no need to invoke the action against an external ref).
+        run: |
+          set -euo pipefail
+          export RECIPE_CACHE_DIR=/tmp/cache-empty
+          if bin/recipe-cache get __verify_fixture 999 ubuntu-24.04 x86_64 --out /tmp/never 2>/dev/null; then
+            echo "::error::recipe-cache get should have failed for unknown key"
+            exit 1
+          fi
+      - name: patches/ folds into the cache key
+        # No real recipe ships patches today (cling will be the first).
+        # Cover the code path now so cling's patches/ gets cache-key
+        # treatment correctly when it lands.
+        run: |
+          set -euo pipefail
+          key_no_patch="$(bin/recipe-cache key __verify_fixture 1 ubuntu-24.04 x86_64)"
+          mkdir -p recipes/__verify_fixture/patches
+          echo "diff goes here" > recipes/__verify_fixture/patches/foo.patch
+          key_with_patch="$(bin/recipe-cache key __verify_fixture 1 ubuntu-24.04 x86_64)"
+          if [ "$key_no_patch" = "$key_with_patch" ]; then
+            echo "::error::adding patches/foo.patch did not move the key"
+            exit 1
+          fi
+          # Editing the patch content also moves the key.
+          echo "different diff" > recipes/__verify_fixture/patches/foo.patch
+          key_changed="$(bin/recipe-cache key __verify_fixture 1 ubuntu-24.04 x86_64)"
+          if [ "$key_with_patch" = "$key_changed" ]; then
+            echo "::error::editing patches/foo.patch did not move the key"
+            exit 1
+          fi
+
+  url-parser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: gh_release_url_parse handles trailing slash, missing slash, non-github
+        # Unit test for the URL parser. The full upload path can't run
+        # from a fork PR (no release-write token); this covers the slug
+        # arithmetic that the action would otherwise feed to gh.
+        run: |
+          set -euo pipefail
+          source actions/lib/cache-io.sh
+          fail=0
+          assert_parse() {
+            local input="$1" want_owner="$2" want_tag="$3" desc="$4"
+            local out
+            if ! out=$(gh_release_url_parse "$input"); then
+              echo "::error::parse failed for $desc: $input"
+              fail=1
+              return
+            fi
+            local got_owner="${out%$'\t'*}"
+            local got_tag="${out#*$'\t'}"
+            if [ "$got_owner" != "$want_owner" ] || [ "$got_tag" != "$want_tag" ]; then
+              echo "::error::$desc: parsed ($got_owner, $got_tag), want ($want_owner, $want_tag)"
+              fail=1
+            fi
+          }
+          assert_reject() {
+            local input="$1" desc="$2"
+            if gh_release_url_parse "$input" >/dev/null 2>&1; then
+              echo "::error::$desc: $input was accepted, should have been rejected"
+              fail=1
+            fi
+          }
+          assert_parse "https://github.com/foo/bar/releases/download/cache/" "foo/bar" "cache" "trailing slash"
+          assert_parse "https://github.com/foo/bar/releases/download/cache"  "foo/bar" "cache" "no trailing slash"
+          assert_parse "https://github.com/compiler-research/ci-workflows/releases/download/v1" \
+                       "compiler-research/ci-workflows" "v1" "real-world URL"
+          assert_reject "file:///some/path"               "file://"
+          assert_reject "https://example.org/foo/bar"     "non-github host"
+          assert_reject "https://github.com/foo/bar"      "github URL but not a Releases path"
+          exit $fail
