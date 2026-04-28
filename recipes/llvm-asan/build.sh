@@ -136,51 +136,61 @@ echo "build.sh: dropping intermediate .o files"
 find . -name '*.o' -delete
 echo "build.sh: post-cleanup disk: $(df -h . | tail -1)"
 
-# Install per-component, NOT via the install-X umbrellas. The umbrellas
-# (install-llvm-libraries especially) phony-depend on every library
-# they group, which forces ninja to *build* libraries the recipe never
-# linked against (LLVMDiff, LLVMDebuginfod, LLVMObjCopy, LLVMSymbolize,
-# LLVMWindowsDriver, …). Each is hundreds of MiB of asan-instrumented
-# intermediate state and that's what ran the runner out of disk on the
-# first attempt at this pivot (GHA reported the runner-shutdown signal
-# at ~27 min into a build that should have completed in ~30). cmake
-# --install --component runs only the component's *install rules* —
-# pure file copies, no rebuild — so libraries that weren't built
-# simply have no source to copy and we let that error pass.
+# Drive the install through LLVM_DISTRIBUTION_COMPONENTS, not raw
+# `cmake --install --component`. The naive per-component approach
+# installs only built libraries, but `cmake-exports` always emits a
+# *complete* LLVMExports.cmake that lists every LLVM library the build
+# tree configured (including ones we never built — LLVMSupportLSP,
+# LLVMDiff, LLVMDebuginfod, …). find_package(LLVM) walks
+# LLVMExports.cmake at consumer time and aborts on any IMPORTED target
+# whose .a is missing, which is exactly what bit CppInterOp's asan row
+# the first time it tried to consume the install tree.
 #
-# See https://llvm.org/docs/BuildingADistribution.html for the LLVM
-# install component convention; each add_llvm_library(X ...) emits an
-# install() rule with COMPONENT X.
+# LLVM_DISTRIBUTION_COMPONENTS scopes the cmake-exports output: when
+# set, install_distribution_exports() in LLVMDistributionSupport.cmake
+# emits an LLVMExports.cmake containing only the listed components. So
+# we compute the list from what we actually built (libclang*.a +
+# libLLVM*.a + OOP_TARGETS + the umbrella headers/exports), reconfigure
+# with that as DISTRIBUTION_COMPONENTS, then `ninja install-distribution`
+# installs only those and writes a self-consistent exports file.
 #
-# cwd is $WORK_DIR/llvm-project/build at this point; pass `.` as the
-# build directory to cmake --install.
+# Reconfigure cost is ~3-5 s (cmake re-emits build.ninja); install-
+# distribution is fast because every listed component is already built.
+#
+# See https://llvm.org/docs/BuildingADistribution.html#options-for-building-an-llvm-distribution
+# and llvm/cmake/modules/LLVMDistributionSupport.cmake.
 
-# Top-level glue: clang binary, headers, cmake-exports, resource headers.
-for comp in clang clang-headers clang-cmake-exports clang-resource-headers \
-            cmake-exports llvm-headers llvm-config clangInterpreter; do
-  cmake --install . --component "$comp" 2>/dev/null \
-    || echo "build.sh: install component $comp had nothing to install" >&2
-done
-
-# Each clang/LLVM library that was built has its own install component
-# named identically to the library. Walk build/lib/ and install only
-# what's there, so we don't pay the asan-instrumented build cost for
-# libraries clang's link closure didn't pull in.
+# Umbrellas + computed per-library list. Headers/cmake-exports umbrellas
+# don't suffer the missing-.a problem because they install source-tree
+# or generated files, not built libraries.
+declare -a DIST_COMPONENTS=(
+  clang
+  clang-headers
+  clang-cmake-exports
+  clang-resource-headers
+  clangInterpreter
+  cmake-exports
+  llvm-headers
+  llvm-config
+)
 for f in lib/libclang*.a lib/libLLVM*.a; do
   [[ -f "$f" ]] || continue
-  comp=$(basename "$f" | sed 's/^lib//; s/\.a$//')
-  cmake --install . --component "$comp" 2>/dev/null || true
+  DIST_COMPONENTS+=("$(basename "$f" | sed 's/^lib//; s/\.a$//')")
+done
+for tgt in ${OOP_TARGETS}; do
+  DIST_COMPONENTS+=("$tgt")
 done
 
-# orc_rt platform variants — same per-component install pattern.
-for tgt in ${OOP_TARGETS}; do
-  cmake --install . --component "$tgt" 2>/dev/null || true
-done
+DIST_STR=$(IFS=';'; echo "${DIST_COMPONENTS[*]}")
+echo "build.sh: LLVM_DISTRIBUTION_COMPONENTS=${DIST_STR}"
+cmake -DLLVM_DISTRIBUTION_COMPONENTS="${DIST_STR}" .
+
+ninja -j "${NCPUS}" install-distribution
 
 # llvm-jitlink-executor's CMakeLists registers an install() rule but
-# the install rule's COMPONENT defaults to "Unspecified" (no umbrella,
-# no component name we can target). Copy by hand into the install bin/
-# so consumers that need the OOP executor find it next to clang at
+# its COMPONENT defaults to "Unspecified", so it can't be in
+# DISTRIBUTION_COMPONENTS. Copy by hand into the install bin/ so
+# consumers that need the OOP executor find it next to clang at
 # $LLVM/bin/llvm-jitlink-executor.
 if [[ -x bin/llvm-jitlink-executor ]]; then
   install -m 0755 bin/llvm-jitlink-executor "$OUT_DIR/llvm-project/bin/"
