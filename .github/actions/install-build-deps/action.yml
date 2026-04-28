@@ -1,0 +1,27 @@
+name: 'Install build dependencies'
+description: |
+  Installs the host-side packages a recipe build needs (ninja, zstd,
+  ccache, rsync). Pulled out of publish-recipe.yml so the dispatch
+  and push jobs share the same install logic.
+
+runs:
+  using: composite
+  steps:
+    - name: Install build dependencies (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build zstd ccache rsync
+
+    - name: Install build dependencies (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install ninja zstd ccache rsync
+
+    - name: Install build dependencies (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        choco install -y ninja zstandard
