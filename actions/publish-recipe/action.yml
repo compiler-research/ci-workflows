@@ -110,11 +110,10 @@ runs:
         BASE: ${{ steps.skip.outputs.base }}
         GH_TOKEN: ${{ github.token }}
       run: |
-        # Extract owner/repo and tag from BASE.
-        rest="${BASE#https://github.com/}"
-        owner_repo="${rest%%/releases/*}"
-        tag="${rest#*/releases/download/}"
-        tag="${tag%/}"
+        source actions/lib/cache-io.sh
+        parsed="$(gh_release_url_parse "$BASE")"
+        owner_repo="${parsed%$'\t'*}"
+        tag="${parsed#*$'\t'}"
         if ! gh release view "$tag" -R "$owner_repo" >/dev/null 2>&1; then
           gh release create "$tag" -R "$owner_repo" \
             --title "Recipe cache" \
