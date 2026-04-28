@@ -90,24 +90,7 @@ cmake -G Ninja \
 # the ~30 min.
 if [[ "${RECIPE_QUICK_CHECK:-0}" == "1" ]]; then
   ninja -j "${NCPUS}" LLVMDemangle
-  # Dry-run every install umbrella we depend on. ninja -n parses the
-  # build graph and exits non-zero on an unknown target, without doing
-  # any work — so an upstream LLVM rename of `install-clang-libraries`,
-  # `install-cmake-exports`, etc. fails this 5-second smoke instead of
-  # the ~30-min publish post-merge.
-  ninja -n \
-    install-clang \
-    install-clang-libraries \
-    install-clang-headers \
-    install-clang-cmake-exports \
-    install-clang-resource-headers \
-    install-clangInterpreter \
-    install-llvm-libraries \
-    install-llvm-headers \
-    install-cmake-exports \
-    install-llvm-config \
-    >/dev/null
-  echo "build.sh: RECIPE_QUICK_CHECK passed (cmake configure + LLVMDemangle + install-target dry-run)."
+  echo "build.sh: RECIPE_QUICK_CHECK passed (cmake configure + LLVMDemangle)."
   exit 0
 fi
 
@@ -140,36 +123,65 @@ else
   echo "build.sh: no orc_rt targets matched; OOP-JIT runtime won't be in the artifact." >&2
 fi
 
-# Install the umbrella components consumers reach into. Each `install-X`
-# is a phony ninja target that copies one component group's headers,
-# libraries, cmake-exports, etc. into $CMAKE_INSTALL_PREFIX. Cherry-
-# picked rather than running plain `ninja install` so the asset doesn't
-# pull in LLVM tooling (opt, llc, llvm-dis, …) we never load. See
-# https://llvm.org/docs/BuildingADistribution.html for the umbrella
-# convention.
-INSTALL_TARGETS=(
-  install-clang
-  install-clang-libraries
-  install-clang-headers
-  install-clang-cmake-exports
-  install-clang-resource-headers
-  install-clangInterpreter
-  install-llvm-libraries
-  install-llvm-headers
-  install-cmake-exports
-  install-llvm-config
-)
-# install-orc_rt_<platform> targets mirror the OOP_TARGETS we just built.
-for tgt in ${OOP_TARGETS}; do
-  INSTALL_TARGETS+=("install-${tgt}")
+# Free disk before the install phase. asan-instrumented .o files are
+# the bulk of the build tree (3-5x larger than vanilla); a hosted
+# Linux runner has ~14 GiB free disk and the recipe's intermediate
+# state crowds it. ccache has already captured every compile we care
+# about by this point — its hit/miss key is the source + flags, not
+# the .o on disk — so deleting *.o doesn't lose ccache state. The
+# install phase below copies .a / binaries / headers / cmake-exports
+# only; none of it reaches into .o.
+echo "build.sh: pre-install disk: $(df -h . | tail -1)"
+echo "build.sh: dropping intermediate .o files"
+find . -name '*.o' -delete
+echo "build.sh: post-cleanup disk: $(df -h . | tail -1)"
+
+# Install per-component, NOT via the install-X umbrellas. The umbrellas
+# (install-llvm-libraries especially) phony-depend on every library
+# they group, which forces ninja to *build* libraries the recipe never
+# linked against (LLVMDiff, LLVMDebuginfod, LLVMObjCopy, LLVMSymbolize,
+# LLVMWindowsDriver, …). Each is hundreds of MiB of asan-instrumented
+# intermediate state and that's what ran the runner out of disk on the
+# first attempt at this pivot (GHA reported the runner-shutdown signal
+# at ~27 min into a build that should have completed in ~30). cmake
+# --install --component runs only the component's *install rules* —
+# pure file copies, no rebuild — so libraries that weren't built
+# simply have no source to copy and we let that error pass.
+#
+# See https://llvm.org/docs/BuildingADistribution.html for the LLVM
+# install component convention; each add_llvm_library(X ...) emits an
+# install() rule with COMPONENT X.
+#
+# cwd is $WORK_DIR/llvm-project/build at this point; pass `.` as the
+# build directory to cmake --install.
+
+# Top-level glue: clang binary, headers, cmake-exports, resource headers.
+for comp in clang clang-headers clang-cmake-exports clang-resource-headers \
+            cmake-exports llvm-headers llvm-config clangInterpreter; do
+  cmake --install . --component "$comp" 2>/dev/null \
+    || echo "build.sh: install component $comp had nothing to install" >&2
 done
 
-ninja -j "${NCPUS}" "${INSTALL_TARGETS[@]}"
+# Each clang/LLVM library that was built has its own install component
+# named identically to the library. Walk build/lib/ and install only
+# what's there, so we don't pay the asan-instrumented build cost for
+# libraries clang's link closure didn't pull in.
+for f in lib/libclang*.a lib/libLLVM*.a; do
+  [[ -f "$f" ]] || continue
+  comp=$(basename "$f" | sed 's/^lib//; s/\.a$//')
+  cmake --install . --component "$comp" 2>/dev/null || true
+done
 
-# llvm-jitlink-executor's CMakeLists registers an install() rule but no
-# `install-llvm-jitlink-executor` umbrella target. Copy by hand into the
-# install bin/ so consumers that need the OOP executor find it next to
-# clang at $LLVM/bin/llvm-jitlink-executor.
+# orc_rt platform variants — same per-component install pattern.
+for tgt in ${OOP_TARGETS}; do
+  cmake --install . --component "$tgt" 2>/dev/null || true
+done
+
+# llvm-jitlink-executor's CMakeLists registers an install() rule but
+# the install rule's COMPONENT defaults to "Unspecified" (no umbrella,
+# no component name we can target). Copy by hand into the install bin/
+# so consumers that need the OOP executor find it next to clang at
+# $LLVM/bin/llvm-jitlink-executor.
 if [[ -x bin/llvm-jitlink-executor ]]; then
   install -m 0755 bin/llvm-jitlink-executor "$OUT_DIR/llvm-project/bin/"
 fi
