@@ -1,0 +1,167 @@
+name: verify
+
+# PR-time sanity checks for the recipe cache contract. All jobs run
+# read-only — no upload risk if the PR comes from a fork.
+#
+# Deliberately omits the full recipe build (~30 min for asan). That
+# coverage happens at merge time via publish-recipe.yml's push trigger;
+# the jobs here catch the cheap-to-detect contract failures before merge.
+on:
+  pull_request:
+    paths:
+      - 'recipes/**'
+      - 'actions/**'
+      - 'bin/**'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+jobs:
+  lint-actions:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        run: |
+          docker run --rm \
+            -v "$PWD":/repo -w /repo \
+            rhysd/actionlint:latest -color
+
+  compute-key-parity:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Identical key from repo root and from sparse-checkout subdir
+        run: |
+          set -euo pipefail
+          a="$(bash actions/setup-recipe/compute-key.sh llvm-asan 22 ubuntu-24.04 x86_64)"
+          mkdir -p /tmp/sim/__ci_workflows__
+          rsync -a recipes /tmp/sim/__ci_workflows__/
+          rsync -a actions /tmp/sim/__ci_workflows__/
+          b="$(cd /tmp/sim/__ci_workflows__ && bash actions/setup-recipe/compute-key.sh llvm-asan 22 ubuntu-24.04 x86_64)"
+          c="$(bash actions/setup-recipe/compute-key.sh llvm-asan 22 ubuntu-24.04 x86_64 "$PWD/recipes")"
+          [ "$a" = "$b" ] || { echo "::error::root vs subdir key mismatch: $a vs $b"; exit 1; }
+          [ "$a" = "$c" ] || { echo "::error::relative vs absolute recipe_root mismatch: $a vs $c"; exit 1; }
+          echo "OK: $a"
+      - name: Each input perturbation moves the key
+        run: |
+          set -euo pipefail
+          base="$(bash actions/setup-recipe/compute-key.sh llvm-asan 22 ubuntu-24.04 x86_64)"
+          for change in version os arch; do
+            case "$change" in
+              version) k="$(bash actions/setup-recipe/compute-key.sh llvm-asan 99 ubuntu-24.04 x86_64)" ;;
+              os)      k="$(bash actions/setup-recipe/compute-key.sh llvm-asan 22 macos-26     x86_64)" ;;
+              arch)    k="$(bash actions/setup-recipe/compute-key.sh llvm-asan 22 ubuntu-24.04 arm64)"  ;;
+            esac
+            [ "$base" != "$k" ] || { echo "::error::$change perturbation did not move key"; exit 1; }
+          done
+          # Perturb recipe.yaml content.
+          orig="$(sha256sum recipes/llvm-asan/recipe.yaml)"
+          echo "# verify-test perturbation" >> recipes/llvm-asan/recipe.yaml
+          k="$(bash actions/setup-recipe/compute-key.sh llvm-asan 22 ubuntu-24.04 x86_64)"
+          [ "$base" != "$k" ] || { echo "::error::recipe.yaml edit did not move key"; exit 1; }
+          # Restore for any later steps in this job (paranoia).
+          git checkout -- recipes/llvm-asan/recipe.yaml
+          echo "OK: all perturbations moved the key"
+
+  manifest-schema:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: build-manifest.sh emits valid JSON
+        run: |
+          set -euo pipefail
+          export SRC_COMMIT=mock-src GITHUB_SHA=mock-ci ImageOS=mock-os ImageVersion=mock-ver
+          bash actions/publish-recipe/build-manifest.sh \
+            llvm-asan 22 ubuntu-24.04 x86_64 mock-key | jq -e .
+
+  recipe-yaml-no-dead-fields:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every recipe.yaml top-level key is read somewhere
+        # Catches the drift the red-team review flagged: decorative
+        # fields silently accumulating in recipe.yaml that nothing
+        # consumes. Every top-level key must appear in at least one
+        # of: the recipe's build.sh, the actions, or bin/.
+        #
+        # We deliberately use `for key in $(...)` rather than `while
+        # read` so the loop runs in the parent shell and `fail=1` is
+        # visible after the loop. Recipe keys are simple identifiers
+        # so word-splitting on $(...) is safe here.
+        run: |
+          set -uo pipefail
+          fail=0
+          for r in recipes/*/recipe.yaml; do
+            recipe_dir="$(dirname "$r")"
+            keys=$(grep -E '^[a-z_]+:' "$r" | sed -E 's/:.*//' | sort -u)
+            for key in $keys; do
+              if ! grep -q -r -F "$key" \
+                "$recipe_dir/build.sh" \
+                actions/setup-recipe/ \
+                actions/publish-recipe/ \
+                actions/lib/ \
+                bin/ 2>/dev/null; then
+                echo "::error file=$r::dead field '$key' (not read by build.sh, actions, or bin)"
+                fail=1
+              fi
+            done
+          done
+          exit $fail
+
+  tar-zstd-round-trip:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Tiny tree round-trip via the publish/consume pipelines
+        run: |
+          set -euo pipefail
+          mkdir -p src/llvm-project/build/lib src/llvm-project/llvm/include
+          echo "header" > src/llvm-project/llvm/include/foo.h
+          printf 'binary\x00\x01\x02' > src/llvm-project/build/lib/libfoo.a
+          ( cd src && tar -cf - llvm-project | zstd -19 --long > /tmp/c.tar.zst )
+          mkdir dest
+          cat /tmp/c.tar.zst | zstd -d | tar -xf - -C dest
+          diff -r src/llvm-project dest/llvm-project
+
+  end-to-end-fixture:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zstd jq
+      - name: Pack + get round-trip via the CLI
+        # Synthesises a fake recipe directory, builds it via the CLI,
+        # then fetches it back. Catches contract breaks across
+        # compute-key, cache-io, and the CLI itself in one ~10-second
+        # pass — without the 30-min real-recipe build cost.
+        run: |
+          set -euo pipefail
+          export RECIPE_CACHE_DIR=/tmp/cache
+          mkdir -p recipes/__verify_fixture
+          cat > recipes/__verify_fixture/recipe.yaml <<'EOF'
+          recipe: __verify_fixture
+          description: synthetic fixture used by verify.yml end-to-end-fixture job
+          source:
+            repo: file:///none
+            branch_template: 'none-{version}'
+          EOF
+          cat > recipes/__verify_fixture/build.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          mkdir -p "$OUT_DIR/llvm-project/build/bin"
+          echo "fake clang built by recipe v${RECIPE_VERSION}" \
+            > "$OUT_DIR/llvm-project/build/bin/clang"
+          EOF
+          chmod +x recipes/__verify_fixture/build.sh
+          bin/recipe-cache build __verify_fixture 1 ubuntu-24.04 x86_64
+          bin/recipe-cache list
+          mkdir /tmp/out
+          bin/recipe-cache get __verify_fixture 1 ubuntu-24.04 x86_64 --out /tmp/out
+          test -f /tmp/out/llvm-project/build/bin/clang
+          grep -q "fake clang built by recipe v1" /tmp/out/llvm-project/build/bin/clang
+          # Manifest sanity
+          jq -e .recipe "/tmp/cache/$(bin/recipe-cache key __verify_fixture 1 ubuntu-24.04 x86_64).manifest.json"
