@@ -46,7 +46,7 @@ cmake_extra=()
   cmake_extra+=( -DCMAKE_CXX_COMPILER="${CMAKE_CXX_COMPILER}" )
 
 cmake -G Ninja \
-  -DLLVM_ENABLE_PROJECTS=clang \
+  -DLLVM_ENABLE_PROJECTS="clang;compiler-rt" \
   -DLLVM_TARGETS_TO_BUILD="host;NVPTX" \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_ASSERTIONS=ON \
@@ -58,10 +58,34 @@ cmake -G Ninja \
   -DLLVM_INCLUDE_BENCHMARKS=OFF \
   -DLLVM_INCLUDE_EXAMPLES=OFF \
   -DLLVM_INCLUDE_TESTS=OFF \
+  -DCOMPILER_RT_BUILD_BUILTINS=OFF \
+  -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+  -DCOMPILER_RT_BUILD_PROFILE=OFF \
+  -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+  -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+  -DCOMPILER_RT_BUILD_XRAY=OFF \
+  -DCOMPILER_RT_BUILD_GWP_ASAN=OFF \
+  -DCOMPILER_RT_BUILD_CTX_PROFILE=OFF \
   "${cmake_extra[@]}" \
   ../llvm
 
 ninja -j "${NCPUS}" clang clangInterpreter clangStaticAnalyzerCore
+
+# compiler-rt is enabled solely for the OOP-JIT runtime that CppInterOp's
+# clang-repl-based driver uses. We deliberately turn off every other
+# compiler-rt component (sanitizers, fuzzer, profile, memprof, xray,
+# gwp_asan, ctx_profile, builtins) so the build stays cheap — the asan
+# *runtime* CppInterOp links against is whatever ships with the host
+# clang, not what we'd be building here. The orc_rt target name varies
+# per platform (orc_rt_osx, orc_rt_linux_x86_64, …); enumerate via
+# `ninja -t targets` and build whatever matches, plus the executor.
+OOP_TARGETS=$(ninja -t targets all 2>/dev/null | \
+  awk -F: '/^orc_rt[^:]*:/{print $1}' | sort -u | tr '\n' ' ')
+if [[ -n "${OOP_TARGETS}" ]]; then
+  ninja -j "${NCPUS}" llvm-jitlink-executor ${OOP_TARGETS}
+else
+  echo "build.sh: no orc_rt targets matched; OOP-JIT runtime won't be in the artifact." >&2
+fi
 
 # Trim the tree before rsync — keeps Releases asset under the per-asset
 # 2 GB cap and matches what downstream consumers actually link against.
