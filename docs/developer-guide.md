@@ -134,6 +134,14 @@ The cache directory is `~/.cache/recipe-cache` (override with
 `<key>.manifest.json` files — no database, no daemon, no lock
 file.
 
+> **Mockups aren't safe to share.** A `recipe-cache pack` tarball
+> bears the same key shape as a real publish — `setup-recipe` will
+> happily download and trust it. The manifest's `kind: mockup`
+> field is documentation only, not enforced. Treat
+> `~/.cache/recipe-cache` as machine-local; don't rsync mockup
+> entries to a shared cache. (The publish path on the action side
+> won't accept a mockup, but a hand-crafted upload could.)
+
 To point a CppInterOp / clad / cppyy job at your local cache
 when you run it under `act`:
 
