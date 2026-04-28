@@ -2,6 +2,14 @@
 # Scheme-aware probe / download / upload primitives for the recipe
 # cache. Source this from an action or from bin/recipe-cache.
 #
+# FIXME(port-to-python): Bash + git-bash works on every GHA runner
+# (including Windows via shell: bash) but the dev-facing CLI doesn't
+# run natively on Windows CMD/PowerShell. When the first Windows-native
+# developer flow shows up, port this lib + bin/recipe-cache to
+# stdlib-only Python (subprocess, hashlib, urllib, tarfile, json) and
+# have the actions invoke `python3 actions/lib/cache_io.py <op> ...`
+# instead of sourcing this file.
+#
 # Supported schemes:
 #   file:///abs/path  — local directory acting as the cache backend
 #                       (developer machines, act runs, NFS mounts)

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # recipe-cache — local CLI for the recipe cache contract.
 #
+# FIXME(port-to-python): bash works on Linux/macOS and on Windows via
+# git-bash, but not on bare CMD/PowerShell. When a Windows-native
+# developer flow needs this, port to stdlib-only Python alongside
+# actions/lib/cache-io.sh. See the FIXME at the top of that file.
+#
 # Same key formula and tarball shape as the GitHub-side actions, with
 # a file:// backend by default. Lets a developer build, mock, fetch,
 # and inspect cached recipes on their own machine without GitHub.
