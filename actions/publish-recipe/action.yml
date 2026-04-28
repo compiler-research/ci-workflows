@@ -170,5 +170,19 @@ runs:
             --checkpoint=100000 --checkpoint-action=echo='%T tar checkpoint' \
           | zstd -19 --long -T0 > "${KEY}.tar.zst"
         ls -lh "${KEY}.tar.zst"
-        echo "::notice::uploading to $BASE"
+        # The notice URL: $BASE is the asset *prefix*
+        # (https://.../releases/download/cache/) which 404s when clicked
+        # because that exact path doesn't serve content. Show the
+        # release-page URL (.../releases/tag/cache) so a reviewer
+        # clicking the notice in the GHA log lands on the actual
+        # release. file:// backends fall through to the raw $BASE.
+        if [[ "$BASE" == https://github.com/*/releases/download/*/ ]]; then
+          parsed="$(gh_release_url_parse "$BASE")"
+          owner_repo="${parsed%$'\t'*}"
+          tag="${parsed#*$'\t'}"
+          release_url="https://github.com/${owner_repo}/releases/tag/${tag}"
+        else
+          release_url="$BASE"
+        fi
+        echo "::notice::uploading ${KEY} to ${release_url}"
         cache_upload "$BASE" "$KEY" "${KEY}.tar.zst" "${KEY}.manifest.json"
