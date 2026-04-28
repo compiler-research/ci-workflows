@@ -1,0 +1,67 @@
+name: publish-recipe
+
+# First slice: workflow_dispatch only. Once cells.yaml lands we'll add
+# a push trigger that recomputes keys and rebuilds anything missing.
+on:
+  workflow_dispatch:
+    inputs:
+      recipe:
+        type: choice
+        required: true
+        options:
+          - llvm-asan
+      version:
+        type: string
+        required: true
+        default: '22'
+      # The first slice publishes a single cell. Each new cell expands
+      # the os/arch options after its build.sh has been verified on
+      # that platform (recipe builds aren't host-portable for free).
+      os:
+        type: choice
+        required: true
+        options:
+          - ubuntu-24.04
+        default: ubuntu-24.04
+      arch:
+        type: choice
+        required: true
+        options:
+          - x86_64
+        default: x86_64
+
+permissions:
+  contents: write   # release upload
+
+jobs:
+  publish:
+    name: ${{ inputs.recipe }} v${{ inputs.version }} (${{ inputs.os }}/${{ inputs.arch }})
+    runs-on: ${{ inputs.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build zstd ccache rsync
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install ninja zstd ccache rsync
+
+      - name: Install build dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install -y ninja zstandard
+
+      - uses: ./actions/publish-recipe
+        with:
+          recipe: ${{ inputs.recipe }}
+          version: ${{ inputs.version }}
+          os: ${{ inputs.os }}
+          arch: ${{ inputs.arch }}
