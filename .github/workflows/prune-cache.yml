@@ -1,0 +1,155 @@
+name: prune-cache
+
+# Converges the Releases cache to what cells.yaml says should be there.
+# Runs after every successful publish-recipe completion (so newly
+# uploaded assets exist in their canonical key form before pruning),
+# plus weekly on a schedule as a watchdog, plus manually.
+#
+# Algorithm:
+#   1. Compute expected_keys = { compute-key for each cell in cells.yaml }.
+#   2. List existing assets on the rolling Release.
+#   3. orphans = existing − expected.
+#   4. Drop orphans whose age > caps.grace_days (so in-flight PRs that
+#      reference an old key aren't broken mid-run by the prune).
+#   5. Tally remaining storage; warn over caps.soft_gb, fail over
+#      caps.hard_gb.
+#
+# What grace_days protects: when a recipe build.sh is edited, the
+# cache key for every affected cell moves. The next push warms the new
+# keys; the old assets become orphans. A PR opened a day before the
+# edit and tested a day after still references the old key and pulls
+# the old asset. Holding orphans for `grace_days` (default 7) lets
+# those in-flight PRs finish before the asset disappears.
+on:
+  workflow_run:
+    workflows: [publish-recipe]
+    types: [completed]
+  schedule:
+    # Weekly watchdog. UTC; pick a low-traffic time.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # delete release assets
+
+jobs:
+  prune:
+    # Don't prune on a *failed* publish-recipe run — bad data could mean
+    # we'd evict still-needed assets. The schedule and dispatch paths
+    # always run.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute expected keys
+        id: expected
+        run: |
+          set -euo pipefail
+          : > /tmp/expected_keys.txt
+          while IFS= read -r cell; do
+            [ -z "$cell" ] && continue
+            recipe=$(echo "$cell" | jq -r .recipe)
+            version=$(echo "$cell" | jq -r .version)
+            os=$(echo "$cell"     | jq -r .os)
+            arch=$(echo "$cell"   | jq -r .arch)
+            key=$(bash actions/setup-recipe/compute-key.sh \
+                    "$recipe" "$version" "$os" "$arch" | sed 's/^key=//')
+            echo "$key" >> /tmp/expected_keys.txt
+          done < <(yq -o=json -I=0 '.cells[]' cells.yaml)
+          sort -u -o /tmp/expected_keys.txt /tmp/expected_keys.txt
+          n=$(wc -l < /tmp/expected_keys.txt | tr -d ' ')
+          echo "::notice::expected $n key(s) from cells.yaml"
+          cat /tmp/expected_keys.txt
+
+      - name: List existing release assets
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # No Release yet → nothing to prune. Exit cleanly.
+          if ! gh release view cache -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::no 'cache' release yet; nothing to prune"
+            : > /tmp/existing_assets.jsonl
+            exit 0
+          fi
+          # `--jq` over `.assets[]` flattens to one JSON object per line.
+          gh release view cache -R "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[] | {name, size, createdAt}' \
+            > /tmp/existing_assets.jsonl
+          n=$(wc -l < /tmp/existing_assets.jsonl | tr -d ' ')
+          echo "::notice::found $n asset(s) on cache release"
+
+      - name: Compute orphans + drop those past grace
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ ! -s /tmp/existing_assets.jsonl ]; then
+            echo "::notice::no existing assets; nothing to do"
+            exit 0
+          fi
+          grace_days=$(yq '.caps.grace_days' cells.yaml)
+          now=$(date -u +%s)
+          # For every .tar.zst whose key (filename minus .tar.zst)
+          # isn't in /tmp/expected_keys.txt and whose age exceeds
+          # grace_days, delete it and its sibling .manifest.json.
+          dropped=0
+          kept=0
+          while IFS= read -r asset; do
+            name=$(echo "$asset" | jq -r .name)
+            case "$name" in
+              *.tar.zst)        key="${name%.tar.zst}" ;;
+              *.manifest.json)  continue ;;  # handled with its tarball
+              *)                echo "::warning::unexpected asset: $name"; continue ;;
+            esac
+            if grep -qxF "$key" /tmp/expected_keys.txt; then
+              kept=$((kept + 1))
+              continue
+            fi
+            created=$(echo "$asset" | jq -r .createdAt)
+            created_epoch=$(date -u -d "$created" +%s 2>/dev/null || true)
+            if [ -z "$created_epoch" ]; then
+              echo "::warning::could not parse createdAt='$created' for $key; keeping"
+              kept=$((kept + 1))
+              continue
+            fi
+            age_days=$(( (now - created_epoch) / 86400 ))
+            if [ "$age_days" -lt "$grace_days" ]; then
+              echo "::notice::orphan within grace ($age_days/$grace_days days): $key"
+              kept=$((kept + 1))
+              continue
+            fi
+            echo "::notice::dropping orphan ($age_days days old): $key"
+            gh release delete-asset cache "${key}.tar.zst" \
+              -R "$GITHUB_REPOSITORY" --yes || true
+            gh release delete-asset cache "${key}.manifest.json" \
+              -R "$GITHUB_REPOSITORY" --yes || true
+            dropped=$((dropped + 1))
+          done < /tmp/existing_assets.jsonl
+          echo "::notice::prune summary: dropped=$dropped kept=$kept"
+
+      - name: Enforce caps
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view cache -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            exit 0
+          fi
+          soft=$(yq '.caps.soft_gb' cells.yaml)
+          hard=$(yq '.caps.hard_gb' cells.yaml)
+          total_bytes=$(gh release view cache -R "$GITHUB_REPOSITORY" \
+            --json assets --jq '[.assets[].size] | add // 0')
+          # Convert to GB (binary GiB so 1024^3 — close enough for caps).
+          total_gb=$(( total_bytes / 1073741824 ))
+          echo "::notice::cache size: ${total_gb} GiB (soft cap ${soft}, hard cap ${hard})"
+          if [ "$total_gb" -gt "$hard" ]; then
+            echo "::error::cache size ${total_gb} GiB exceeds hard cap ${hard} GiB"
+            exit 1
+          fi
+          if [ "$total_gb" -gt "$soft" ]; then
+            echo "::warning::cache size ${total_gb} GiB exceeds soft cap ${soft} GiB"
+          fi

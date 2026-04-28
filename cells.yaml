@@ -1,0 +1,33 @@
+# cells.yaml — single source of truth for what the recipe cache holds.
+#
+# Every entry under `cells:` is a (recipe, version, os, arch) tuple that
+# publish-recipe.yml's push trigger will warm on every relevant push,
+# and that prune-cache will *not* drop. Anything in Releases whose key
+# doesn't correspond to an entry here is an orphan and gets pruned
+# after `caps.grace_days`.
+#
+# Editing this file:
+#   - Add a row → next push to main warms it (or just dispatch
+#     publish-recipe manually).
+#   - Remove a row → next push to main prunes the asset after the
+#     grace period (so in-flight PRs that still reference the old key
+#     don't break mid-run).
+#   - Change build inputs (recipe directory content) → the cache key
+#     moves; the old asset becomes an orphan, the new one gets warmed.
+
+# Major LLVM versions we currently support. Informational here;
+# package-catchup-probe will key off this list.
+support_window:
+  - 22
+
+caps:
+  # Soft cap: prune-cache emits ::warning:: when total Release storage
+  # is over this. Hard cap: workflow fails. Grace days: how long to
+  # leave an orphan asset around so in-flight PRs don't break when
+  # the cell is removed from this file or the recipe content changes.
+  soft_gb: 20
+  hard_gb: 30
+  grace_days: 7
+
+cells:
+  - { recipe: llvm-asan, version: '22', os: ubuntu-24.04, arch: x86_64 }

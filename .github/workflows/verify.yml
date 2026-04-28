@@ -9,6 +9,7 @@ name: verify
 on:
   pull_request:
     paths:
+      - 'cells.yaml'
       - 'recipes/**'
       - 'actions/**'
       - 'bin/**'
@@ -108,6 +109,85 @@ jobs:
             done
           done
           exit $fail
+
+  cells-yaml-integrity:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Schema parse
+        # cells.yaml is the single source of truth for what publish-recipe
+        # warms and what prune-cache keeps. All later checks here build
+        # on a successful parse; no point validating fields if the YAML
+        # itself is malformed.
+        run: yq -o=json '.' cells.yaml >/dev/null
+      - name: Required fields present
+        run: |
+          set -euo pipefail
+          for f in support_window caps cells; do
+            if ! yq -e "has(\"$f\")" cells.yaml >/dev/null; then
+              echo "::error file=cells.yaml::missing required top-level field: $f"
+              exit 1
+            fi
+          done
+          for f in soft_gb hard_gb grace_days; do
+            if ! yq -e ".caps | has(\"$f\")" cells.yaml >/dev/null; then
+              echo "::error file=cells.yaml::caps missing field: $f"
+              exit 1
+            fi
+          done
+      - name: caps sanity
+        run: |
+          set -euo pipefail
+          soft=$(yq '.caps.soft_gb' cells.yaml)
+          hard=$(yq '.caps.hard_gb' cells.yaml)
+          grace=$(yq '.caps.grace_days' cells.yaml)
+          [ "$soft" -lt "$hard" ] || { echo "::error file=cells.yaml::soft_gb ($soft) must be < hard_gb ($hard)"; exit 1; }
+          [ "$grace" -gt 0 ]      || { echo "::error file=cells.yaml::grace_days must be > 0"; exit 1; }
+      - name: No duplicate cells
+        run: |
+          set -euo pipefail
+          # Serialise each cell to a single JSON line, then look for repeats.
+          dupes=$(yq -o=json -I=0 '.cells[]' cells.yaml | sort | uniq -d)
+          if [ -n "$dupes" ]; then
+            echo "::error file=cells.yaml::duplicate cells found:"
+            echo "$dupes"
+            exit 1
+          fi
+      - name: Referenced recipes exist with required files
+        run: |
+          set -euo pipefail
+          fail=0
+          for r in $(yq '.cells[].recipe' cells.yaml | sort -u); do
+            dir="recipes/$r"
+            if [ ! -d "$dir" ]; then
+              echo "::error file=cells.yaml::references recipe '$r' but $dir does not exist"
+              fail=1
+              continue
+            fi
+            for f in recipe.yaml build.sh; do
+              if [ ! -f "$dir/$f" ]; then
+                echo "::error file=$dir::recipe '$r' missing $f"
+                fail=1
+              fi
+            done
+          done
+          exit $fail
+      - name: No orphan recipe directories
+        # Catches recipes/ subdirs that aren't referenced by cells.yaml.
+        # An orphan recipe directory is dead weight — it's never built,
+        # never published, but its contents still feed compute-key parity
+        # tests etc. Force the maintainer to either add a cell or remove
+        # the directory.
+        run: |
+          set -euo pipefail
+          referenced=$(yq '.cells[].recipe' cells.yaml | sort -u)
+          actual=$(for d in recipes/*/; do [ -d "$d" ] && basename "$d"; done | sort -u)
+          orphans=$(comm -23 <(echo "$actual") <(echo "$referenced"))
+          if [ -n "$orphans" ]; then
+            echo "::error::recipe directories not referenced by any cell in cells.yaml:"
+            echo "$orphans"
+            exit 1
+          fi
 
   tar-zstd-round-trip:
     runs-on: ubuntu-24.04
