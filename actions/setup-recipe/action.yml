@@ -119,16 +119,57 @@ runs:
           echo "hit=false" >> "$GITHUB_OUTPUT"
         fi
 
-    - name: Download from cache
+    - name: Download + extract from cache
       if: steps.probe.outputs.hit == 'true'
       shell: bash
       env:
         KEY: ${{ steps.compute-key.outputs.key }}
         BASE: ${{ steps.probe.outputs.base }}
+        RECIPE: ${{ inputs.recipe }}
+        VERSION: ${{ inputs.version }}
+        OS: ${{ steps.slugs.outputs.os }}
+        ARCH: ${{ steps.slugs.outputs.arch }}
       run: |
-        source __ci_workflows__/actions/lib/cache-io.sh
+        set -euo pipefail
+        # Download to a file first (rather than streaming through tar)
+        # so the log shows download time and extract time separately —
+        # operators investigating "why was this run slow" can see which
+        # phase dominated.
+        asset="/tmp/${KEY}.tar.zst"
+        base="${BASE%/}"
+        case "$base" in
+          file://*)
+            src="${base#file://}/${KEY}.tar.zst"
+            echo "::notice::Downloading from ${src}"
+            t0=$(date +%s)
+            cp "$src" "$asset"
+            t1=$(date +%s)
+            ;;
+          https://*|http://*)
+            src="${base}/${KEY}.tar.zst"
+            echo "::notice::Downloading from ${src}"
+            t0=$(date +%s)
+            curl -fsL "$src" -o "$asset"
+            t1=$(date +%s)
+            ;;
+          *)
+            echo "::error::unsupported cache-base scheme: $base"; exit 2 ;;
+        esac
+        size_bytes=$(stat -c%s "$asset" 2>/dev/null || stat -f%z "$asset")
+        size_mb=$(( size_bytes / 1048576 ))
+        download_s=$(( t1 - t0 ))
+        # Avoid divide-by-zero on absurdly fast downloads (file://, cached).
+        rate_mbps="-"
+        [ "$download_s" -gt 0 ] && rate_mbps="$(( size_mb / download_s ))"
+
         mkdir -p _llvm_dl
-        cache_download "$BASE" "$KEY" _llvm_dl
+        echo "::notice::Extracting ${size_mb} MiB"
+        t2=$(date +%s)
+        zstd -d < "$asset" | tar -xf - -C _llvm_dl
+        t3=$(date +%s)
+        extract_s=$(( t3 - t2 ))
+        rm -f "$asset"
+
         # Recipe's tarball root is `llvm-project/`; surface it at $GITHUB_WORKSPACE.
         if [[ -d _llvm_dl/llvm-project ]]; then
           mv _llvm_dl/llvm-project ./
@@ -137,6 +178,17 @@ runs:
           mv _llvm_dl/* ./ 2>/dev/null || true
         fi
         rm -rf _llvm_dl
+
+        extracted=$(du -sh llvm-project 2>/dev/null | awk '{print $1}')
+
+        # Provenance notices: every operator looking at this run can
+        # see at a glance what was loaded plus a clickable URL to the
+        # full manifest (source commit, runner image, build timestamp).
+        manifest_url="${base}/${KEY}.manifest.json"
+        echo "::notice title=Recipe loaded from cache::${RECIPE} v${VERSION} (${OS}/${ARCH})"
+        echo "::notice title=Recipe key::${KEY}"
+        echo "::notice title=Recipe load stats::download ${size_mb} MiB in ${download_s}s (${rate_mbps} MiB/s); extract in ${extract_s}s; on disk: ${extracted:-?}"
+        echo "::notice title=Recipe manifest::${manifest_url}"
 
     - name: Build inline (cache miss)
       if: steps.probe.outputs.hit != 'true' && inputs.build-on-miss == 'true'
