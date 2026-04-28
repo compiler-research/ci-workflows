@@ -1,8 +1,21 @@
 name: 'Install build dependencies'
 description: |
   Installs the host-side packages a recipe build needs (ninja, zstd,
-  ccache, rsync). Pulled out of publish-recipe.yml so the dispatch
-  and push jobs share the same install logic.
+  ccache, rsync) and a Clang host toolchain. Pulled out of
+  publish-recipe.yml so the dispatch and push jobs share the same
+  install logic.
+
+  Why Clang: recipes that set LLVM_USE_SANITIZER (e.g. llvm-asan)
+  rely on Clang-specific UBSan flags such as `-fno-sanitize=function`
+  and `-fsanitize-blacklist=`, which gcc rejects. Forcing Clang as
+  the host compiler keeps every recipe on a uniformly-supported
+  toolchain rather than picking up whatever the runner image's
+  default `c++` happens to be (gcc on Ubuntu).
+
+  macOS already provides Clang via the Xcode CLT preinstalled on
+  GHA runners; we just point CC/CXX at it explicitly. Windows uses
+  clang-cl from Chocolatey when needed by individual recipes; the
+  default here installs only ninja and zstandard.
 
 runs:
   using: composite
@@ -12,13 +25,18 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y ninja-build zstd ccache rsync
+        sudo apt-get install -y ninja-build zstd ccache rsync clang
+        # Pin the host compiler for every subsequent step in this job.
+        echo "CC=clang" >> "$GITHUB_ENV"
+        echo "CXX=clang++" >> "$GITHUB_ENV"
 
     - name: Install build dependencies (macOS)
       if: runner.os == 'macOS'
       shell: bash
       run: |
         brew install ninja zstd ccache rsync
+        echo "CC=clang" >> "$GITHUB_ENV"
+        echo "CXX=clang++" >> "$GITHUB_ENV"
 
     - name: Install build dependencies (Windows)
       if: runner.os == 'Windows'
