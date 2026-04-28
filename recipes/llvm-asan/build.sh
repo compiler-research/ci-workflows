@@ -196,4 +196,31 @@ if [[ -x bin/llvm-jitlink-executor ]]; then
   install -m 0755 bin/llvm-jitlink-executor "$OUT_DIR/llvm-project/bin/"
 fi
 
+# Producer-side smoke: invoke find_package(LLVM) and find_package(Clang)
+# from a throwaway cmake project against the install tree we just
+# produced. find_package walks every IMPORTED target's
+# IMPORTED_LOCATION_RELEASE and validates the file exists, plus checks
+# every reference in INTERFACE_LINK_LIBRARIES — exactly what the
+# consumer will run. Catches missing-.a-in-exports (the bug that broke
+# CppInterOp's first install-tree consume) and any other inconsistency
+# before the asset is tar'd and uploaded. Costs ~5 s.
+SMOKE_DIR="$(mktemp -d)"
+trap 'rm -rf "$SMOKE_DIR"' EXIT
+cat > "$SMOKE_DIR/CMakeLists.txt" <<'EOF'
+cmake_minimum_required(VERSION 3.20)
+project(install_tree_smoke LANGUAGES CXX)
+find_package(LLVM REQUIRED CONFIG PATHS "${SMOKE_LLVM_PREFIX}/lib/cmake/llvm" NO_DEFAULT_PATH)
+find_package(Clang REQUIRED CONFIG PATHS "${SMOKE_LLVM_PREFIX}/lib/cmake/clang" NO_DEFAULT_PATH)
+message(STATUS "smoke: LLVM ${LLVM_VERSION_MAJOR}.${LLVM_VERSION_MINOR}.${LLVM_VERSION_PATCH} loaded from ${LLVM_DIR}")
+EOF
+echo "build.sh: smoke-testing install tree (find_package LLVM + Clang)"
+cmake -S "$SMOKE_DIR" -B "$SMOKE_DIR/build" \
+  -DSMOKE_LLVM_PREFIX="$OUT_DIR/llvm-project" \
+  >"$SMOKE_DIR/log" 2>&1 || {
+  echo "::error::install tree failed find_package smoke. Exports likely reference missing files."
+  tail -50 "$SMOKE_DIR/log" >&2
+  exit 1
+}
+echo "build.sh: smoke passed."
+
 echo "build.sh: done. SRC_COMMIT=${SRC_COMMIT}"
