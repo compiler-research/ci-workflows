@@ -56,7 +56,7 @@ jobs:
         mkdir native_build
         cd native_build
         cmake -DLLVM_ENABLE_PROJECTS=clang -DLLVM_TARGETS_TO_BUILD=host -DCMAKE_BUILD_TYPE=Release -G Ninja ../llvm/
-        cmake --build . --target llvm-tblgen clang-tblgen --parallel $(nproc --all)
+        cmake --build . --target llvm-tblgen clang-tblgen --parallel "$(nproc --all)"
         export NATIVE_DIR=$PWD/bin/
         cd ..
         mkdir build
@@ -80,7 +80,7 @@ jobs:
                       -DLLVM_ENABLE_LIBPFM=OFF                        \
                       -DCLANG_BUILD_TOOLS=OFF                         \
                       -G Ninja                                         \
-                      -DLLVM_NATIVE_TOOL_DIR=$NATIVE_DIR 		\
+                      -DLLVM_NATIVE_TOOL_DIR="$NATIVE_DIR" 		\
                       ../llvm
         emmake ninja ClangReplInterpreterTests ClangReplInterpreterExceptionTests
         node ./tools/clang/unittests/Interpreter/ClangReplInterpreterTests.js
@@ -89,6 +89,7 @@ jobs:
 
     - name: Build Emscripten LLVM on Windows systems
       if: ${{ runner.os == 'windows' }}
+      shell: powershell
       run: |
         function Error-On-Failure {
           param (
