@@ -1,0 +1,14 @@
+recipe: llvm-asan
+description: |
+  LLVM/Clang built with Address+Undefined sanitizers, against
+  release/{version}.x. Consumed via setup-recipe by projects whose
+  test suites run under -fsanitize=address (CppInterOp's asan row,
+  clad's asan row).
+
+# Only fields read by build-manifest.sh live here. The cmake invocation
+# and trim list are authoritative in build.sh — having them duplicated
+# here as decorative metadata would silently drift. Add a field here
+# only when something else (manifest, dispatcher) actually reads it.
+source:
+  repo: https://github.com/llvm/llvm-project
+  branch_template: release/{version}.x

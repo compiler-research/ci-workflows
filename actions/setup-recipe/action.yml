@@ -1,0 +1,170 @@
+name: 'Setup recipe'
+description: |
+  Probes ci-workflows' Releases cache for a prebuilt recipe artifact
+  (LLVM-asan, LLVM-wasm, cling, ...) keyed by the recipe inputs and
+  downloads it. On miss, builds the recipe inline from source.
+
+inputs:
+  recipe:
+    required: true
+    description: 'Recipe name; matches a directory under recipes/'
+  version:
+    required: true
+    description: 'Version input, e.g. "22" — interpolated into the recipe source branch'
+  os:
+    required: true
+    description: |
+      OS slug for the cache key. Must match what publish-recipe used
+      when writing the asset — typically a runner-image name like
+      "ubuntu-24.04", "macos-26", "windows-2025". `runner.os` ("Linux"
+      etc.) is a *different* namespace and will not hit the cache.
+  arch:
+    required: true
+    description: |
+      Architecture slug for the cache key (e.g. "x86_64", "arm64").
+      Must match what publish-recipe used.
+  build-on-miss:
+    required: false
+    default: 'true'
+    description: 'On cache miss, build the recipe inline. When false, fail with a copy-pasteable publish-recipe invocation.'
+  cache-repo:
+    required: false
+    default: 'compiler-research/ci-workflows'
+    description: 'Repository hosting the cache Release'
+  cache-release:
+    required: false
+    default: 'cache'
+    description: 'Release tag name where cache assets are attached'
+  ref:
+    required: false
+    default: 'main'
+    description: 'Ref of cache-repo to read recipes/ from. Pin to a sha while iterating.'
+
+outputs:
+  path:
+    description: 'Filesystem path to the recipe build tree'
+    value: ${{ steps.finalize.outputs.path }}
+  cache-hit:
+    description: '"true" when downloaded from Releases, "false" when built inline'
+    value: ${{ steps.finalize.outputs.cache-hit }}
+  key:
+    description: 'Computed cache key'
+    value: ${{ steps.compute-key.outputs.key }}
+  src-commit:
+    description: 'llvm-project HEAD sha (only set on inline build path)'
+    value: ${{ env.SRC_COMMIT }}
+
+runs:
+  using: composite
+  steps:
+    - name: Normalize OS/arch slugs
+      id: slugs
+      shell: bash
+      env:
+        IN_OS: ${{ inputs.os }}
+        IN_ARCH: ${{ inputs.arch }}
+      run: |
+        os="$(echo "$IN_OS" | tr '[:upper:]' '[:lower:]')"
+        arch="$(echo "$IN_ARCH" | tr '[:upper:]' '[:lower:]')"
+        echo "os=$os" >> "$GITHUB_OUTPUT"
+        echo "arch=$arch" >> "$GITHUB_OUTPUT"
+
+    - name: Checkout ci-workflows recipes
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.cache-repo }}
+        ref: ${{ inputs.ref }}
+        path: __ci_workflows__
+        sparse-checkout: |
+          recipes
+          actions
+
+    - name: Compute key
+      id: compute-key
+      shell: bash
+      env:
+        RECIPE: ${{ inputs.recipe }}
+        VERSION: ${{ inputs.version }}
+        OS: ${{ steps.slugs.outputs.os }}
+        ARCH: ${{ steps.slugs.outputs.arch }}
+      run: |
+        cd __ci_workflows__
+        bash actions/setup-recipe/compute-key.sh \
+          "$RECIPE" "$VERSION" "$OS" "$ARCH" >> "$GITHUB_OUTPUT"
+
+    - name: Probe cache
+      id: probe
+      shell: bash
+      env:
+        KEY: ${{ steps.compute-key.outputs.key }}
+        REPO: ${{ inputs.cache-repo }}
+        TAG: ${{ inputs.cache-release }}
+      run: |
+        url="https://github.com/${REPO}/releases/download/${TAG}/${KEY}.tar.zst"
+        if curl -fsLI "$url" >/dev/null 2>&1; then
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+        else
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Download from Releases
+      if: steps.probe.outputs.hit == 'true'
+      shell: bash
+      env:
+        URL: ${{ steps.probe.outputs.url }}
+      run: |
+        mkdir -p _llvm_dl
+        curl -fsL "$URL" | zstd -d | tar -xf - -C _llvm_dl
+        # Recipe's tarball root is `llvm-project/`; surface it at $GITHUB_WORKSPACE.
+        if [[ -d _llvm_dl/llvm-project ]]; then
+          mv _llvm_dl/llvm-project ./
+        else
+          # Defensive: some recipes may tar a different root in future.
+          mv _llvm_dl/* ./ 2>/dev/null || true
+        fi
+        rm -rf _llvm_dl
+
+    - name: Build inline (cache miss)
+      if: steps.probe.outputs.hit != 'true' && inputs.build-on-miss == 'true'
+      shell: bash
+      env:
+        RECIPE_VERSION: ${{ inputs.version }}
+        WORK_DIR: ${{ github.workspace }}
+        OUT_DIR: ${{ github.workspace }}/_recipe_out
+      run: |
+        mkdir -p "$OUT_DIR"
+        bash __ci_workflows__/recipes/${{ inputs.recipe }}/build.sh
+        # build.sh produces $OUT_DIR/llvm-project; surface it at workspace root.
+        if [[ -d "$OUT_DIR/llvm-project" ]]; then
+          rsync -a "$OUT_DIR/llvm-project/" "$GITHUB_WORKSPACE/llvm-project/"
+        fi
+
+    - name: Fail on miss when build-on-miss=false
+      if: steps.probe.outputs.hit != 'true' && inputs.build-on-miss != 'true'
+      shell: bash
+      env:
+        KEY: ${{ steps.compute-key.outputs.key }}
+        RECIPE: ${{ inputs.recipe }}
+        VERSION: ${{ inputs.version }}
+        OS: ${{ steps.slugs.outputs.os }}
+        ARCH: ${{ steps.slugs.outputs.arch }}
+        REPO: ${{ inputs.cache-repo }}
+      run: |
+        {
+          echo "::error::no prebuilt for key=${KEY}"
+          echo "::error::populate by running:"
+          echo "::error::  gh workflow run publish-recipe.yml -R ${REPO} \\"
+          echo "::error::    -f recipe=${RECIPE} -f version=${VERSION} \\"
+          echo "::error::    -f os=${OS} -f arch=${ARCH}"
+        } >&2
+        exit 1
+
+    - name: Finalize outputs
+      id: finalize
+      shell: bash
+      env:
+        HIT: ${{ steps.probe.outputs.hit }}
+      run: |
+        echo "path=${{ github.workspace }}/llvm-project" >> "$GITHUB_OUTPUT"
+        echo "cache-hit=${HIT}" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,142 @@
+name: 'Publish recipe'
+description: |
+  Builds a recipe locally (under ccache) and uploads
+  cache/<key>.tar.zst + cache/<key>.manifest.json to a single rolling
+  Release on this repo. Skips work when the asset already exists.
+
+  Only meant to run inside ci-workflows itself, where GITHUB_TOKEN has
+  release-write permission. Never invoked from client repos.
+
+inputs:
+  recipe:
+    required: true
+  version:
+    required: true
+  os:
+    required: true
+    description: 'OS slug for the cache key (e.g. "ubuntu-24.04", "macos-26"). Must match what setup-recipe consumers will pass.'
+  arch:
+    required: true
+    description: 'Arch slug for the cache key (e.g. "x86_64", "arm64").'
+  release-tag:
+    required: false
+    default: 'cache'
+
+runs:
+  using: composite
+  steps:
+    - name: Normalize OS/arch slugs
+      id: slugs
+      shell: bash
+      env:
+        IN_OS: ${{ inputs.os }}
+        IN_ARCH: ${{ inputs.arch }}
+      run: |
+        os="$(echo "$IN_OS" | tr '[:upper:]' '[:lower:]')"
+        arch="$(echo "$IN_ARCH" | tr '[:upper:]' '[:lower:]')"
+        echo "os=$os" >> "$GITHUB_OUTPUT"
+        echo "arch=$arch" >> "$GITHUB_OUTPUT"
+
+    - name: Compute key
+      id: compute-key
+      shell: bash
+      env:
+        RECIPE: ${{ inputs.recipe }}
+        VERSION: ${{ inputs.version }}
+        OS: ${{ steps.slugs.outputs.os }}
+        ARCH: ${{ steps.slugs.outputs.arch }}
+      run: |
+        bash actions/setup-recipe/compute-key.sh \
+          "$RECIPE" "$VERSION" "$OS" "$ARCH" >> "$GITHUB_OUTPUT"
+
+    # Why: workflow_dispatch can fire against a key that's already
+    # published (operator retrying, or someone manually warming a cell
+    # that's already there). HEAD probe + skip avoids a redundant
+    # 30-min rebuild. The upload step still uses --clobber as a defense
+    # against parallel-dispatch races where two runs probe-miss together.
+    - name: Skip if asset already published
+      id: skip
+      shell: bash
+      env:
+        KEY: ${{ steps.compute-key.outputs.key }}
+        TAG: ${{ inputs.release-tag }}
+      run: |
+        url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${KEY}.tar.zst"
+        if curl -fsLI "$url" >/dev/null 2>&1; then
+          echo "::notice::cache hit; skipping build for key=${KEY}"
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Why: ccache is keyed only on (recipe, version, os, arch) — *not* on
+    # the recipe-content hash that drives the Releases key. When build.sh
+    # or recipe.yaml changes, the Releases key invalidates and we must
+    # rebuild, but most LLVM object files are still hits because their
+    # source inputs didn't change. Coarse-keying ccache is what makes a
+    # flag bump cheap. See https://ccache.dev/manual/latest.html
+    #
+    # Restore happens *after* the skip-probe so an already-published
+    # key doesn't pay restore cost.
+    # TODO: pin to a sha (not just @v1) before the v1 contract freezes.
+    - name: Restore ccache (coarse-keyed, survives recipe-content bumps)
+      if: steps.skip.outputs.exists != 'true'
+      uses: hendrikmuhs/ccache-action@v1
+      with:
+        key: ${{ inputs.recipe }}-${{ inputs.version }}-${{ steps.slugs.outputs.os }}-${{ steps.slugs.outputs.arch }}
+        max-size: 5G
+
+    - name: Ensure rolling Release exists
+      if: steps.skip.outputs.exists != 'true'
+      shell: bash
+      env:
+        TAG: ${{ inputs.release-tag }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --title "Recipe cache" \
+            --notes "Rolling cache of prebuilt recipe artifacts. Each asset is keyed by sha256 of (recipe.yaml, build.sh, patches, version, os, arch). See <key>.manifest.json for the inputs that produced any given <key>.tar.zst."
+        fi
+
+    - name: Build recipe
+      if: steps.skip.outputs.exists != 'true'
+      shell: bash
+      env:
+        RECIPE_VERSION: ${{ inputs.version }}
+        WORK_DIR: ${{ github.workspace }}/_recipe_work
+        OUT_DIR: ${{ github.workspace }}/_recipe_out
+        CMAKE_C_COMPILER_LAUNCHER: ccache
+        CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      run: |
+        mkdir -p "$WORK_DIR" "$OUT_DIR"
+        bash recipes/${{ inputs.recipe }}/build.sh
+
+    - name: Build manifest
+      if: steps.skip.outputs.exists != 'true'
+      shell: bash
+      env:
+        KEY: ${{ steps.compute-key.outputs.key }}
+        RECIPE: ${{ inputs.recipe }}
+        VERSION: ${{ inputs.version }}
+        OS: ${{ steps.slugs.outputs.os }}
+        ARCH: ${{ steps.slugs.outputs.arch }}
+      run: |
+        bash actions/publish-recipe/build-manifest.sh \
+          "$RECIPE" "$VERSION" "$OS" "$ARCH" "$KEY" \
+          > "${{ github.workspace }}/_recipe_out/${KEY}.manifest.json"
+
+    - name: Tar + zstd + upload
+      if: steps.skip.outputs.exists != 'true'
+      shell: bash
+      env:
+        KEY: ${{ steps.compute-key.outputs.key }}
+        TAG: ${{ inputs.release-tag }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        cd "${{ github.workspace }}/_recipe_out"
+        tar -cf - llvm-project | zstd -19 --long > "${KEY}.tar.zst"
+        ls -lh "${KEY}.tar.zst"
+        gh release upload "$TAG" \
+          "${KEY}.tar.zst" "${KEY}.manifest.json" \
+          -R "$GITHUB_REPOSITORY" --clobber
