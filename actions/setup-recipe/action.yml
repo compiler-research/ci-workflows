@@ -195,14 +195,17 @@ runs:
       shell: bash
       env:
         RECIPE_VERSION: ${{ inputs.version }}
-        WORK_DIR: ${{ github.workspace }}
+        WORK_DIR: ${{ github.workspace }}/_recipe_work
         OUT_DIR: ${{ github.workspace }}/_recipe_out
       run: |
-        mkdir -p "$OUT_DIR"
+        mkdir -p "$WORK_DIR" "$OUT_DIR"
         bash __ci_workflows__/recipes/${{ inputs.recipe }}/build.sh
-        # build.sh produces $OUT_DIR/llvm-project; surface it at workspace root.
+        # build.sh installs to $OUT_DIR/llvm-project. The install tree is
+        # relocatable (cmake configs use _IMPORT_PREFIX-relative paths),
+        # so move it under the workspace where consumers expect to find it.
         if [[ -d "$OUT_DIR/llvm-project" ]]; then
-          rsync -a "$OUT_DIR/llvm-project/" "$GITHUB_WORKSPACE/llvm-project/"
+          rm -rf "$GITHUB_WORKSPACE/llvm-project"
+          mv "$OUT_DIR/llvm-project" "$GITHUB_WORKSPACE/llvm-project"
         fi
 
     - name: Fail on miss when build-on-miss=false

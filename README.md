@@ -56,7 +56,9 @@ bin/recipe-cache pack llvm-asan 22 darwin arm64 \
 
 # Fetch + extract.
 bin/recipe-cache get llvm-asan 22 ubuntu-24.04 x86_64 --out /tmp/llvm
-ls /tmp/llvm/llvm-project/build/lib/cmake/llvm/
+# Recipes publish a cmake --install tree, so LLVMConfig.cmake lives at
+# the standard install path — pass this directory to find_package(LLVM).
+ls /tmp/llvm/llvm-project/lib/cmake/llvm/
 
 # Inspect cached cells.
 bin/recipe-cache list

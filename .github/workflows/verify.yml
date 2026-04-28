@@ -198,9 +198,12 @@ jobs:
       - name: Tiny tree round-trip via the publish/consume pipelines
         run: |
           set -euo pipefail
-          mkdir -p src/llvm-project/build/lib src/llvm-project/llvm/include
-          echo "header" > src/llvm-project/llvm/include/foo.h
-          printf 'binary\x00\x01\x02' > src/llvm-project/build/lib/libfoo.a
+          # Mirror the install-tree shape that real recipes produce:
+          # bin/, lib/, include/, lib/cmake/llvm/. The contents here are
+          # synthetic — what we're testing is tar+zstd, not the layout.
+          mkdir -p src/llvm-project/lib src/llvm-project/include
+          echo "header" > src/llvm-project/include/foo.h
+          printf 'binary\x00\x01\x02' > src/llvm-project/lib/libfoo.a
           ( cd src && tar -cf - llvm-project | zstd -19 --long > /tmp/c.tar.zst )
           mkdir dest
           cat /tmp/c.tar.zst | zstd -d | tar -xf - -C dest
@@ -254,17 +257,17 @@ jobs:
           cat > recipes/__verify_fixture/build.sh <<'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
-          mkdir -p "$OUT_DIR/llvm-project/build/bin"
+          mkdir -p "$OUT_DIR/llvm-project/bin"
           echo "fake clang built by recipe v${RECIPE_VERSION}" \
-            > "$OUT_DIR/llvm-project/build/bin/clang"
+            > "$OUT_DIR/llvm-project/bin/clang"
           EOF
           chmod +x recipes/__verify_fixture/build.sh
           bin/recipe-cache build __verify_fixture 1 ubuntu-24.04 x86_64
           bin/recipe-cache list
           mkdir /tmp/out
           bin/recipe-cache get __verify_fixture 1 ubuntu-24.04 x86_64 --out /tmp/out
-          test -f /tmp/out/llvm-project/build/bin/clang
-          grep -q "fake clang built by recipe v1" /tmp/out/llvm-project/build/bin/clang
+          test -f /tmp/out/llvm-project/bin/clang
+          grep -q "fake clang built by recipe v1" /tmp/out/llvm-project/bin/clang
           # Manifest sanity
           jq -e .recipe "/tmp/cache/$(bin/recipe-cache key __verify_fixture 1 ubuntu-24.04 x86_64).manifest.json"
       - name: Negative — get on uncached key fails
