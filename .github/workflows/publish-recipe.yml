@@ -1,7 +1,15 @@
 name: publish-recipe
 
-# First slice: workflow_dispatch only. Once cells.yaml lands we'll add
-# a push trigger that recomputes keys and rebuilds anything missing.
+# Two trigger paths:
+#   workflow_dispatch — operator-driven, single cell from inputs.
+#   push to main      — auto-warm the recipe cache after a merge that
+#                       touched the recipe directory or actions. Each
+#                       cell goes through the same publish-recipe
+#                       action, which skip-if-exists internally so the
+#                       steady state cost is one HEAD probe per cell.
+#
+# When cells.yaml lands the push matrix becomes derived from that file
+# rather than hardcoded.
 on:
   workflow_dispatch:
     inputs:
@@ -14,9 +22,6 @@ on:
         type: string
         required: true
         default: '22'
-      # The first slice publishes a single cell. Each new cell expands
-      # the os/arch options after its build.sh has been verified on
-      # that platform (recipe builds aren't host-portable for free).
       os:
         type: choice
         required: true
@@ -29,39 +34,49 @@ on:
         options:
           - x86_64
         default: x86_64
+  push:
+    branches: [main]
+    paths:
+      - 'recipes/**'
+      - 'actions/setup-recipe/**'
+      - 'actions/publish-recipe/**'
+      - '.github/workflows/publish-recipe.yml'
 
 permissions:
   contents: write   # release upload
 
 jobs:
-  publish:
-    name: ${{ inputs.recipe }} v${{ inputs.version }} (${{ inputs.os }}/${{ inputs.arch }})
+  publish-dispatch:
+    if: github.event_name == 'workflow_dispatch'
+    name: dispatch ${{ inputs.recipe }} v${{ inputs.version }} (${{ inputs.os }}/${{ inputs.arch }})
     runs-on: ${{ inputs.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install build dependencies (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build zstd ccache rsync
-
-      - name: Install build dependencies (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          brew install ninja zstd ccache rsync
-
-      - name: Install build dependencies (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          choco install -y ninja zstandard
-
+      - uses: ./.github/actions/install-build-deps
       - uses: ./actions/publish-recipe
         with:
           recipe: ${{ inputs.recipe }}
           version: ${{ inputs.version }}
           os: ${{ inputs.os }}
           arch: ${{ inputs.arch }}
+
+  publish-on-push:
+    if: github.event_name == 'push'
+    name: ${{ matrix.recipe }} v${{ matrix.version }} (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Hardcoded one-cell matrix for now. Replace with a fromJson
+      # over cells.yaml when that lands.
+      matrix:
+        include:
+          - { recipe: llvm-asan, version: '22', os: ubuntu-24.04, arch: x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/install-build-deps
+      - uses: ./actions/publish-recipe
+        with:
+          recipe: ${{ matrix.recipe }}
+          version: ${{ matrix.version }}
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
