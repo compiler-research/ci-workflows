@@ -57,7 +57,6 @@ jobs:
             [ "$base" != "$k" ] || { echo "::error::$change perturbation did not move key"; exit 1; }
           done
           # Perturb recipe.yaml content.
-          orig="$(sha256sum recipes/llvm-asan/recipe.yaml)"
           echo "# verify-test perturbation" >> recipes/llvm-asan/recipe.yaml
           k="$(bash actions/setup-recipe/compute-key.sh llvm-asan 22 ubuntu-24.04 x86_64)"
           [ "$base" != "$k" ] || { echo "::error::recipe.yaml edit did not move key"; exit 1; }
