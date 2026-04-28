@@ -34,13 +34,27 @@ fi
 #   - runner image SHA — bumps shouldn't invalidate every cell. Image
 #     details land in the manifest for forensics.
 #   - timestamps — keys must be reproducible.
+#   - file *paths* — `sha256sum file` includes the filename in its
+#     output, which would make the key path-sensitive. Hash file
+#     *contents* only via stdin redirection so the key is the same
+#     whether called with a relative or absolute recipe_root.
+hash_content() {
+  sha256sum < "$1" | awk '{print $1}'
+}
+
 hash=$(
   {
-    sha256sum "$dir/recipe.yaml"
-    sha256sum "$dir/build.sh"
+    hash_content "$dir/recipe.yaml"
+    hash_content "$dir/build.sh"
     if [[ -d "$dir/patches" ]]; then
+      # Use sort to make the order deterministic; hash content + the
+      # path *relative to the patches dir* so a renamed patch
+      # invalidates but moving the patches dir does not.
       ( cd "$dir/patches" && \
-        find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum )
+        find . -type f | LC_ALL=C sort | while read -r f; do
+          printf '%s ' "$f"
+          hash_content "$f"
+        done )
     fi
     printf 'V=%s OS=%s ARCH=%s\n' "$VERSION" "$OS" "$ARCH"
   } | sha256sum | awk '{print $1}'
