@@ -6,6 +6,11 @@ family recipe artifacts that the upstream ecosystem doesn't
 redistribute (sanitizer-instrumented LLVM, wasm-LLVM, the cling fork,
 eventually MSan stacks and sanitizer-CPython).
 
+> **New here?** Read [docs/developer-guide.md](docs/developer-guide.md)
+> first. It walks through why this exists, how to use it day-to-day,
+> and the trade-offs you're accepting. The rest of this README is a
+> quick reference.
+
 ## Consumer side: `setup-recipe`
 
 In a downstream workflow:
