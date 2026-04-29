@@ -1,0 +1,26 @@
+recipe: llvm-root
+description: |
+  LLVM/Clang built with cling integrated as an LLVM_EXTERNAL_PROJECT,
+  against root-project/llvm-project's cling-llvm20 (cling's patches
+  alone) or ROOT-llvm20 (cling's patches + ROOT's extra clang patches)
+  branches. Consumed via setup-recipe by:
+    - CppInterOp's cppyy/cling rows (need cling-llvm20),
+    - CppInterOp's ROOT integration job (needs ROOT-llvm20).
+  Each flavor maps to a `version` value below; the cache key partitions
+  on it, so the same recipe directory ships two distinct artifacts.
+
+# `version` doubles as the flavor selector here — each value maps to a
+# branch on root-project/llvm-project under the same date-stamped
+# ladder (currently 20260408-01). When ROOT or cling cuts a new patch
+# set, edit the date stamp here; the cache key moves and the new
+# asset republishes for both flavors.
+source:
+  repo: https://github.com/root-project/llvm-project
+  branch_template: '{version}-20260408-01'
+
+# cling lives in its own repo and is pulled in at cmake time via
+# LLVM_EXTERNAL_PROJECTS. Bumping the cling tag is a recipe edit:
+# changes recipe.yaml, moves the cache key, republishes.
+cling:
+  repo: https://github.com/root-project/cling
+  branch: v1.3

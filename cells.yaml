@@ -18,6 +18,7 @@
 # Major LLVM versions we currently support. Informational here;
 # package-catchup-probe will key off this list.
 support_window:
+  - 20
   - 22
 
 caps:
@@ -30,4 +31,18 @@ caps:
   grace_days: 7
 
 cells:
-  - { recipe: llvm-asan, version: '22', os: ubuntu-24.04, arch: x86_64 }
+  - { recipe: llvm-asan, version: '22',            os: ubuntu-24.04,    arch: x86_64 }
+  # llvm-root: `version` doubles as a flavor selector and substitutes
+  # into recipes/llvm-root/recipe.yaml's branch_template. Two flavors
+  # track root-project/llvm-project's paired branches:
+  #   cling-llvm20 = cling's patches alone (CppInterOp's cppyy/cling row).
+  #                  Linux-only today; macOS / Windows cling rows still
+  #                  share the ROOT-llvm20 superset to keep one cell warm.
+  #   ROOT-llvm20  = cling + ROOT's extra clang patches. Built across
+  #                  the full CppInterOp matrix so every cling-using
+  #                  consumer has a ready cell.
+  - { recipe: llvm-root, version: 'cling-llvm20',  os: ubuntu-24.04,    arch: x86_64 }
+  - { recipe: llvm-root, version: 'ROOT-llvm20',   os: ubuntu-24.04,    arch: x86_64 }
+  - { recipe: llvm-root, version: 'ROOT-llvm20',   os: macos-26,        arch: arm64  }
+  - { recipe: llvm-root, version: 'ROOT-llvm20',   os: macos-26-intel,  arch: x86_64 }
+  - { recipe: llvm-root, version: 'ROOT-llvm20',   os: windows-2025,    arch: x86_64 }
