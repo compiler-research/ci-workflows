@@ -152,3 +152,39 @@ cache_upload() {
       ;;
   esac
 }
+
+# cache_pack IN_DIR KEY  →  writes ${KEY}.tar.zst in cwd by tar+zstd-ing
+#                           IN_DIR/llvm-project.
+#
+# IN_DIR is the directory containing the `llvm-project/` install tree
+# (typically $OUT_DIR for a real recipe build). KEY is the asset
+# basename. Output goes to $cwd/${KEY}.tar.zst.
+#
+# Why factor this out: publish-recipe and verify.yml's publish-dryrun
+# both need exactly this command. Inlining it twice means tool-flag
+# drift (e.g. one side updates a flag, the other doesn't) goes
+# unnoticed until publish time. One source of truth here.
+#
+# zstd -T0 fans out to all vCPUs (single-threaded by default; on a
+# 4-vCPU GHA runner this brings the compress phase from ~8 min to
+# ~2 min on a 4 GB tree). -19 stays — smaller asset wins more on
+# upload + every later download.
+#
+# Tar checkpoints emit one stderr line every ~50 MB of input so the
+# log shows liveness during the otherwise-silent pipe.
+#
+# WARNING: `--checkpoint=` / `--checkpoint-action=` are GNU tar
+# extensions; BSD tar (the default `tar` on macOS) parses them as
+# filenames and errors with "Cannot stat: No such file or directory".
+# This invocation is deliberately left ungated for now to verify the
+# verify.yml publish-dryrun matrix actually catches the failure on
+# macOS legs. Add the gating in a follow-up once the trigger has
+# fired red.
+cache_pack() {
+  local in_dir="$1"
+  local key="$2"
+  echo "::notice::compressing ${key}.tar.zst (zstd -19 --long -T0)"
+  ( cd "$in_dir" && tar -cf - llvm-project \
+      --checkpoint=100000 --checkpoint-action=echo='%T tar checkpoint' \
+  ) | zstd -19 --long -T0 > "${key}.tar.zst"
+}

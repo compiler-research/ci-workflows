@@ -147,11 +147,37 @@ llvm_build::install_distribution() {
   dist+=("$@")
 
   local IFS=';'
-  local dist_str="${dist[*]}"
+  llvm_build::run_install_distribution "${dist[*]}"
+}
+
+# Lower-level helper: take a literal semicolon-joined component string,
+# reconfigure cmake with LLVM_DISTRIBUTION_COMPONENTS, install each
+# component. Recipes that don't follow the umbrella convention (e.g.
+# llvm-dry-run, which ships only LLVMDemangle and can't include
+# `clang`-prefixed umbrellas the way real recipes do) call this
+# directly. Real recipes go through llvm_build::install_distribution
+# which builds the umbrella+walk list and delegates here.
+#
+# We deliberately avoid `ninja install-distribution`: that target
+# depends on every library in the configured project being built,
+# not just the libraries listed in LLVM_DISTRIBUTION_COMPONENTS.
+# On a partial build (e.g. llvm-dry-run, which only ninja-builds
+# LLVMDemangle), `ninja install-distribution` cascades into
+# building LLVMSupport's ~240 sources etc. — defeating the dry-run's
+# fast-feedback property. `cmake --install --component` runs the
+# install rule directly with no build-side dependency, so it only
+# touches files that are already on disk.
+#
+# Cwd: build directory.
+llvm_build::run_install_distribution() {
+  local dist_str="$1"
   echo "build.sh: LLVM_DISTRIBUTION_COMPONENTS=${dist_str}"
   cmake -DLLVM_DISTRIBUTION_COMPONENTS="${dist_str}" .
-
-  ninja -j "${NCPUS}" install-distribution
+  local IFS=';'
+  local comp
+  for comp in $dist_str; do
+    cmake --install . --component "$comp"
+  done
 }
 
 # Producer-side smoke: invoke find_package(LLVM REQUIRED) and

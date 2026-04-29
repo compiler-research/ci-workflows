@@ -159,16 +159,7 @@ runs:
         cd "${{ github.workspace }}/_recipe_out"
         echo "::notice::input tree size:"
         du -sh llvm-project
-        # Why `-T0`: zstd is single-threaded by default. -T0 fans out to
-        # all vCPUs, which on a 4-vCPU GHA runner brings the compress
-        # phase from ~8 min to ~2 min on a 4 GB tree. -19 stays —
-        # smaller asset wins more on the upload + every later download.
-        # Tar checkpoints emit one stderr line every ~50 MB of input so
-        # the log shows liveness during the otherwise-silent pipe.
-        echo "::notice::compressing ${KEY}.tar.zst (zstd -19 --long -T0)"
-        tar -cf - llvm-project \
-            --checkpoint=100000 --checkpoint-action=echo='%T tar checkpoint' \
-          | zstd -19 --long -T0 > "${KEY}.tar.zst"
+        cache_pack . "${KEY}"
         ls -lh "${KEY}.tar.zst"
         # The notice URL: $BASE is the asset *prefix*
         # (https://.../releases/download/cache/) which 404s when clicked
