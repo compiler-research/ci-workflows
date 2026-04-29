@@ -13,9 +13,14 @@ description: |
   default `c++` happens to be (gcc on Ubuntu).
 
   macOS already provides Clang via the Xcode CLT preinstalled on
-  GHA runners; we just point CC/CXX at it explicitly. Windows uses
-  clang-cl from Chocolatey when needed by individual recipes; the
-  default here installs only ninja and zstandard.
+  GHA runners; we just point CC/CXX at it explicitly.
+
+  Windows: source MSVC's developer environment via msvc-dev-cmd so
+  cl.exe is on PATH and LIB/INCLUDE are populated; otherwise GHA's
+  hosted Windows runners default to MinGW g++ from chocolatey, which
+  rejects MSVC-only constructs that LLVM and cling depend on
+  (`_MSC_VER`, MSVC-style LPTSTR/TCHAR semantics, `#pragma comment(lib,
+  ...)`). cmake -G Ninja then picks up cl.exe as the compiler.
 
 runs:
   using: composite
@@ -38,8 +43,19 @@ runs:
         echo "CC=clang" >> "$GITHUB_ENV"
         echo "CXX=clang++" >> "$GITHUB_ENV"
 
+    # MSVC env: sets cl.exe on PATH plus INCLUDE/LIB/LIBPATH. Pinned
+    # to a tagged release (not @v1) so a future ilammy/msvc-dev-cmd
+    # behavior change can't silently break our publish runs.
+    - name: Set up MSVC developer environment (Windows)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1.13.0
+
     - name: Install build dependencies (Windows)
       if: runner.os == 'Windows'
       shell: bash
       run: |
         choco install -y ninja zstandard
+        # Pin the host compiler. CC/CXX use cl from msvc-dev-cmd's
+        # PATH addition above. cmake -G Ninja honors these.
+        echo "CC=cl" >> "$GITHUB_ENV"
+        echo "CXX=cl" >> "$GITHUB_ENV"
