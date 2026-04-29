@@ -209,28 +209,50 @@ jobs:
           cat /tmp/c.tar.zst | zstd -d | tar -xf - -C dest
           diff -r src/llvm-project dest/llvm-project
 
-  # Smoke-tests recipes/llvm-asan against the install-build-deps
-  # toolchain by running the recipe's own build.sh in
-  # RECIPE_QUICK_CHECK mode. Catches the publish-time failure mode
-  # where the runner's default c++ rejects LLVM_USE_SANITIZER's
-  # Clang-only UBSan flags. Costs a git clone + cmake configure +
-  # one tiny library compile (~3-5 min); slower than the other
-  # verify jobs but cheap insurance against another 30-min publish
-  # blowing up post-merge.
-  llvm-asan-smoke:
+  # Read cells.yaml and emit a matrix-include JSON. Every cell becomes
+  # one leg of the recipe-smoke matrix below — adding a cell to
+  # cells.yaml automatically gets it covered at PR time.
+  read-cells:
     runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.cells.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: cells
+        run: |
+          set -euo pipefail
+          matrix=$(yq -o=json '{"include": .cells}' cells.yaml)
+          {
+            echo 'matrix<<EOF'
+            echo "$matrix"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+  # Run RECIPE_QUICK_CHECK for every cells.yaml entry on its native OS.
+  # Catches install-build-deps misconfiguration (host toolchain shape),
+  # cmake configure regressions, install-distribution contract
+  # breakage, and LLVMConfig.cmake load-time issues — without paying
+  # for the full ~30-min publish build. RECIPE_QUICK_CHECK runs:
+  # cmake configure + LLVMDemangle compile + minimal install +
+  # find_package(LLVM); see actions/lib/llvm-build.sh's
+  # quick_check_or_continue. Costs ~3-5 min per leg.
+  recipe-smoke:
+    needs: read-cells
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.read-cells.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/install-build-deps
-      - name: Configure + build LLVMDemangle (RECIPE_QUICK_CHECK)
+      - name: RECIPE_QUICK_CHECK ${{ matrix.recipe }} v${{ matrix.version }} (${{ matrix.os }}/${{ matrix.arch }})
+        shell: bash
         env:
-          RECIPE_VERSION: '22'
-          WORK_DIR: ${{ github.workspace }}/_recipe_work
-          OUT_DIR: ${{ github.workspace }}/_recipe_out
+          RECIPE_VERSION: ${{ matrix.version }}
+          WORK_DIR: ${{ runner.temp }}/_recipe_work
+          OUT_DIR: ${{ runner.temp }}/_recipe_out
           RECIPE_QUICK_CHECK: '1'
-        run: |
-          mkdir -p "$WORK_DIR" "$OUT_DIR"
-          bash recipes/llvm-asan/build.sh
+        run: bash recipes/${{ matrix.recipe }}/build.sh
 
   end-to-end-fixture:
     runs-on: ubuntu-24.04
