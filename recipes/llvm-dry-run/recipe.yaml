@@ -1,0 +1,18 @@
+recipe: llvm-dry-run
+description: |
+  PR-time dry-run recipe. Produces a tiny LLVM install tree
+  (LLVMDemangle only) by going through the same actions/lib/llvm-build.sh
+  helper and the same actions/publish-recipe action that real publishes
+  use. The verify.yml publish-dryrun matrix invokes this recipe with
+  cache-base: file:///... so no actual upload happens; the goal is to
+  exercise every shared codepath (env validation, cmake configure,
+  cleanup_intermediates, run_install_distribution, cache_pack,
+  cache_upload to file://) on every supported runner OS without paying
+  for a real ~30-min recipe build.
+
+  Not in cells.yaml — this recipe is never published as a steady-state
+  asset; it's a test fixture invoked at PR time only.
+
+source:
+  repo: https://github.com/llvm/llvm-project
+  branch_template: release/{version}.x

@@ -178,11 +178,17 @@ jobs:
         # never published, but its contents still feed compute-key parity
         # tests etc. Force the maintainer to either add a cell or remove
         # the directory.
+        #
+        # Exception: recipes that are intentionally PR-time fixtures
+        # (llvm-dry-run) live in recipes/ but never publish steady-state
+        # assets. Whitelist them by recipe name.
         run: |
           set -euo pipefail
+          fixtures='llvm-dry-run'
           referenced=$(yq '.cells[].recipe' cells.yaml | sort -u)
           actual=$(for d in recipes/*/; do [ -d "$d" ] && basename "$d"; done | sort -u)
-          orphans=$(comm -23 <(echo "$actual") <(echo "$referenced"))
+          actual_filtered=$(echo "$actual" | grep -vxFf <(echo "$fixtures") || true)
+          orphans=$(comm -23 <(echo "$actual_filtered") <(echo "$referenced"))
           if [ -n "$orphans" ]; then
             echo "::error::recipe directories not referenced by any cell in cells.yaml:"
             echo "$orphans"
@@ -253,6 +259,67 @@ jobs:
           OUT_DIR: ${{ runner.temp }}/_recipe_out
           RECIPE_QUICK_CHECK: '1'
         run: bash recipes/${{ matrix.recipe }}/build.sh
+
+  # End-to-end dry-run of the real publish-recipe action against the
+  # llvm-dry-run fixture recipe with cache-base: file:///... so no
+  # actual upload happens. Exercises every shared codepath a real
+  # publish runs: helper's setup_env/cmake_extra/cleanup_intermediates/
+  # run_install_distribution, cache_pack, cache_upload's file://
+  # branch — across every supported runner OS.
+  #
+  # What this catches at PR time that the recipe-smoke matrix doesn't:
+  #   - cache_pack tool-portability (BSD vs GNU tar, zstd flag drift).
+  #   - cache_upload's file:// branch.
+  #   - publish-recipe action orchestration (compute-key, probe, build,
+  #     manifest, pack, upload sequence).
+  #   - run_install_distribution end-to-end with real cmake reconfigure
+  #     + ninja install-distribution.
+  #
+  # What it doesn't catch:
+  #   - llvm_build::install_distribution's umbrella+walk (only
+  #     run_install_distribution is exercised; the umbrella list
+  #     real recipes use is unique to clang/cling builds).
+  #   - llvm_build::smoke (find_package post-publish).
+  #   - cache_upload's gh release branch (no upload to GitHub).
+  #   - setup-recipe consumer side (separate concerns).
+  #   - prune-cache (separate workflow).
+  #
+  # No Windows leg yet: install-build-deps's MSVC env wiring works,
+  # but the dry-run recipe uses host targets; on Windows that means
+  # cl + LLVMDemangle. Should work once verified end-to-end on a
+  # Windows runner — added in a follow-up.
+  publish-dryrun:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, macos-26-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/install-build-deps
+      - name: Run publish-recipe action against llvm-dry-run (file:// backend)
+        uses: ./actions/publish-recipe
+        with:
+          recipe: llvm-dry-run
+          version: '22'
+          os: ${{ matrix.os }}
+          arch: x86_64
+          cache-base: file://${{ runner.temp }}/dryrun_cache/
+      - name: Verify asset + manifest landed
+        shell: bash
+        run: |
+          set -euo pipefail
+          key=$(bash actions/setup-recipe/compute-key.sh \
+            llvm-dry-run 22 ${{ matrix.os }} x86_64 | sed 's/^key=//')
+          ls -la "$RUNNER_TEMP/dryrun_cache/"
+          test -f "$RUNNER_TEMP/dryrun_cache/${key}.tar.zst"
+          test -f "$RUNNER_TEMP/dryrun_cache/${key}.manifest.json"
+          # Round-trip the asset to confirm it's well-formed end to end.
+          mkdir extract
+          zstd -d < "$RUNNER_TEMP/dryrun_cache/${key}.tar.zst" \
+            | tar -xf - -C extract
+          test -f extract/llvm-project/lib/cmake/llvm/LLVMConfig.cmake
+          echo "::notice::publish-dryrun OK on ${{ matrix.os }}"
 
   end-to-end-fixture:
     runs-on: ubuntu-24.04
