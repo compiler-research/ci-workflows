@@ -171,20 +171,19 @@ cache_upload() {
 # upload + every later download.
 #
 # Tar checkpoints emit one stderr line every ~50 MB of input so the
-# log shows liveness during the otherwise-silent pipe.
-#
-# WARNING: `--checkpoint=` / `--checkpoint-action=` are GNU tar
-# extensions; BSD tar (the default `tar` on macOS) parses them as
-# filenames and errors with "Cannot stat: No such file or directory".
-# This invocation is deliberately left ungated for now to verify the
-# verify.yml publish-dryrun matrix actually catches the failure on
-# macOS legs. Add the gating in a follow-up once the trigger has
-# fired red.
+# log shows liveness during the otherwise-silent pipe. `--checkpoint=`
+# / `--checkpoint-action=` are GNU tar extensions; BSD tar (the
+# default `tar` on macOS) parses them as filenames and errors with
+# "Cannot stat: No such file or directory". Gate on tar flavor so
+# the macOS path skips the flags entirely.
 cache_pack() {
   local in_dir="$1"
   local key="$2"
+  local tar_checkpoint=()
+  if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+    tar_checkpoint=(--checkpoint=100000 --checkpoint-action=echo='%T tar checkpoint')
+  fi
   echo "::notice::compressing ${key}.tar.zst (zstd -19 --long -T0)"
-  ( cd "$in_dir" && tar -cf - llvm-project \
-      --checkpoint=100000 --checkpoint-action=echo='%T tar checkpoint' \
-  ) | zstd -19 --long -T0 > "${key}.tar.zst"
+  ( cd "$in_dir" && tar -cf - llvm-project ${tar_checkpoint[@]+"${tar_checkpoint[@]}"} ) \
+    | zstd -19 --long -T0 > "${key}.tar.zst"
 }
