@@ -127,10 +127,17 @@ echo "build.sh: dropping intermediate .o files"
 find . -name '*.o' -delete
 echo "build.sh: post-cleanup disk: $(df -h . | tail -1)"
 
-# Drive the install through LLVM_DISTRIBUTION_COMPONENTS so the
-# generated LLVMExports.cmake only references libraries we actually
-# shipped. Same pattern as llvm-asan; see that recipe's build.sh and
-# https://llvm.org/docs/BuildingADistribution.html for the rationale.
+# Drive the LLVM/Clang install through LLVM_DISTRIBUTION_COMPONENTS so
+# the generated LLVMExports.cmake / ClangExports.cmake only reference
+# libraries we actually shipped. Same pattern as llvm-asan.
+#
+# Cling's cmake uses raw `install(TARGETS ...)` instead of LLVM's
+# `add_llvm_install_targets`, which means cling components have no
+# `install-X` umbrella targets. install-distribution requires those
+# umbrellas, so cling components must NOT be in DIST_COMPONENTS — we
+# install them separately below via `cmake --install --component`,
+# which runs the install rule directly without needing an umbrella.
+# Likewise, the per-library walk skips lib/libcling*.a.
 declare -a DIST_COMPONENTS=(
   clang
   clang-headers
@@ -140,10 +147,8 @@ declare -a DIST_COMPONENTS=(
   cmake-exports
   llvm-headers
   llvm-config
-  cling
-  clingInterpreter
 )
-for f in lib/libclang*.a lib/libLLVM*.a lib/libcling*.a; do
+for f in lib/libclang*.a lib/libLLVM*.a; do
   [[ -f "$f" ]] || continue
   DIST_COMPONENTS+=("$(basename "$f" | sed 's/^lib//; s/\.a$//')")
 done
@@ -153,6 +158,33 @@ echo "build.sh: LLVM_DISTRIBUTION_COMPONENTS=${DIST_STR}"
 cmake -DLLVM_DISTRIBUTION_COMPONENTS="${DIST_STR}" .
 
 ninja -j "${NCPUS}" install-distribution
+
+# Cling components — installed separately because cling's cmake doesn't
+# create install-X umbrellas. cmake --install --component runs the
+# install rule directly. Walk libcling*.a to discover what cling built;
+# the cling binary lands via its own component.
+for f in lib/libcling*.a; do
+  [[ -f "$f" ]] || continue
+  comp=$(basename "$f" | sed 's/^lib//; s/\.a$//')
+  cmake --install . --component "$comp" 2>/dev/null \
+    || echo "build.sh: cling component $comp install rule absent" >&2
+done
+# `cling` binary: cling's CMakeLists install(TARGETS cling RUNTIME ...)
+# uses COMPONENT cling. If that path doesn't exist (older cling),
+# fall back to a manual copy.
+if cmake --install . --component cling 2>/dev/null; then
+  :
+elif [[ -x bin/cling ]]; then
+  install -m 0755 bin/cling "$OUT_DIR/llvm-project/bin/"
+fi
+# Cling headers — cling's install rules typically don't ship them
+# (consumers historically read from the source tree via include path).
+# Stage them under include/cling/ in the install tree so consumers
+# find them without an extra source clone.
+if [[ -d "$WORK_DIR/cling/include/cling" ]]; then
+  mkdir -p "$OUT_DIR/llvm-project/include"
+  cp -R "$WORK_DIR/cling/include/cling" "$OUT_DIR/llvm-project/include/"
+fi
 
 # Producer-side smoke: find_package(LLVM)+(Clang) from a throwaway
 # cmake project against the install tree. Catches any missing-.a-in-
