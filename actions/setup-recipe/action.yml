@@ -30,8 +30,13 @@ inputs:
       Must match what publish-recipe used.
   build-on-miss:
     required: false
-    default: 'true'
-    description: 'On cache miss, build the recipe inline. When false, fail with a copy-pasteable publish-recipe invocation.'
+    default: 'false'
+    description: |
+      On cache miss, build the recipe inline. Default is 'false':
+      consumers usually want a hard fail with a copy-pasteable
+      publish-recipe invocation, not a silent ~30-min inline rebuild
+      that doubles every PR run after a recipe-content change. Set
+      to 'true' for the producer-of-record row that warms the cell.
   cache-base:
     required: false
     default: ''
