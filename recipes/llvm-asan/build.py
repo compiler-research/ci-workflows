@@ -59,51 +59,39 @@ def main() -> int:
     ncpus = os.environ["NCPUS"]
 
     os.chdir(work_dir)
-    if not (work_dir / "llvm-project" / ".git").is_dir():
-        subprocess.run(
-            ["git", "clone", "--depth=1", "-b", f"release/{version}.x",
-             "https://github.com/llvm/llvm-project.git"],
-            check=True,
-        )
-
-    os.chdir(work_dir / "llvm-project")
-    src_commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    github_env = os.environ.get("GITHUB_ENV", "")
-    if github_env:
-        with open(github_env, "a") as f:
-            f.write(f"SRC_COMMIT={src_commit}\n")
+    llvm_build.clone_shallow(
+        "https://github.com/llvm/llvm-project.git",
+        f"release/{version}.x",
+        work_dir / "llvm-project",
+    )
+    src_commit = llvm_build.record_src_commit(work_dir / "llvm-project")
 
     build_dir = work_dir / "llvm-project" / "build"
     build_dir.mkdir(exist_ok=True)
     os.chdir(build_dir)
 
-    cmake_args = [
-        "cmake", "-G", "Ninja",
-        f"-DCMAKE_INSTALL_PREFIX={out_dir / 'llvm-project'}",
-        '-DLLVM_ENABLE_PROJECTS=clang;compiler-rt',
-        '-DLLVM_TARGETS_TO_BUILD=host;NVPTX',
-        '-DCMAKE_BUILD_TYPE=Release',
-        '-DLLVM_ENABLE_ASSERTIONS=ON',
-        '-DLLVM_USE_SANITIZER=Address;Undefined',
-        '-DCLANG_ENABLE_STATIC_ANALYZER=OFF',
-        '-DCLANG_ENABLE_ARCMT=OFF',
-        '-DCLANG_ENABLE_FORMAT=OFF',
-        '-DCLANG_ENABLE_BOOTSTRAP=OFF',
-        '-DLLVM_INCLUDE_BENCHMARKS=OFF',
-        '-DLLVM_INCLUDE_EXAMPLES=OFF',
-        '-DLLVM_INCLUDE_TESTS=OFF',
-        '-DCOMPILER_RT_BUILD_BUILTINS=OFF',
-        '-DCOMPILER_RT_BUILD_LIBFUZZER=OFF',
-        '-DCOMPILER_RT_BUILD_PROFILE=OFF',
-        '-DCOMPILER_RT_BUILD_MEMPROF=OFF',
-        '-DCOMPILER_RT_BUILD_SANITIZERS=OFF',
-        '-DCOMPILER_RT_BUILD_XRAY=OFF',
-        '-DCOMPILER_RT_BUILD_GWP_ASAN=OFF',
-        '-DCOMPILER_RT_BUILD_CTX_PROFILE=OFF',
-    ] + llvm_build.cmake_extra() + ["../llvm"]
+    # asan-specific flags layered on top of base_cmake_args:
+    # - LLVM_USE_SANITIZER propagates to every C/C++ target so the
+    #   resident clang and the compiler-rt OOP runtime ship instrumented.
+    # - compiler-rt is enabled solely for orc_rt_<platform>, which the
+    #   OOP-JIT path needs; everything else under compiler-rt is OFF.
+    cmake_args = (
+        llvm_build.base_cmake_args(str(out_dir / "llvm-project"))
+        + [
+            '-DLLVM_ENABLE_PROJECTS=clang;compiler-rt',
+            '-DLLVM_USE_SANITIZER=Address;Undefined',
+            '-DCOMPILER_RT_BUILD_BUILTINS=OFF',
+            '-DCOMPILER_RT_BUILD_LIBFUZZER=OFF',
+            '-DCOMPILER_RT_BUILD_PROFILE=OFF',
+            '-DCOMPILER_RT_BUILD_MEMPROF=OFF',
+            '-DCOMPILER_RT_BUILD_SANITIZERS=OFF',
+            '-DCOMPILER_RT_BUILD_XRAY=OFF',
+            '-DCOMPILER_RT_BUILD_GWP_ASAN=OFF',
+            '-DCOMPILER_RT_BUILD_CTX_PROFILE=OFF',
+        ]
+        + llvm_build.cmake_extra()
+        + ["../llvm"]
+    )
     subprocess.run(cmake_args, check=True)
 
     llvm_build.quick_check_or_continue()

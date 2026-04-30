@@ -52,6 +52,98 @@ class SetupEnvTests(unittest.TestCase):
                 self.assertEqual(os.environ["NCPUS"], "7")
 
 
+class BaseCmakeArgsTests(unittest.TestCase):
+    """base_cmake_args is the single source of truth for the flag set
+    every LLVM-family recipe shares — drift here means a recipe goes red
+    silently in a way only a real CI run would catch. Pin the contract."""
+
+    def test_required_flags_present(self):
+        args = llvm_build.base_cmake_args("/opt/install")
+        self.assertEqual(args[:3], ["cmake", "-G", "Ninja"])
+        self.assertIn("-DCMAKE_INSTALL_PREFIX=/opt/install", args)
+        self.assertIn("-DLLVM_TARGETS_TO_BUILD=host;NVPTX", args)
+        self.assertIn("-DCMAKE_BUILD_TYPE=Release", args)
+        self.assertIn("-DLLVM_ENABLE_ASSERTIONS=ON", args)
+        # CLANG_ENABLE_* off-flags reduce build time in clang-using
+        # recipes; harmless when LLVM_ENABLE_PROJECTS doesn't include clang.
+        for flag in ("-DCLANG_ENABLE_STATIC_ANALYZER=OFF",
+                     "-DCLANG_ENABLE_ARCMT=OFF",
+                     "-DCLANG_ENABLE_FORMAT=OFF",
+                     "-DCLANG_ENABLE_BOOTSTRAP=OFF",
+                     "-DLLVM_INCLUDE_BENCHMARKS=OFF",
+                     "-DLLVM_INCLUDE_EXAMPLES=OFF",
+                     "-DLLVM_INCLUDE_TESTS=OFF"):
+            self.assertIn(flag, args)
+
+    def test_targets_override(self):
+        args = llvm_build.base_cmake_args("/p", targets="host")
+        self.assertIn("-DLLVM_TARGETS_TO_BUILD=host", args)
+        self.assertNotIn("-DLLVM_TARGETS_TO_BUILD=host;NVPTX", args)
+
+
+class CloneShallowTests(unittest.TestCase):
+    def test_skips_when_already_cloned(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "repo"
+            (dest / ".git").mkdir(parents=True)
+            with mock.patch.object(llvm_build.subprocess, "run") as run:
+                llvm_build.clone_shallow("https://example/r", "main", dest)
+            run.assert_not_called()
+
+    def test_invokes_git_clone_when_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "repo"
+            with mock.patch.object(llvm_build.subprocess, "run") as run:
+                run.return_value = subprocess.CompletedProcess([], 0)
+                llvm_build.clone_shallow("https://example/r.git",
+                                         "release/22.x", dest)
+            run.assert_called_once()
+            cmd = run.call_args[0][0]
+            self.assertEqual(cmd[:5],
+                             ["git", "clone", "--depth=1", "-b", "release/22.x"])
+            self.assertEqual(cmd[5], "https://example/r.git")
+            self.assertEqual(cmd[6], str(dest))
+
+
+class RecordSrcCommitTests(unittest.TestCase):
+    def test_returns_sha_and_appends_when_github_env_set(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            ge = Path(d) / "github_env"
+            ge.write_text("PRIOR=1\n")
+
+            def fake_run(cmd, **_):
+                self.assertEqual(cmd, ["git", "rev-parse", "HEAD"])
+                return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n")
+
+            with mock.patch.object(llvm_build.subprocess, "run",
+                                   side_effect=fake_run), \
+                 mock.patch.dict(os.environ, {"GITHUB_ENV": str(ge)},
+                                 clear=False):
+                sha = llvm_build.record_src_commit(repo)
+
+            self.assertEqual(sha, "abc123")
+            self.assertEqual(ge.read_text(),
+                             "PRIOR=1\nSRC_COMMIT=abc123\n")
+
+    def test_no_github_env_still_returns_sha(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+
+            def fake_run(cmd, **_):
+                return subprocess.CompletedProcess(cmd, 0, stdout="deadbeef\n")
+
+            env = {k: v for k, v in os.environ.items() if k != "GITHUB_ENV"}
+            with mock.patch.object(llvm_build.subprocess, "run",
+                                   side_effect=fake_run), \
+                 mock.patch.dict(os.environ, env, clear=True):
+                sha = llvm_build.record_src_commit(repo)
+
+            self.assertEqual(sha, "deadbeef")
+
+
 class CmakeExtraTests(unittest.TestCase):
     def test_empty_when_no_env(self):
         with mock.patch.dict(os.environ, {}, clear=True):

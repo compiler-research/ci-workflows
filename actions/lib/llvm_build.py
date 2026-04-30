@@ -49,6 +49,60 @@ def setup_env() -> None:
     Path(os.environ["OUT_DIR"]).mkdir(parents=True, exist_ok=True)
 
 
+def base_cmake_args(install_prefix: str,
+                    targets: str = "host;NVPTX") -> List[str]:
+    """Cmake flags every LLVM-family recipe shares.
+
+    Recipes append their flavor-specific flags (LLVM_USE_SANITIZER for
+    asan, LLVM_EXTERNAL_PROJECTS=cling for root, etc.) and feed the
+    combined list to cmake. Centralising the shared subset means a flag
+    bump happens in one place, not three.
+    """
+    return [
+        "cmake", "-G", "Ninja",
+        f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
+        f"-DLLVM_TARGETS_TO_BUILD={targets}",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DLLVM_ENABLE_ASSERTIONS=ON",
+        "-DCLANG_ENABLE_STATIC_ANALYZER=OFF",
+        "-DCLANG_ENABLE_ARCMT=OFF",
+        "-DCLANG_ENABLE_FORMAT=OFF",
+        "-DCLANG_ENABLE_BOOTSTRAP=OFF",
+        "-DLLVM_INCLUDE_BENCHMARKS=OFF",
+        "-DLLVM_INCLUDE_EXAMPLES=OFF",
+        "-DLLVM_INCLUDE_TESTS=OFF",
+    ]
+
+
+def clone_shallow(repo: str, branch: str, dest: Path) -> None:
+    """Shallow git clone to `dest` if missing. No-op on a re-run with
+    a populated working tree (ccache + actions/cache reuse the workspace).
+    """
+    if (dest / ".git").is_dir():
+        return
+    subprocess.run(
+        ["git", "clone", "--depth=1", "-b", branch, repo, str(dest)],
+        check=True,
+    )
+
+
+def record_src_commit(repo_path: Path) -> str:
+    """Return the HEAD sha of `repo_path` and append it to $GITHUB_ENV.
+
+    The action.yml uses `SRC_COMMIT` as a recipe-output env so
+    publish-recipe can stamp it into the manifest's source.commit.
+    """
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_path, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    github_env = os.environ.get("GITHUB_ENV", "")
+    if github_env:
+        with open(github_env, "a") as f:
+            f.write(f"SRC_COMMIT={sha}\n")
+    return sha
+
+
 def cmake_extra() -> List[str]:
     """Return cmake -D flags derived from CC/CXX/launcher env vars."""
     flags: List[str] = []
