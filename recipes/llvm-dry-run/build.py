@@ -40,22 +40,12 @@ def main() -> int:
     ncpus = os.environ["NCPUS"]
 
     os.chdir(work_dir)
-    if not (work_dir / "llvm-project" / ".git").is_dir():
-        subprocess.run(
-            ["git", "clone", "--depth=1", "-b", f"release/{version}.x",
-             "https://github.com/llvm/llvm-project.git"],
-            check=True,
-        )
-
-    os.chdir(work_dir / "llvm-project")
-    src_commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    github_env = os.environ.get("GITHUB_ENV", "")
-    if github_env:
-        with open(github_env, "a") as f:
-            f.write(f"SRC_COMMIT={src_commit}\n")
+    llvm_build.clone_shallow(
+        "https://github.com/llvm/llvm-project.git",
+        f"release/{version}.x",
+        work_dir / "llvm-project",
+    )
+    src_commit = llvm_build.record_src_commit(work_dir / "llvm-project")
 
     build_dir = work_dir / "llvm-project" / "build"
     build_dir.mkdir(exist_ok=True)
@@ -63,7 +53,10 @@ def main() -> int:
 
     # Minimal LLVM-only configure: no clang, no compiler-rt, just enough
     # for LLVMDemangle to build. host targets only — host;NVPTX would
-    # pull in extra deps we don't need here.
+    # pull in extra deps we don't need here. Deliberately not routed
+    # through base_cmake_args: the dry-run is intentionally narrower
+    # than real recipes (no LLVM_ENABLE_ASSERTIONS, no CLANG_*=OFF)
+    # since it never builds clang.
     cmake_args = [
         "cmake", "-G", "Ninja",
         f"-DCMAKE_INSTALL_PREFIX={out_dir / 'llvm-project'}",

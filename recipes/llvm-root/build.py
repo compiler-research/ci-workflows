@@ -111,28 +111,9 @@ def main() -> int:
           flush=True)
 
     os.chdir(work_dir)
-    if not (work_dir / "cling" / ".git").is_dir():
-        subprocess.run(
-            ["git", "clone", "--depth=1", "-b", cling_branch,
-             cling_repo, "cling"],
-            check=True,
-        )
-    if not (work_dir / "llvm-project" / ".git").is_dir():
-        subprocess.run(
-            ["git", "clone", "--depth=1", "-b", llvm_branch,
-             llvm_repo, "llvm-project"],
-            check=True,
-        )
-
-    os.chdir(work_dir / "llvm-project")
-    src_commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    github_env = os.environ.get("GITHUB_ENV", "")
-    if github_env:
-        with open(github_env, "a") as f:
-            f.write(f"SRC_COMMIT={src_commit}\n")
+    llvm_build.clone_shallow(cling_repo, cling_branch, work_dir / "cling")
+    llvm_build.clone_shallow(llvm_repo, llvm_branch, work_dir / "llvm-project")
+    src_commit = llvm_build.record_src_commit(work_dir / "llvm-project")
 
     build_dir = work_dir / "llvm-project" / "build"
     build_dir.mkdir(exist_ok=True)
@@ -143,23 +124,16 @@ def main() -> int:
     # raw install(TARGETS) rather than LLVM's add_llvm_install_targets,
     # so its components have no install-X umbrellas — they're installed
     # separately below via cmake --install --component.
-    cmake_args = [
-        "cmake", "-G", "Ninja",
-        f"-DCMAKE_INSTALL_PREFIX={out_dir / 'llvm-project'}",
-        '-DLLVM_ENABLE_PROJECTS=clang',
-        '-DLLVM_EXTERNAL_PROJECTS=cling',
-        f'-DLLVM_EXTERNAL_CLING_SOURCE_DIR={work_dir / "cling"}',
-        '-DLLVM_TARGETS_TO_BUILD=host;NVPTX',
-        '-DCMAKE_BUILD_TYPE=Release',
-        '-DLLVM_ENABLE_ASSERTIONS=ON',
-        '-DCLANG_ENABLE_STATIC_ANALYZER=OFF',
-        '-DCLANG_ENABLE_ARCMT=OFF',
-        '-DCLANG_ENABLE_FORMAT=OFF',
-        '-DCLANG_ENABLE_BOOTSTRAP=OFF',
-        '-DLLVM_INCLUDE_BENCHMARKS=OFF',
-        '-DLLVM_INCLUDE_EXAMPLES=OFF',
-        '-DLLVM_INCLUDE_TESTS=OFF',
-    ] + llvm_build.cmake_extra() + ["../llvm"]
+    cmake_args = (
+        llvm_build.base_cmake_args(str(out_dir / "llvm-project"))
+        + [
+            '-DLLVM_ENABLE_PROJECTS=clang',
+            '-DLLVM_EXTERNAL_PROJECTS=cling',
+            f'-DLLVM_EXTERNAL_CLING_SOURCE_DIR={work_dir / "cling"}',
+        ]
+        + llvm_build.cmake_extra()
+        + ["../llvm"]
+    )
     subprocess.run(cmake_args, check=True)
 
     llvm_build.quick_check_or_continue()
