@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Emit the JSON manifest describing a published recipe build.
+
+Args: RECIPE VERSION OS ARCH KEY
+Reads (env):
+  SRC_COMMIT             set by the recipe's build script
+  GITHUB_SHA             the ci-workflows commit being built from
+  ImageOS, ImageVersion  runner image identifiers (GHA-injected)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+
+def _file_sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _grep_yaml_value(yaml_path: Path, key: str) -> Optional[str]:
+    """Extract `<key>: value` from a YAML file (no parser needed for the
+    handful of fields we surface). Returns first match or None.
+
+    Same shape as the bash predecessor's grep+sed pipeline; not a
+    general YAML parser.
+    """
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*:\s*(.*?)\s*$")
+    try:
+        for line in yaml_path.read_text().splitlines():
+            m = pattern.match(line)
+            if m:
+                return m.group(1).strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def _build_script(recipe_dir: Path) -> Optional[Path]:
+    sh = recipe_dir / "build.sh"
+    py = recipe_dir / "build.py"
+    if sh.is_file():
+        return sh
+    if py.is_file():
+        return py
+    return None
+
+
+def build_manifest(recipe: str, version: str, os_: str, arch: str,
+                   key: str, recipe_root: str = "recipes") -> dict:
+    """Return the manifest as a dict; caller json-encodes."""
+    recipe_dir = Path(recipe_root) / recipe
+    yaml_path = recipe_dir / "recipe.yaml"
+
+    recipe_yaml_sha = _file_sha(yaml_path) if yaml_path.is_file() else "unknown"
+    bs = _build_script(recipe_dir)
+    build_script_sha = _file_sha(bs) if bs is not None else "unknown"
+    build_script_name = bs.name if bs is not None else "unknown"
+
+    repo = _grep_yaml_value(yaml_path, "repo") or "unknown"
+    branch_tpl = _grep_yaml_value(yaml_path, "branch_template") or ""
+    branch = branch_tpl.replace("{version}", version) if branch_tpl else "unknown"
+
+    return {
+        "key": key,
+        "recipe": recipe,
+        "version": version,
+        "platform": {
+            "os": os_,
+            "arch": arch,
+            "runner_image":         os.environ.get("ImageOS", "unknown"),
+            "runner_image_version": os.environ.get("ImageVersion", "unknown"),
+        },
+        "recipe_yaml_sha256": recipe_yaml_sha,
+        "build_script": build_script_name,
+        "build_script_sha256": build_script_sha,
+        # Backward-compat alias for tooling that read the old field name.
+        "build_sh_sha256": build_script_sha,
+        "source": {
+            "repo":   repo,
+            "branch": branch,
+            "commit": os.environ.get("SRC_COMMIT", "unknown"),
+        },
+        "ci_workflows_sha": os.environ.get("GITHUB_SHA", "unknown"),
+        "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _main(argv: list[str]) -> int:
+    if len(argv) not in (5, 6):
+        print("usage: build_manifest.py RECIPE VERSION OS ARCH KEY [recipe_root]",
+              file=sys.stderr)
+        return 2
+    recipe_root = argv[5] if len(argv) == 6 else "recipes"
+    manifest = build_manifest(*argv[:5], recipe_root=recipe_root)
+    json.dump(manifest, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))

@@ -52,7 +52,7 @@ runs:
         OS: ${{ steps.slugs.outputs.os }}
         ARCH: ${{ steps.slugs.outputs.arch }}
       run: |
-        bash actions/setup-recipe/compute-key.sh \
+        python3 actions/setup-recipe/compute_key.py \
           "$RECIPE" "$VERSION" "$OS" "$ARCH" >> "$GITHUB_OUTPUT"
 
     # Why: workflow_dispatch can fire against a key that's already
@@ -68,15 +68,14 @@ runs:
         EXPLICIT_BASE: ${{ inputs.cache-base }}
         DEFAULT_GH_BASE: https://github.com/${{ github.repository }}/releases/download/cache/
       run: |
-        source actions/lib/cache-io.sh
         # The default for the *publish* path is this repo's own Releases,
-        # not the upstream ci-workflows one. resolve_cache_base falls
-        # back to the upstream default when no override is set, which is
-        # wrong for forks; force the github.repository-derived URL when
-        # neither inputs nor env supply one.
+        # not the upstream ci-workflows one. cache_io.resolve_cache_base
+        # falls back to the upstream default when no override is set,
+        # which is wrong for forks; force the github.repository-derived
+        # URL when neither inputs nor env supply one.
         base="${EXPLICIT_BASE:-${RECIPE_CACHE_BASE:-$DEFAULT_GH_BASE}}"
         echo "base=$base" >> "$GITHUB_OUTPUT"
-        if cache_probe "$base" "$KEY"; then
+        if python3 actions/lib/cache_io.py probe "$base" "$KEY"; then
           echo "::notice::cache hit; skipping build for key=${KEY}"
           echo "exists=true" >> "$GITHUB_OUTPUT"
         else
@@ -110,14 +109,13 @@ runs:
         BASE: ${{ steps.skip.outputs.base }}
         GH_TOKEN: ${{ github.token }}
       run: |
-        source actions/lib/cache-io.sh
-        parsed="$(gh_release_url_parse "$BASE")"
+        parsed="$(python3 actions/lib/cache_io.py release-url-parse "$BASE")"
         owner_repo="${parsed%$'\t'*}"
         tag="${parsed#*$'\t'}"
         if ! gh release view "$tag" -R "$owner_repo" >/dev/null 2>&1; then
           gh release create "$tag" -R "$owner_repo" \
             --title "Recipe cache" \
-            --notes "Rolling cache of prebuilt recipe artifacts. Each asset is keyed by sha256 of (recipe.yaml, build.sh, patches, version, os, arch). See <key>.manifest.json for the inputs that produced any given <key>.tar.zst."
+            --notes "Rolling cache of prebuilt recipe artifacts. Each asset is keyed by sha256 of (recipe.yaml, build.{sh,py}, patches, version, os, arch). See <key>.manifest.json for the inputs that produced any given <key>.tar.zst."
         fi
 
     - name: Build recipe
@@ -131,7 +129,15 @@ runs:
         CMAKE_CXX_COMPILER_LAUNCHER: ccache
       run: |
         mkdir -p "$WORK_DIR" "$OUT_DIR"
-        bash recipes/${{ inputs.recipe }}/build.sh
+        # Dispatch by recipe build script: prefer build.py (Python,
+        # native on every OS) over build.sh (bash, requires git-bash
+        # on Windows and trips on bash 3.2 quirks on macOS). Recipes
+        # migrate one at a time.
+        if [[ -f "recipes/${{ inputs.recipe }}/build.py" ]]; then
+          python3 "recipes/${{ inputs.recipe }}/build.py"
+        else
+          bash "recipes/${{ inputs.recipe }}/build.sh"
+        fi
 
     - name: Build manifest
       if: steps.skip.outputs.exists != 'true'
@@ -143,7 +149,7 @@ runs:
         OS: ${{ steps.slugs.outputs.os }}
         ARCH: ${{ steps.slugs.outputs.arch }}
       run: |
-        bash actions/publish-recipe/build-manifest.sh \
+        python3 actions/publish-recipe/build_manifest.py \
           "$RECIPE" "$VERSION" "$OS" "$ARCH" "$KEY" \
           > "${{ github.workspace }}/_recipe_out/${KEY}.manifest.json"
 
@@ -155,11 +161,10 @@ runs:
         BASE: ${{ steps.skip.outputs.base }}
         GH_TOKEN: ${{ github.token }}
       run: |
-        source actions/lib/cache-io.sh
+        REPO_ROOT="$(pwd)"
         cd "${{ github.workspace }}/_recipe_out"
-        echo "::notice::input tree size:"
-        du -sh llvm-project
-        cache_pack . "${KEY}"
+        # Python tarfile + zstd: no `tar` binary, no GNU/BSD flag drift.
+        python3 "$REPO_ROOT/actions/lib/cache_io.py" pack . "$KEY"
         ls -lh "${KEY}.tar.zst"
         # The notice URL: $BASE is the asset *prefix*
         # (https://.../releases/download/cache/) which 404s when clicked
@@ -167,13 +172,12 @@ runs:
         # release-page URL (.../releases/tag/cache) so a reviewer
         # clicking the notice in the GHA log lands on the actual
         # release. file:// backends fall through to the raw $BASE.
-        if [[ "$BASE" == https://github.com/*/releases/download/*/ ]]; then
-          parsed="$(gh_release_url_parse "$BASE")"
+        release_url="$BASE"
+        if parsed="$(python3 "$REPO_ROOT/actions/lib/cache_io.py" release-url-parse "$BASE" 2>/dev/null)"; then
           owner_repo="${parsed%$'\t'*}"
           tag="${parsed#*$'\t'}"
           release_url="https://github.com/${owner_repo}/releases/tag/${tag}"
-        else
-          release_url="$BASE"
         fi
         echo "::notice::uploading ${KEY} to ${release_url}"
-        cache_upload "$BASE" "$KEY" "${KEY}.tar.zst" "${KEY}.manifest.json"
+        python3 "$REPO_ROOT/actions/lib/cache_io.py" upload \
+          "$BASE" "$KEY" "${KEY}.tar.zst" "${KEY}.manifest.json"

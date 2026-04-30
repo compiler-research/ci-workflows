@@ -1,238 +1,294 @@
-#!/usr/bin/env bash
-# recipe-cache — local CLI for the recipe cache contract.
-#
-# FIXME(port-to-python): bash works on Linux/macOS and on Windows via
-# git-bash, but not on bare CMD/PowerShell. When a Windows-native
-# developer flow needs this, port to stdlib-only Python alongside
-# actions/lib/cache-io.sh. See the FIXME at the top of that file.
-#
-# Same key formula and tarball shape as the GitHub-side actions, with
-# a file:// backend by default. Lets a developer build, mock, fetch,
-# and inspect cached recipes on their own machine without GitHub.
-#
-# Examples:
-#   recipe-cache build llvm-asan 22 ubuntu-24.04 x86_64
-#       Run the recipe's build.sh and store the result locally.
-#
-#   recipe-cache pack llvm-asan 22 darwin arm64 --from /path/to/build
-#       Treat /path/to/build as if a recipe build had produced it
-#       (mockup mode for testing the cache layer without a 30-min build).
-#
-#   recipe-cache get llvm-asan 22 ubuntu-24.04 x86_64 --out /tmp/llvm
-#       Fetch from the local cache and extract under /tmp/llvm/.
-#
-#   recipe-cache list
-#       Show every cell currently cached.
-#
-# Env:
-#   RECIPE_CACHE_DIR   local cache directory (default: ~/.cache/recipe-cache)
+#!/usr/bin/env python3
+"""recipe-cache — local CLI for the recipe cache contract.
 
-set -euo pipefail
+Same key formula and tarball shape as the GitHub-side actions, with a
+file:// backend by default. Lets a developer build, mock, fetch, and
+inspect cached recipes on their own machine.
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+Examples:
+  recipe-cache build llvm-asan 22 ubuntu-24.04 x86_64
+      Run the recipe's build script and store the result locally.
 
-# shellcheck source=../actions/lib/cache-io.sh
-source "$REPO_ROOT/actions/lib/cache-io.sh"
+  recipe-cache pack llvm-asan 22 darwin arm64 --from /path/to/build
+      Treat /path/to/build as if a recipe build had produced it
+      (mockup mode for testing the cache layer without a 30-min build).
 
-CACHE_DIR="${RECIPE_CACHE_DIR:-$HOME/.cache/recipe-cache}"
-CACHE_BASE="file://$CACHE_DIR"
+  recipe-cache get llvm-asan 22 ubuntu-24.04 x86_64 --out /tmp/llvm
+      Fetch from the local cache and extract under /tmp/llvm/.
 
-usage() {
-  cat <<'EOF'
-Usage: recipe-cache <command> [args]
-
-Commands:
-  build  RECIPE VERSION OS ARCH                  Build via the recipe's build.sh and cache the result.
-  pack   RECIPE VERSION OS ARCH --from PATH      Treat PATH as if a recipe build had produced it (mockup).
-  get    RECIPE VERSION OS ARCH [--out DIR] [--build-on-miss]
-                                                 Fetch + extract from the local cache.
-  key    RECIPE VERSION OS ARCH                  Print the cache key for these inputs.
-  list                                           Show cached cells with sizes.
-  rm     KEY                                     Delete a cached cell by full key.
+  recipe-cache list
+      Show every cell currently cached.
 
 Env:
-  RECIPE_CACHE_DIR    local cache directory (default: ~/.cache/recipe-cache)
-EOF
-}
+  RECIPE_CACHE_DIR   local cache directory (default: ~/.cache/recipe-cache)
+"""
 
-die() { echo "recipe-cache: $*" >&2; exit 2; }
+from __future__ import annotations
 
-compute_key() {
-  local recipe="$1" version="$2" os="$3" arch="$4"
-  bash "$REPO_ROOT/actions/setup-recipe/compute-key.sh" \
-    "$recipe" "$version" "$os" "$arch" "$REPO_ROOT/recipes" \
-    | sed 's/^key=//'
-}
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
 
-cmd_key() {
-  [[ $# -eq 4 ]] || die "key: expected 4 args (recipe version os arch)"
-  compute_key "$1" "$2" "$3" "$4"
-}
+# Set up sys.path so we can import the lib modules.
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(REPO_ROOT / "actions" / "lib"))
+sys.path.insert(0, str(REPO_ROOT / "actions" / "setup-recipe"))
 
-cmd_build() {
-  [[ $# -eq 4 ]] || die "build: expected 4 args (recipe version os arch)"
-  local recipe="$1" version="$2" os="$3" arch="$4"
-  local key; key="$(compute_key "$recipe" "$version" "$os" "$arch")"
+import cache_io                              # noqa: E402
+from compute_key import compute_key           # noqa: E402
 
-  if cache_probe "$CACHE_BASE" "$key"; then
-    echo "skip: $key already cached"
+
+def _cache_dir() -> Path:
+    return Path(os.environ.get(
+        "RECIPE_CACHE_DIR",
+        str(Path.home() / ".cache" / "recipe-cache"),
+    ))
+
+
+def _cache_base() -> str:
+    return f"file://{_cache_dir()}"
+
+
+def _key(recipe: str, version: str, os_: str, arch: str) -> str:
+    return compute_key(recipe, version, os_, arch,
+                       recipe_root=str(REPO_ROOT / "recipes"))
+
+
+# ---------------------------------------------------------------------------
+
+def cmd_key(args: argparse.Namespace) -> int:
+    print(_key(args.recipe, args.version, args.os, args.arch))
     return 0
-  fi
 
-  mkdir -p "$CACHE_DIR"
-  local work out
-  work="$(mktemp -d)"
-  out="$(mktemp -d)"
 
-  RECIPE_VERSION="$version" \
-  WORK_DIR="$work" \
-  OUT_DIR="$out" \
-    bash "$REPO_ROOT/recipes/$recipe/build.sh"
+def cmd_build(args: argparse.Namespace) -> int:
+    key = _key(args.recipe, args.version, args.os, args.arch)
+    cache_dir = _cache_dir()
 
-  ( cd "$out" && tar -cf - llvm-project | zstd -19 --long > "$CACHE_DIR/${key}.tar.zst" )
+    if cache_io.cache_probe(_cache_base(), key):
+        print(f"skip: {key} already cached")
+        return 0
 
-  ( cd "$REPO_ROOT" && \
-    SRC_COMMIT="${SRC_COMMIT:-unknown}" \
-    bash actions/publish-recipe/build-manifest.sh \
-      "$recipe" "$version" "$os" "$arch" "$key" \
-      > "$CACHE_DIR/${key}.manifest.json" )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as work_str, \
+         tempfile.TemporaryDirectory() as out_str:
+        env = os.environ | {
+            "RECIPE_VERSION": args.version,
+            "WORK_DIR":       work_str,
+            "OUT_DIR":        out_str,
+        }
+        recipe_dir = REPO_ROOT / "recipes" / args.recipe
+        if (recipe_dir / "build.py").is_file():
+            cmd = ["python3", str(recipe_dir / "build.py")]
+        elif (recipe_dir / "build.sh").is_file():
+            cmd = ["bash", str(recipe_dir / "build.sh")]
+        else:
+            print(f"recipe-cache: no build.py or build.sh in {recipe_dir}",
+                  file=sys.stderr)
+            return 2
+        subprocess.run(cmd, env=env, check=True)
 
-  rm -rf "$work" "$out"
-  echo "built: $CACHE_DIR/${key}.tar.zst"
-}
+        cache_io.cache_pack(out_str, key, str(cache_dir))
 
-cmd_pack() {
-  local recipe="" version="" os="" arch="" from=""
-  [[ $# -ge 4 ]] || die "pack: expected at least 4 positional args"
-  recipe="$1"; version="$2"; os="$3"; arch="$4"; shift 4
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --from) from="$2"; shift 2 ;;
-      *) die "pack: unknown arg: $1" ;;
-    esac
-  done
-  [[ -n "$from" ]]      || die "pack: --from PATH is required"
-  [[ -d "$from" ]]      || die "pack: --from path is not a directory: $from"
+        # Manifest. Reuse the same module the publish-recipe action does.
+        sys.path.insert(0, str(REPO_ROOT / "actions" / "publish-recipe"))
+        from build_manifest import build_manifest  # noqa: E402
 
-  local key abs_from
-  key="$(compute_key "$recipe" "$version" "$os" "$arch")"
-  abs_from="$(cd "$from" && pwd -P)"
+        manifest = build_manifest(
+            args.recipe, args.version, args.os, args.arch, key,
+            recipe_root=str(REPO_ROOT / "recipes"),
+        )
+        (cache_dir / f"{key}.manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n"
+        )
 
-  mkdir -p "$CACHE_DIR"
-  local work; work="$(mktemp -d)"
-
-  # Symlink the source into work/llvm-project so the tarball root
-  # matches what build.sh would produce; tar -h dereferences. This
-  # avoids copying gigabytes when a real LLVM tree is being mocked.
-  ln -s "$abs_from" "$work/llvm-project"
-  ( cd "$work" && tar -chf - llvm-project | zstd -3 > "$CACHE_DIR/${key}.tar.zst" )
-
-  # Synthetic manifest — packed assets carry less provenance than
-  # built ones (no source.commit). Mark them clearly so an operator
-  # can distinguish a mockup from a real build.
-  cat > "$CACHE_DIR/${key}.manifest.json" <<EOF
-{
-  "key": "$key",
-  "recipe": "$recipe",
-  "version": "$version",
-  "platform": {
-    "os": "$os",
-    "arch": "$arch",
-    "runner_image": "local-mockup",
-    "runner_image_version": "n/a"
-  },
-  "source": {
-    "repo": "mockup://",
-    "branch": "n/a",
-    "commit": "n/a"
-  },
-  "ci_workflows_sha": "$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)",
-  "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "packed_from": "$abs_from",
-  "kind": "mockup"
-}
-EOF
-
-  rm -rf "$work"
-  local size; size="$(du -h "$CACHE_DIR/${key}.tar.zst" | awk '{print $1}')"
-  echo "packed: $CACHE_DIR/${key}.tar.zst (${size})"
-}
-
-cmd_get() {
-  local recipe="" version="" os="" arch="" out="" build_on_miss=0
-  [[ $# -ge 4 ]] || die "get: expected at least 4 positional args"
-  recipe="$1"; version="$2"; os="$3"; arch="$4"; shift 4
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --out) out="$2"; shift 2 ;;
-      --build-on-miss) build_on_miss=1; shift ;;
-      *) die "get: unknown arg: $1" ;;
-    esac
-  done
-  out="${out:-$PWD}"
-
-  local key; key="$(compute_key "$recipe" "$version" "$os" "$arch")"
-
-  if cache_probe "$CACHE_BASE" "$key"; then
-    cache_download "$CACHE_BASE" "$key" "$out"
-    echo "hit: $key → $out"
+    print(f"built: {cache_dir / (key + '.tar.zst')}")
     return 0
-  fi
 
-  if [[ $build_on_miss -eq 1 ]]; then
-    cmd_build "$recipe" "$version" "$os" "$arch"
-    cache_download "$CACHE_BASE" "$key" "$out"
-    echo "built+got: $key → $out"
+
+def cmd_pack(args: argparse.Namespace) -> int:
+    src = Path(args.source).resolve()
+    if not src.is_dir():
+        print(f"pack: --from path is not a directory: {src}", file=sys.stderr)
+        return 2
+    key = _key(args.recipe, args.version, args.os, args.arch)
+    cache_dir = _cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pack the directory as if it were named llvm-project (matches what
+    # build.sh would produce). Use tarfile directly with arcname so we
+    # don't need to materialise a symlink (which doesn't work cleanly
+    # on Windows for non-admins).
+    asset_path = cache_dir / f"{key}.tar.zst"
+    print(f"::notice::compressing {key}.tar.zst (zstd -3)", flush=True)
+    with asset_path.open("wb") as out_f:
+        zstd = subprocess.Popen(
+            ["zstd", "-3"], stdin=subprocess.PIPE, stdout=out_f,
+        )
+        try:
+            with tarfile.open(fileobj=zstd.stdin, mode="w|") as tar:
+                tar.add(src, arcname="llvm-project")
+        finally:
+            assert zstd.stdin is not None
+            zstd.stdin.close()
+        rc = zstd.wait()
+    if rc != 0:
+        print(f"pack: zstd exited {rc}", file=sys.stderr)
+        return 1
+
+    # Synthetic manifest — packed assets have less provenance than built
+    # ones (no source.commit). Mark them with kind=mockup so list shows it.
+    try:
+        ci_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except subprocess.CalledProcessError:
+        ci_sha = "unknown"
+    manifest = {
+        "key": key,
+        "recipe": args.recipe,
+        "version": args.version,
+        "platform": {
+            "os": args.os, "arch": args.arch,
+            "runner_image": "local-mockup", "runner_image_version": "n/a",
+        },
+        "source": {"repo": "mockup://", "branch": "n/a", "commit": "n/a"},
+        "ci_workflows_sha": ci_sha,
+        "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "packed_from": str(src),
+        "kind": "mockup",
+    }
+    (cache_dir / f"{key}.manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n"
+    )
+
+    size_kb = asset_path.stat().st_size / 1024
+    print(f"packed: {asset_path} ({size_kb:.0f} KiB)")
     return 0
-  fi
 
-  echo "miss: $key (no asset in $CACHE_DIR)" >&2
-  echo "  to populate: recipe-cache build $recipe $version $os $arch" >&2
-  return 1
-}
 
-cmd_list() {
-  if [[ ! -d "$CACHE_DIR" ]]; then
-    echo "(no cache at $CACHE_DIR)"
-    return
-  fi
-  local any=0
-  for m in "$CACHE_DIR"/*.manifest.json; do
-    [[ -e "$m" ]] || continue
-    any=1
-    local key size kind
-    key="$(basename "$m" .manifest.json)"
-    size="$(du -h "$CACHE_DIR/${key}.tar.zst" 2>/dev/null | awk '{print $1}')"
-    kind="$(grep -E '"kind"' "$m" 2>/dev/null | sed -E 's/.*"kind"\s*:\s*"([^"]+)".*/\1/' || true)"
-    if [[ -n "$kind" ]]; then
-      printf '%-72s %6s  [%s]\n' "$key" "${size:-?}" "$kind"
-    else
-      printf '%-72s %6s\n'        "$key" "${size:-?}"
-    fi
-  done
-  [[ $any -eq 1 ]] || echo "(empty: $CACHE_DIR)"
-}
+def cmd_get(args: argparse.Namespace) -> int:
+    key = _key(args.recipe, args.version, args.os, args.arch)
+    out = Path(args.out or os.getcwd())
 
-cmd_rm() {
-  [[ $# -eq 1 ]] || die "rm: expected 1 arg (key)"
-  local key="$1"
-  if [[ ! -f "$CACHE_DIR/${key}.tar.zst" ]]; then
-    die "rm: no such key: $key"
-  fi
-  rm -f "$CACHE_DIR/${key}.tar.zst" "$CACHE_DIR/${key}.manifest.json"
-  echo "removed: $key"
-}
+    if cache_io.cache_probe(_cache_base(), key):
+        cache_io.cache_download(_cache_base(), key, str(out))
+        print(f"hit: {key} -> {out}")
+        return 0
 
-cmd="${1:-}"
-[[ -n "$cmd" ]] && shift
-case "$cmd" in
-  build) cmd_build "$@" ;;
-  pack)  cmd_pack  "$@" ;;
-  get)   cmd_get   "$@" ;;
-  key)   cmd_key   "$@" ;;
-  list)  cmd_list  "$@" ;;
-  rm)    cmd_rm    "$@" ;;
-  -h|--help|help|"") usage ;;
-  *) echo "unknown command: $cmd" >&2; usage; exit 2 ;;
-esac
+    if args.build_on_miss:
+        rc = cmd_build(args)
+        if rc != 0:
+            return rc
+        cache_io.cache_download(_cache_base(), key, str(out))
+        print(f"built+got: {key} -> {out}")
+        return 0
+
+    print(f"miss: {key} (no asset in {_cache_dir()})", file=sys.stderr)
+    print(f"  to populate: recipe-cache build "
+          f"{args.recipe} {args.version} {args.os} {args.arch}",
+          file=sys.stderr)
+    return 1
+
+
+def cmd_list(_args: argparse.Namespace) -> int:
+    cache_dir = _cache_dir()
+    if not cache_dir.is_dir():
+        print(f"(no cache at {cache_dir})")
+        return 0
+    any_found = False
+    for m in sorted(cache_dir.glob("*.manifest.json")):
+        any_found = True
+        key = m.name[:-len(".manifest.json")]
+        asset = cache_dir / f"{key}.tar.zst"
+        size = "?"
+        try:
+            size_kb = asset.stat().st_size / 1024
+            size = f"{size_kb:.0f}K" if size_kb < 1024 else f"{size_kb/1024:.0f}M"
+        except OSError:
+            pass
+        kind = ""
+        try:
+            data = json.loads(m.read_text())
+            kind = data.get("kind", "")
+        except (OSError, json.JSONDecodeError):
+            pass
+        if kind:
+            print(f"{key:<72} {size:>6}  [{kind}]")
+        else:
+            print(f"{key:<72} {size:>6}")
+    if not any_found:
+        print(f"(empty: {cache_dir})")
+    return 0
+
+
+def cmd_rm(args: argparse.Namespace) -> int:
+    cache_dir = _cache_dir()
+    asset = cache_dir / f"{args.key}.tar.zst"
+    if not asset.is_file():
+        print(f"rm: no such key: {args.key}", file=sys.stderr)
+        return 2
+    asset.unlink()
+    manifest = cache_dir / f"{args.key}.manifest.json"
+    if manifest.is_file():
+        manifest.unlink()
+    print(f"removed: {args.key}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="recipe-cache")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add_recipe_args(parser):
+        parser.add_argument("recipe")
+        parser.add_argument("version")
+        parser.add_argument("os")
+        parser.add_argument("arch")
+
+    p_build = sub.add_parser("build")
+    add_recipe_args(p_build)
+    p_build.set_defaults(func=cmd_build)
+
+    p_pack = sub.add_parser("pack")
+    add_recipe_args(p_pack)
+    p_pack.add_argument("--from", dest="source", required=True)
+    p_pack.set_defaults(func=cmd_pack)
+
+    p_get = sub.add_parser("get")
+    add_recipe_args(p_get)
+    p_get.add_argument("--out")
+    p_get.add_argument("--build-on-miss", action="store_true")
+    p_get.set_defaults(func=cmd_get)
+
+    p_key = sub.add_parser("key")
+    add_recipe_args(p_key)
+    p_key.set_defaults(func=cmd_key)
+
+    p_list = sub.add_parser("list")
+    p_list.set_defaults(func=cmd_list)
+
+    p_rm = sub.add_parser("rm")
+    p_rm.add_argument("key")
+    p_rm.set_defaults(func=cmd_rm)
+
+    return p
+
+
+def main(argv: list[str]) -> int:
+    args = _build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

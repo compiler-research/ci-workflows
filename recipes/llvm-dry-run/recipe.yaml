@@ -1,7 +1,7 @@
 recipe: llvm-dry-run
 description: |
   PR-time dry-run recipe. Produces a tiny LLVM install tree
-  (LLVMDemangle only) by going through the same actions/lib/llvm-build.sh
+  (LLVMDemangle only) by going through the same actions/lib/llvm_build.py
   helper and the same actions/publish-recipe action that real publishes
   use. The verify.yml publish-dryrun matrix invokes this recipe with
   cache-base: file:///... so no actual upload happens; the goal is to
