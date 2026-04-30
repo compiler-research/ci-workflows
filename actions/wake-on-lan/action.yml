@@ -1,29 +1,7 @@
 name: 'Wake-on-LAN'
-description: |
-  Send a magic packet to wake a self-hosted runner, then wait for it
-  to come online (TCP connect probe).
-
-  Every step is gated on `!env.ACT`, so under act (env.ACT=true) the
-  whole action is a no-op success. Consuming workflows do NOT need
-  their own env.ACT guard on the wake job; the dependent build
-  job's normal `needs:` chain is satisfied either way:
-
-      jobs:
-        wake-runner:
-          # The job's runs-on must still resolve under act; conditional
-          # on env.ACT to fall back to a hosted runner image act knows
-          # how to map.
-          runs-on: ${{ env.ACT && 'ubuntu-latest' || fromJSON('["self-hosted", "spotter"]') }}
-          steps:
-            - uses: compiler-research/ci-workflows/actions/wake-on-lan@<sha>
-              with:
-                mac: ${{ secrets.DELL_MAC }}
-                target-host: ${{ vars.DELL_HOST }}
-
-        build:
-          needs: wake-runner
-          runs-on: [self-hosted, dell]
-          ...
+description: >-
+  Send a magic packet to wake a self-hosted runner, then wait for
+  it to come online (TCP connect probe).
 
 inputs:
   mac:
@@ -73,7 +51,6 @@ runs:
   using: composite
   steps:
     - name: Mask sensitive values in logs
-      if: ${{ !env.ACT }}
       shell: bash
       env:
         MAC: ${{ inputs.mac }}
@@ -88,7 +65,7 @@ runs:
         [ -n "$BCAST" ] && echo "::add-mask::$BCAST"
 
     - name: Skip if target already responsive
-      if: ${{ !env.ACT && inputs.target-host != '' }}
+      if: ${{ inputs.target-host != '' }}
       id: precheck
       shell: bash
       env:
@@ -105,7 +82,7 @@ runs:
         fi
 
     - name: Send magic packet
-      if: ${{ !env.ACT && steps.precheck.outputs.skip != 'true' }}
+      if: ${{ steps.precheck.outputs.skip != 'true' }}
       shell: bash
       env:
         MAC: ${{ inputs.mac }}
@@ -151,7 +128,7 @@ runs:
         PYEOF
 
     - name: Wait for target online
-      if: ${{ !env.ACT && steps.precheck.outputs.skip != 'true' && inputs.target-host != '' }}
+      if: ${{ steps.precheck.outputs.skip != 'true' && inputs.target-host != '' }}
       shell: bash
       env:
         HOST: ${{ inputs.target-host }}
@@ -170,9 +147,3 @@ runs:
         done
         echo "::error title=Wake-on-LAN::target did not accept TCP/$PORT within ${TIMEOUT}s"
         exit 1
-
-    - name: Note skipped under act
-      if: ${{ env.ACT }}
-      shell: bash
-      run: |
-        echo "::notice title=Wake-on-LAN::skipped under act (\$ACT=true)"

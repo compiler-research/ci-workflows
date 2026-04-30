@@ -250,17 +250,14 @@ spotter runner and waits for SSH (TCP port 22) on the target:
 ```yaml
 jobs:
   wake-runner:
-    name: Activate self-host infrastructure
-    # The spotter runner shares a LAN with the dell so the magic
-    # packet reaches it via subnet broadcast. Conditional runs-on
-    # falls back to ubuntu-latest under act so the job has a runner
-    # act knows how to map.
-    runs-on: ${{ env.ACT && 'ubuntu-latest' || fromJSON('["self-hosted", "spotter"]') }}
+    # Spotter runner shares a LAN with the dell so the magic packet
+    # reaches it via subnet broadcast.
+    runs-on: [self-hosted, spotter]
     steps:
       - uses: compiler-research/ci-workflows/actions/wake-on-lan@<sha>
         with:
-          mac: ${{ secrets.DELL_MAC }}
-          target-host: ${{ vars.DELL_IP }}
+          mac: <hardware address>
+          target-host: <ip address>
           # target-port: 22             # default; SSH = "ready"
           # broadcast: 192.168.100.255  # default derived from IPv4 target
           # port: 9                     # UDP WoL port; some old routers use 7
@@ -272,10 +269,10 @@ jobs:
     ...
 ```
 
-The action's steps are gated on `!env.ACT`, so under act
-(`bin/repro` or plain `act`) the action runs to no-op success and
-`build`'s `needs:` chain is satisfied without any extra
-`if: success() || env.ACT` boilerplate in the consuming workflow.
+The action makes no assumptions about act -- it just sends the
+packet. Consumers whose self-hosted runner is unreachable from act
+(the typical case) don't need any guarding; act-only repro paths
+target hosted-runner jobs that don't need the wake at all.
 
 What the action does:
 - Masks MAC/IP/broadcast in the run log (`::add-mask::`).
