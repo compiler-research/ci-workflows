@@ -124,6 +124,32 @@ class PerturbationTests(unittest.TestCase):
         )
         self.assertNotEqual(self.base, self._key())
 
+    def test_lib_content_invalidates(self):
+        # actions/lib/ Python contents must move the key: changes
+        # there reshape the published artifact (component lists,
+        # smoke checks), so old cells must stop shadowing new code.
+        lib = Path(self.dir) / "actions_lib"
+        lib.mkdir()
+        (lib / "llvm_build.py").write_text("orig\n")
+        with_lib = self._key(lib_root=str(lib))
+        self.assertNotEqual(self.base, with_lib)
+        (lib / "llvm_build.py").write_text("changed\n")
+        edited = self._key(lib_root=str(lib))
+        self.assertNotEqual(with_lib, edited)
+
+    def test_lib_test_files_ignored(self):
+        # test_*.py and __pycache__ must NOT contribute -- editing
+        # tests or running tests (which populates __pycache__) would
+        # otherwise invalidate every cached artifact for free.
+        lib = Path(self.dir) / "actions_lib"
+        lib.mkdir()
+        (lib / "llvm_build.py").write_text("hi\n")
+        baseline = self._key(lib_root=str(lib))
+        (lib / "test_llvm_build.py").write_text("import x\n")
+        (lib / "__pycache__").mkdir()
+        (lib / "__pycache__" / "x.pyc").write_bytes(b"\x00bytecode")
+        self.assertEqual(baseline, self._key(lib_root=str(lib)))
+
 
 class BuildScriptFallbackTests(unittest.TestCase):
     def test_build_sh_preferred_when_both(self):

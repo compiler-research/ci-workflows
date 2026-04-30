@@ -58,7 +58,8 @@ def _cache_base() -> str:
 
 def _key(recipe: str, version: str, os_: str, arch: str) -> str:
     return compute_key(recipe, version, os_, arch,
-                       recipe_root=str(REPO_ROOT / "recipes"))
+                       recipe_root=str(REPO_ROOT / "recipes"),
+                       lib_root=str(REPO_ROOT / "actions" / "lib"))
 
 
 # ---------------------------------------------------------------------------

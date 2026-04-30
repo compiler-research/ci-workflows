@@ -42,6 +42,13 @@ on:
       - 'recipes/**'
       - 'actions/setup-recipe/**'
       - 'actions/publish-recipe/**'
+      # actions/lib/ holds shared Python that drives every recipe's
+      # build (install-distribution component list, smoke checks).
+      # Changes there don't move the cache key (key hashes only the
+      # recipe directory), so they need the operator to invalidate
+      # affected cells manually -- but we still want a build to RUN
+      # so the new artifact is uploaded once invalidation happens.
+      - 'actions/lib/**'
       - '.github/workflows/publish-recipe.yml'
 
 permissions:
