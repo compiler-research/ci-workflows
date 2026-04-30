@@ -14,6 +14,10 @@ Hash inputs that *should* invalidate when changed:
   - recipe.yaml  (declarative metadata)
   - build.sh or build.py  (imperative build; whichever exists)
   - patches/**   (any local patches applied to the source)
+  - actions/lib/**.py  (shared build helpers — install-distribution
+    component list, smoke checks. Reshape these and the published
+    artifact reshapes too; the key must move so old cells stop
+    shadowing new code. Test files and __pycache__ are excluded.)
   - the literal version/os/arch tuple
 
 What we deliberately do NOT include:
@@ -25,9 +29,6 @@ What we deliberately do NOT include:
     with a relative or absolute recipe_root. Patch filenames are part
     of the per-patch line so a renamed patch invalidates but moving
     the patches dir does not.
-
-Byte-for-byte compatible with the bash predecessor (compute-key.sh)
-on recipes that have build.sh — verified by test_compute_key.py.
 """
 
 from __future__ import annotations
@@ -62,8 +63,31 @@ def _build_script(recipe_dir: Path) -> Path:
     )
 
 
+def _lib_hash_lines(lib_root: Path) -> list[str]:
+    """Per-file hash lines for non-test Python under actions/lib/.
+
+    Returns sorted "lib/<relpath> <hex>\\n" entries; empty list when
+    lib_root is absent (consumer-style invocations from outside the
+    repo don't carry the build helpers and don't need them in the key).
+    test_*.py and __pycache__ are skipped: tests don't shape output,
+    and the bytecode dir is build-time only.
+    """
+    if not lib_root.is_dir():
+        return []
+    rel_files = []
+    for p in lib_root.rglob("*.py"):
+        if not p.is_file() or p.name.startswith("test_") \
+                or "__pycache__" in p.parts:
+            continue
+        rel = "lib/" + p.relative_to(lib_root).as_posix()
+        rel_files.append((rel, p))
+    rel_files.sort(key=lambda x: x[0])
+    return [f"{rel} {_file_hash(path)}\n" for rel, path in rel_files]
+
+
 def compute_key(recipe: str, version: str, os_: str, arch: str,
-                recipe_root: str = "recipes") -> str:
+                recipe_root: str = "recipes",
+                lib_root: str = "actions/lib") -> str:
     """Return the full cache key for the given (recipe, version, os, arch)."""
     recipe_dir = Path(recipe_root) / recipe
     if not recipe_dir.is_dir():
@@ -71,17 +95,14 @@ def compute_key(recipe: str, version: str, os_: str, arch: str,
             f"compute_key: recipe directory not found: {recipe_dir}"
         )
 
-    # Reproduce the byte sequence the bash predecessor fed to the outer
-    # sha256: per-input hex digest + newline; patches as "relpath SP hex\n";
-    # finally "V=… OS=… ARCH=…\n".
     parts = []
     parts.append(_file_hash(recipe_dir / "recipe.yaml") + "\n")
     parts.append(_file_hash(_build_script(recipe_dir)) + "\n")
 
     patches_dir = recipe_dir / "patches"
     if patches_dir.is_dir():
-        # Walk all files. relpath with `./` prefix and forward slashes
-        # matches `find . -type f` output under LC_ALL=C sort.
+        # relpath with `./` prefix and forward slashes matches
+        # `find . -type f` output under LC_ALL=C sort.
         rel_files = []
         for p in patches_dir.rglob("*"):
             if p.is_file():
@@ -91,6 +112,8 @@ def compute_key(recipe: str, version: str, os_: str, arch: str,
         for rel, path in rel_files:
             parts.append(f"{rel} {_file_hash(path)}\n")
 
+    parts.extend(_lib_hash_lines(Path(lib_root)))
+
     parts.append(f"V={version} OS={os_} ARCH={arch}\n")
 
     full = "".join(parts).encode("utf-8")
@@ -99,13 +122,15 @@ def compute_key(recipe: str, version: str, os_: str, arch: str,
 
 
 def _main(argv: list[str]) -> int:
-    if len(argv) < 4 or len(argv) > 5:
-        print("usage: compute_key.py RECIPE VERSION OS ARCH [recipe_root]",
+    if len(argv) < 4 or len(argv) > 6:
+        print("usage: compute_key.py RECIPE VERSION OS ARCH "
+              "[recipe_root [lib_root]]",
               file=sys.stderr)
         return 2
     recipe, version, os_, arch = argv[:4]
-    recipe_root = argv[4] if len(argv) == 5 else "recipes"
-    key = compute_key(recipe, version, os_, arch, recipe_root)
+    recipe_root = argv[4] if len(argv) >= 5 else "recipes"
+    lib_root = argv[5] if len(argv) >= 6 else "actions/lib"
+    key = compute_key(recipe, version, os_, arch, recipe_root, lib_root)
     print(f"key={key}")
     return 0
 
