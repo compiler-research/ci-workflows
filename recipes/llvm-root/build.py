@@ -182,6 +182,13 @@ def main() -> int:
                 _install_executable(src, out_dir / "llvm-project" / fallback)
                 break
 
+    # Cling cmake-exports: ships ClingConfig.cmake + ClingTargets.cmake
+    # under lib/cmake/cling/ so downstream consumers can resolve cling
+    # via `find_package(Cling REQUIRED CONFIG)` (CppInterOp does this).
+    # The lib-walk above doesn't pick this up: the component installs
+    # cmake files, not a libcling*.a, so its name doesn't appear there.
+    _try_install_component(build_dir, "cling-cmake-exports")
+
     # Cling headers — cling's install rules typically don't ship them
     # (consumers historically read from the source tree). Stage them
     # under include/cling/ in the install tree so consumers find them
@@ -193,15 +200,19 @@ def main() -> int:
             shutil.rmtree(dst)
         shutil.copytree(cling_headers, dst)
 
-    # Producer-side smoke. find_package(LLVM)+(Clang) covers the
-    # LLVM/clang install; cling has no Config.cmake, so add an
-    # existence check for libclingInterpreter (clingInterpreter.lib
-    # on Windows MSVC).
+    # Producer-side smoke. find_package(LLVM)+(Clang) covers LLVM/clang;
+    # require ClingConfig.cmake + libclingInterpreter for cling so a
+    # missing cmake-exports install rule fails loudly here instead of
+    # surfacing as a downstream `find_package(Cling)` failure on every
+    # consumer run.
     install = out_dir / "llvm-project"
+    cling_cfg = "lib/cmake/cling/ClingConfig.cmake"
     if (install / "lib" / "libclingInterpreter.a").is_file():
-        llvm_build.smoke(required_files=["lib/libclingInterpreter.a"])
+        llvm_build.smoke(required_files=["lib/libclingInterpreter.a",
+                                         cling_cfg])
     elif (install / "lib" / "clingInterpreter.lib").is_file():
-        llvm_build.smoke(required_files=["lib/clingInterpreter.lib"])
+        llvm_build.smoke(required_files=["lib/clingInterpreter.lib",
+                                         cling_cfg])
     else:
         print("::error::neither libclingInterpreter.a nor "
               "clingInterpreter.lib found in install", file=sys.stderr)
