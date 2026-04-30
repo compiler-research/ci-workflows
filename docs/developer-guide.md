@@ -240,6 +240,58 @@ cell gets warmed. The previous version's cell stays cached until
 either it ages past `caps.grace_days` or you remove it from
 `cells.yaml`, at which point `prune-cache` drops it.
 
+## Waking a self-hosted runner before a job
+
+If your matrix targets a `[self-hosted, ...]` runner that isn't
+always on (a Dell box on someone's desk, a workstation that
+sleeps), `actions/wake-on-lan` sends the magic packet from a
+spotter runner and waits for SSH (TCP port 22) on the target:
+
+```yaml
+jobs:
+  wake-runner:
+    name: Activate self-host infrastructure
+    # The spotter runner shares a LAN with the dell so the magic
+    # packet reaches it via subnet broadcast. Conditional runs-on
+    # falls back to ubuntu-latest under act so the job has a runner
+    # act knows how to map.
+    runs-on: ${{ env.ACT && 'ubuntu-latest' || fromJSON('["self-hosted", "spotter"]') }}
+    steps:
+      - uses: compiler-research/ci-workflows/actions/wake-on-lan@<sha>
+        with:
+          mac: ${{ secrets.DELL_MAC }}
+          target-host: ${{ vars.DELL_IP }}
+          # target-port: 22             # default; SSH = "ready"
+          # broadcast: 192.168.100.255  # default derived from IPv4 target
+          # port: 9                     # UDP WoL port; some old routers use 7
+          # timeout-seconds: 240        # 4 minutes, checking every 10 s
+
+  build:
+    needs: wake-runner
+    runs-on: [self-hosted, dell]
+    ...
+```
+
+The action's steps are gated on `!env.ACT`, so under act
+(`bin/repro` or plain `act`) the action runs to no-op success and
+`build`'s `needs:` chain is satisfied without any extra
+`if: success() || env.ACT` boilerplate in the consuming workflow.
+
+What the action does:
+- Masks MAC/IP/broadcast in the run log (`::add-mask::`).
+- Pre-checks the target via `bash /dev/tcp/$host/$port` -- skips
+  the magic packet if the host is already responsive on the
+  readiness port.
+- Sends the magic packet via pure-stdlib Python UDP broadcast
+  (no `apt-get install wakeonlan`, no `sudo` -- UDP sendto
+  doesn't require privileges).
+- Waits for the readiness port to start accepting TCP connects.
+
+`bash /dev/tcp` is the portable readiness probe across GHA images
+that lack `nc` or `ping`. Default port 22 corresponds to SSH being
+up, which is the strongest signal that the runner is ready to
+register itself with GitHub.
+
 ## Inspecting a published asset
 
 The manifest sibling tells you what produced any given tarball:
