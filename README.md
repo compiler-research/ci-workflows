@@ -109,6 +109,7 @@ recipes/<name>/
 actions/
   setup-recipe/        consumer-side: probe → download or build-on-miss
   publish-recipe/      producer-side: build under ccache + tar/zstd + upload
+  wake-on-lan/         send a magic packet to wake a self-hosted runner; no-op under act
   lib/cache-io.sh      scheme-aware probe/download/upload helpers; sourced by both actions and the CLI
   install-build-deps/  thin composite action installing host packages
 

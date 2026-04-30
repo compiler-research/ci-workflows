@@ -1,0 +1,178 @@
+name: 'Wake-on-LAN'
+description: |
+  Send a magic packet to wake a self-hosted runner, then wait for it
+  to come online (TCP connect probe).
+
+  Every step is gated on `!env.ACT`, so under act (env.ACT=true) the
+  whole action is a no-op success. Consuming workflows do NOT need
+  their own env.ACT guard on the wake job; the dependent build
+  job's normal `needs:` chain is satisfied either way:
+
+      jobs:
+        wake-runner:
+          # The job's runs-on must still resolve under act; conditional
+          # on env.ACT to fall back to a hosted runner image act knows
+          # how to map.
+          runs-on: ${{ env.ACT && 'ubuntu-latest' || fromJSON('["self-hosted", "spotter"]') }}
+          steps:
+            - uses: compiler-research/ci-workflows/actions/wake-on-lan@<sha>
+              with:
+                mac: ${{ secrets.DELL_MAC }}
+                target-host: ${{ vars.DELL_HOST }}
+
+        build:
+          needs: wake-runner
+          runs-on: [self-hosted, dell]
+          ...
+
+inputs:
+  mac:
+    required: true
+    description: |
+      MAC address (colons or dashes; case-insensitive). Typically a
+      repo secret -- a leaked MAC is mildly annoying via DDoS.
+  target-host:
+    required: false
+    default: ''
+    description: |
+      Host to TCP-probe before sending the packet (skip if already
+      reachable) and after sending (wait until reachable). When the
+      runner has no `ping` in its environment (common in stripped-
+      down GHA spotter images), TCP connect is the portable
+      readiness check.
+  target-port:
+    required: false
+    default: '22'
+    description: |
+      TCP port on target-host to probe. Default 22 -- SSH on; runner
+      ready to register itself with GitHub. Override for non-SSH
+      runners.
+  broadcast:
+    required: false
+    default: ''
+    description: |
+      Broadcast address for the magic packet. When empty, derived
+      from target-host by replacing the last octet with 255 (e.g.
+      192.168.100.30 -> 192.168.100.255). Override when the LAN
+      topology needs something else.
+  port:
+    required: false
+    default: '9'
+    description: |
+      UDP port for the magic packet. WoL spec is 9; some old
+      consumer routers default to 7.
+  timeout-seconds:
+    required: false
+    default: '240'
+    description: |
+      How long to wait for target-host to start accepting TCP
+      connections after the magic packet. Default 4 minutes,
+      checking every 10 s.
+
+runs:
+  using: composite
+  steps:
+    - name: Mask sensitive values in logs
+      if: ${{ !env.ACT }}
+      shell: bash
+      env:
+        MAC: ${{ inputs.mac }}
+        HOST: ${{ inputs.target-host }}
+        BCAST: ${{ inputs.broadcast }}
+      run: |
+        # Reduces the post-incident log-leak surface; MAC/IP are
+        # internal-network identifiers and downstream consumers
+        # may share workflow logs publicly.
+        [ -n "$MAC" ]   && echo "::add-mask::$MAC"
+        [ -n "$HOST" ]  && echo "::add-mask::$HOST"
+        [ -n "$BCAST" ] && echo "::add-mask::$BCAST"
+
+    - name: Skip if target already responsive
+      if: ${{ !env.ACT && inputs.target-host != '' }}
+      id: precheck
+      shell: bash
+      env:
+        HOST: ${{ inputs.target-host }}
+        PORT: ${{ inputs.target-port }}
+      run: |
+        # `bash /dev/tcp` is portable across GHA images that lack
+        # `nc` or `ping`. Wrapped in `timeout 1` so a black-holed
+        # IP doesn't stall the precheck for the full kernel SYN
+        # retransmit window.
+        if timeout 1 bash -c "cat < /dev/null > /dev/tcp/$HOST/$PORT" 2>/dev/null; then
+          echo "::notice title=Wake-on-LAN::target already responsive on port $PORT; skipping magic packet"
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Send magic packet
+      if: ${{ !env.ACT && steps.precheck.outputs.skip != 'true' }}
+      shell: bash
+      env:
+        MAC: ${{ inputs.mac }}
+        HOST: ${{ inputs.target-host }}
+        BCAST_INPUT: ${{ inputs.broadcast }}
+        WOL_PORT: ${{ inputs.port }}
+      run: |
+        # Pure-stdlib python: every GHA hosted runner has python3 and
+        # we don't want to apt-install wakeonlan/etherwake just for
+        # six bytes of header + sixteen mac repeats. Same wire format
+        # as RFC-defined magic packets (0xff x6 + MAC x16 = 102 bytes).
+        # No sudo needed -- UDP sendto on an arbitrary destination
+        # port doesn't require privileges (only binding to a privileged
+        # local port would, and we don't bind).
+        python3 - <<'PYEOF'
+        import os
+        import socket
+        import sys
+
+        raw = os.environ["MAC"].replace(":", "").replace("-", "").lower()
+        if len(raw) != 12 or not all(c in "0123456789abcdef" for c in raw):
+            sys.exit(f"wake-on-lan: invalid MAC: {os.environ['MAC']!r}")
+        mac_bytes = bytes.fromhex(raw)
+        packet = b"\xff" * 6 + mac_bytes * 16
+
+        broadcast = os.environ.get("BCAST_INPUT", "").strip()
+        if not broadcast:
+            host = os.environ.get("HOST", "").strip()
+            if host and "." in host and host.replace(".", "").isdigit():
+                # Derive default broadcast from IPv4 (a.b.c.d -> a.b.c.255).
+                octets = host.split(".")
+                if len(octets) == 4:
+                    broadcast = ".".join(octets[:3] + ["255"])
+            if not broadcast:
+                broadcast = "255.255.255.255"
+
+        port = int(os.environ["WOL_PORT"])
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(packet, (broadcast, port))
+        print(f"wake-on-lan: sent magic packet "
+              f"via {broadcast}:{port}")
+        PYEOF
+
+    - name: Wait for target online
+      if: ${{ !env.ACT && steps.precheck.outputs.skip != 'true' && inputs.target-host != '' }}
+      shell: bash
+      env:
+        HOST: ${{ inputs.target-host }}
+        PORT: ${{ inputs.target-port }}
+        TIMEOUT: ${{ inputs.timeout-seconds }}
+      run: |
+        set -uo pipefail
+        deadline=$((SECONDS + TIMEOUT))
+        echo "wake-on-lan: waiting up to ${TIMEOUT}s for TCP/$PORT on target ..."
+        while [ "$SECONDS" -lt "$deadline" ]; do
+          if timeout 1 bash -c "cat < /dev/null > /dev/tcp/$HOST/$PORT" 2>/dev/null; then
+            echo "::notice title=Wake-on-LAN::target accepting TCP/$PORT after $((SECONDS))s"
+            exit 0
+          fi
+          sleep 10
+        done
+        echo "::error title=Wake-on-LAN::target did not accept TCP/$PORT within ${TIMEOUT}s"
+        exit 1
+
+    - name: Note skipped under act
+      if: ${{ env.ACT }}
+      shell: bash
+      run: |
+        echo "::notice title=Wake-on-LAN::skipped under act (\$ACT=true)"
