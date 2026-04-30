@@ -164,6 +164,12 @@ def install_distribution(extras: Optional[Sequence[str]] = None) -> None:
         "clang", "clang-headers", "clang-cmake-exports",
         "clang-resource-headers", "clangInterpreter",
         "cmake-exports", "llvm-headers", "llvm-config",
+        # tablegen binaries: LLVMConfig.cmake's TableGen.cmake exports
+        # LLVM_TABLEGEN_EXE pointing at bin/llvm-tblgen, and downstream
+        # consumers that re-invoke `tablegen()` (ROOT's bundled cling,
+        # any project that ships .td files and wants to find the host
+        # tool through the installed LLVM) need the binaries on disk.
+        "llvm-tblgen", "clang-tblgen",
     ]
     lib = Path("lib")
     if lib.is_dir():
