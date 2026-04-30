@@ -59,10 +59,12 @@ runs:
       run: |
         # Reduces the post-incident log-leak surface; MAC/IP are
         # internal-network identifiers and downstream consumers
-        # may share workflow logs publicly.
-        [ -n "$MAC" ]   && echo "::add-mask::$MAC"
-        [ -n "$HOST" ]  && echo "::add-mask::$HOST"
-        [ -n "$BCAST" ] && echo "::add-mask::$BCAST"
+        # may share workflow logs publicly. `if`-blocks (not
+        # `[ ] && echo` chains) so a trailing empty input doesn't
+        # leave the script's last command with a non-zero exit.
+        if [ -n "$MAC" ];   then echo "::add-mask::$MAC";   fi
+        if [ -n "$HOST" ];  then echo "::add-mask::$HOST";  fi
+        if [ -n "$BCAST" ]; then echo "::add-mask::$BCAST"; fi
 
     - name: Skip if target already responsive
       if: ${{ inputs.target-host != '' }}
