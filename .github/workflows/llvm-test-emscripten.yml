@@ -1,11 +1,9 @@
 name: Emscripten
+# Temporarily paused: auto-triggers (pull_request / push / schedule)
+# are removed until further notice. Use workflow_dispatch to run
+# manually. Restore the original triggers when the pause ends.
 on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
-  schedule:
-    - cron: '0 23 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
