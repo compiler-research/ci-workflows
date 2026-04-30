@@ -53,7 +53,7 @@ jobs:
             version=$(echo "$cell" | jq -r .version)
             os=$(echo "$cell"     | jq -r .os)
             arch=$(echo "$cell"   | jq -r .arch)
-            key=$(bash actions/setup-recipe/compute-key.sh \
+            key=$(python3 actions/setup-recipe/compute_key.py \
                     "$recipe" "$version" "$os" "$arch" | sed 's/^key=//')
             echo "$key" >> /tmp/expected_keys.txt
           done < <(yq -o=json -I=0 '.cells[]' cells.yaml)
