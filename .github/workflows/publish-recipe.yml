@@ -1,40 +1,17 @@
 name: publish-recipe
 
-# Two trigger paths:
-#   workflow_dispatch — operator-driven, single cell from inputs.
-#   push to main      — auto-warm the recipe cache after a merge that
-#                       touched the recipe directory or actions. The
-#                       push matrix is derived from cells.yaml; a
-#                       preflight job reads cells.yaml, probes the
-#                       Releases cache for each cell, and emits *only*
-#                       the cells whose key is missing. So the
-#                       steady-state cost on a no-op push is one
-#                       preflight runner (~30 s) and zero per-cell
-#                       runners.
+# Auto-warm the recipe cache after a merge that touched the recipe
+# directory or actions. The matrix is derived from cells.yaml; a
+# preflight job reads cells.yaml, probes the Releases cache for each
+# cell, and emits *only* the cells whose key is missing. Steady-state
+# cost on a no-op push is one preflight runner (~30 s) and zero
+# per-cell runners.
+#
+# Operator-driven single-cell publishes live in publish-recipe-
+# dispatch.yml. Splitting the dispatch path out of this file removes
+# the Skipped phantom row that GHA would otherwise list on every push
+# (cross-event jobs gated by `if:` still enumerate in the run UI).
 on:
-  workflow_dispatch:
-    inputs:
-      recipe:
-        type: choice
-        required: true
-        options:
-          - llvm-asan
-      version:
-        type: string
-        required: true
-        default: '22'
-      os:
-        type: choice
-        required: true
-        options:
-          - ubuntu-24.04
-        default: ubuntu-24.04
-      arch:
-        type: choice
-        required: true
-        options:
-          - x86_64
-        default: x86_64
   push:
     branches: [main]
     paths:
@@ -48,22 +25,7 @@ permissions:
   contents: write   # release upload
 
 jobs:
-  publish-dispatch:
-    if: github.event_name == 'workflow_dispatch'
-    name: dispatch ${{ inputs.recipe }} v${{ inputs.version }} (${{ inputs.os }}/${{ inputs.arch }})
-    runs-on: ${{ inputs.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/install-build-deps
-      - uses: ./actions/publish-recipe
-        with:
-          recipe: ${{ inputs.recipe }}
-          version: ${{ inputs.version }}
-          os: ${{ inputs.os }}
-          arch: ${{ inputs.arch }}
-
   read-cells:
-    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     outputs:
       # Matrix `include:` JSON. Empty when every cell is already
@@ -110,7 +72,7 @@ jobs:
 
   publish-on-push:
     needs: read-cells
-    if: github.event_name == 'push' && needs.read-cells.outputs.empty != 'true'
+    if: needs.read-cells.outputs.empty != 'true'
     name: ${{ matrix.recipe }} v${{ matrix.version }} (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     strategy:

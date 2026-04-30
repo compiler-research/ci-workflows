@@ -1,0 +1,48 @@
+name: publish-recipe-dispatch
+
+# Operator-driven publish of a single cell. Lives in its own workflow
+# file so it doesn't enumerate (and render as Skipped) on every push
+# to publish-recipe.yml's siblings; previous shape combined dispatch
+# + push triggers in one file, which made GitHub Actions list a
+# Skipped row with an unresolved `${{ inputs.* }}` name on every push.
+on:
+  workflow_dispatch:
+    inputs:
+      recipe:
+        type: choice
+        required: true
+        options:
+          - llvm-asan
+      version:
+        type: string
+        required: true
+        default: '22'
+      os:
+        type: choice
+        required: true
+        options:
+          - ubuntu-24.04
+        default: ubuntu-24.04
+      arch:
+        type: choice
+        required: true
+        options:
+          - x86_64
+        default: x86_64
+
+permissions:
+  contents: write   # release upload
+
+jobs:
+  publish-dispatch:
+    name: dispatch ${{ inputs.recipe }} v${{ inputs.version }} (${{ inputs.os }}/${{ inputs.arch }})
+    runs-on: ${{ inputs.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/install-build-deps
+      - uses: ./actions/publish-recipe
+        with:
+          recipe: ${{ inputs.recipe }}
+          version: ${{ inputs.version }}
+          os: ${{ inputs.os }}
+          arch: ${{ inputs.arch }}

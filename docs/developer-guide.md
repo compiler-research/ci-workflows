@@ -19,7 +19,7 @@ upstream. So we end up rebuilding them.
 
 This repository caches those variants. The contract is small: a
 recipe is a directory under `recipes/` with two files
-(`recipe.yaml` for metadata, `build.sh` for the build), and the
+(`recipe.yaml` for metadata, `build.py` for the build), and the
 cache is a content-addressed store of tarballs keyed by a hash of
 that directory plus `(version, os, arch)`. Same inputs → same key
 → same artifact, regardless of which CI run produced it.
@@ -28,13 +28,13 @@ Nothing about the cache is magical. A cached recipe is a
 `<key>.tar.zst` plus a `<key>.manifest.json`, attached to a GitHub
 Release on this repository. `setup-recipe` is a thin Action that
 knows how to compute the key and HEAD-probe the asset.
-`publish-recipe` is its inverse — runs the recipe's `build.sh`,
+`publish-recipe` is its inverse — runs the recipe's `build.py`,
 tar/zstd's the result, uploads it.
 
 ## When the cache moves, and when it doesn't
 
 The recipe directory's content is the only knob. Edit
-`recipes/llvm-asan/build.sh` — the key changes for every cell that
+`recipes/llvm-asan/build.py` — the key changes for every cell that
 recipe produces, the next push to `main` rebuilds them, the cache
 repopulates. Bump the LLVM version in your client repo's matrix
 from `'22'` to `'23'` — the key changes (different `version`
@@ -89,17 +89,21 @@ HTTP cache. The same key works against all of them.
 
 ### Producing from this repository
 
-Two triggers feed `publish-recipe.yml`:
+Two workflow files publish to the Releases cache, one per trigger:
 
-- **Push to `main`** that touches `recipes/`,
-  `actions/setup-recipe/`, `actions/publish-recipe/`, or the
-  workflow file. Iterates the cell matrix automatically;
-  `skip-if-exists` keeps it idempotent so a no-op push costs one
-  HEAD probe per cell.
-- **Manual `workflow_dispatch`** for one-off cell warming —
-  retrying a flaky build, populating a cell that just got added.
+- **`publish-recipe.yml`** — push to `main` that touches
+  `cells.yaml`, `recipes/`, `actions/setup-recipe/`,
+  `actions/publish-recipe/`, or the workflow file itself. Reads
+  `cells.yaml`, probes the Releases cache for each cell, and only
+  spawns per-cell runners for the cells whose key is missing. A
+  no-op push costs one preflight runner (~30 s) and zero per-cell
+  runners.
+- **`publish-recipe-dispatch.yml`** — manual `workflow_dispatch`
+  for one-off cell warming: retrying a flaky build, populating a
+  cell that just got added. Single cell from inputs (recipe /
+  version / os / arch).
 
-You almost never invoke `publish-recipe` directly. Most of the
+You almost never invoke either workflow directly. Most of the
 time, when you change a recipe, the next push to `main` does the
 right thing.
 
@@ -107,7 +111,8 @@ right thing.
 
 This is the part worth knowing about even if you never push to
 ci-workflows. The `bin/recipe-cache` CLI is a self-contained
-shell script that wraps the same code paths as the actions.
+Python script that imports the same modules as the actions
+(`actions/lib/cache_io.py`, `actions/setup-recipe/compute_key.py`).
 Defaults the backend to `file://` in `~/.cache/recipe-cache`, and
 exposes the same operations:
 
@@ -170,7 +175,7 @@ machine, also invisible. Cross-machine cache sharing is the case
 that doesn't work today; we'll revisit if it actually matters.
 
 **The first miss after a flag bump pays the build cost.** When
-you edit `build.sh`, the key changes for every cell that uses
+you edit `build.py`, the key changes for every cell that uses
 that recipe. The push-to-main triggers `publish-recipe` to refill
 them all in parallel — typically `~30 min` end-to-end, ccache
 makes most of it cheap. Until that finishes, downstream PRs that
@@ -191,44 +196,53 @@ publish for — cmake flag differences, ninja target name
 differences, available libraries. `cells.yaml` enumerates which
 combinations are first-class; every cell expansion is a manual
 integration step done by adding a row to `cells.yaml` and either
-dispatching `publish-recipe` once for that cell or letting the
-push trigger pick it up.
+dispatching `publish-recipe-dispatch.yml` once for that cell or
+letting the push trigger pick it up.
 
 ## Adding a new recipe
 
 A recipe is a directory under `recipes/`. Two files:
 
-- `recipe.yaml` — metadata read by `build-manifest.sh`. Keep it
+- `recipe.yaml` — metadata read by `build_manifest.py`. Keep it
   minimal. Today only `recipe`, `description`, and `source.{repo,
   branch_template}` are read; the verify workflow's
   `recipe-yaml-no-dead-fields` check enforces this.
-- `build.sh` — the imperative build. Receives `RECIPE_VERSION`,
+- `build.py` — the imperative build. Receives `RECIPE_VERSION`,
   `WORK_DIR`, `OUT_DIR` env vars; writes its result to
   `$OUT_DIR/llvm-project/` (or whatever subdirectory tree your
   recipe wants — `setup-recipe` and the CLI both surface the
-  tarball root verbatim).
+  tarball root verbatim). Build scripts typically import
+  `actions/lib/llvm_build.py` for shared scaffolding (env
+  validation, cmake flags, install-distribution, smoke).
 
 Verify locally with `bin/recipe-cache build` before pushing.
 The verify workflow will catch the rest at PR time:
 
 - `actionlint` over your edits to action / workflow files.
-- `compute-key-parity` — your new key is stable across invocation
-  contexts.
-- `manifest-schema` — emitting valid JSON.
-- `tar-zstd-round-trip` — the publish/consume pipelines round-trip
-  bytewise.
-- `end-to-end-fixture` — the CLI builds + caches + extracts a
-  synthetic recipe.
+- `python-unit-tests` — cross-OS unit tests for every Python
+  module in `actions/lib/`, `actions/setup-recipe/`,
+  `actions/publish-recipe/`, and `bin/`.
+- `recipe-yaml-no-dead-fields` — every top-level key in
+  `recipe.yaml` is read by something.
+- `cells-yaml-integrity` — schema + duplicate-cell + recipe-
+  existence checks on `cells.yaml`.
+- `recipe-smoke` — `RECIPE_QUICK_CHECK=1 build.py` for every
+  cells.yaml entry on its native OS (cmake configure +
+  LLVMDemangle compile).
+- `publish-dryrun` — end-to-end dry run of the
+  `actions/publish-recipe` action against the `llvm-dry-run`
+  fixture with `cache-base: file://`, exercising every shared
+  codepath a real publish runs.
 
-When the recipe lands, add a row to `publish-recipe.yml`'s
-push-trigger matrix so `main` warms it on every relevant push.
+When the recipe lands, add a row to `cells.yaml` so `main` warms
+it on every relevant push.
 
 ## Adding a new cell to an existing recipe
 
-For now, edit the matrix in `publish-recipe.yml`. Add a row
-matching the new (version, os, arch) tuple. The push trigger
-takes care of the build on the next merge that touches the
-recipe directory or the workflow file.
+Edit `cells.yaml`. Add a row matching the new (version, os, arch)
+tuple. `publish-recipe.yml`'s preflight job reads `cells.yaml`
+directly, so the next push to `main` that touches the recipe
+directory or the workflow file picks up the new cell automatically.
 
 ## Bumping the LLVM version
 

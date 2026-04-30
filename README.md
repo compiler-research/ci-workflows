@@ -30,14 +30,18 @@ CI doesn't break before the cache is warmed.
 
 ## Producer side: `publish-recipe`
 
-The `publish-recipe.yml` workflow runs on:
+Two workflow files publish to the Releases cache, one per trigger:
 
-- **Push to `main`** that touches `recipes/`, `actions/setup-recipe/`,
-  `actions/publish-recipe/`, or the workflow file itself. Iterates a
-  matrix of cells and uploads any whose key isn't yet in the Releases
-  cache. `skip-if-exists` keeps the steady-state cost to one HEAD
-  probe per cell.
-- **Manual `workflow_dispatch`** for one-off cell warming.
+- **`publish-recipe.yml`** — fires on push to `main` that touches
+  `cells.yaml`, `recipes/`, `actions/setup-recipe/`,
+  `actions/publish-recipe/`, or the workflow file itself. Reads
+  `cells.yaml`, probes the Releases cache for each cell, and only
+  spawns per-cell runners for the cells whose key is missing. A
+  no-op push costs one preflight runner (~30 s) and zero per-cell
+  runners.
+- **`publish-recipe-dispatch.yml`** — manual `workflow_dispatch` for
+  one-off cell warming. Single cell from inputs (recipe / version /
+  os / arch).
 
 ## Local testing
 
@@ -102,18 +106,22 @@ are supported sinks).
 
 ```
 recipes/<name>/
-  recipe.yaml          metadata fields the manifest reads
-  build.sh             imperative build invoked by setup-recipe and publish-recipe
-  patches/             optional, applied to the source tree
+  recipe.yaml                   metadata fields the manifest reads
+  build.py                      imperative build invoked by setup-recipe and publish-recipe
+  patches/                      optional, applied to the source tree
 
 actions/
-  setup-recipe/        consumer-side: probe → download or build-on-miss
-  publish-recipe/      producer-side: build under ccache + tar/zstd + upload
-  lib/cache-io.sh      scheme-aware probe/download/upload helpers; sourced by both actions and the CLI
-  install-build-deps/  thin composite action installing host packages
+  setup-recipe/                 consumer-side: probe → download or build-on-miss
+  publish-recipe/               producer-side: build under ccache + tar/zstd + upload
+  lib/cache_io.py               scheme-aware probe/download/upload helpers; imported by both actions and the CLI
+  lib/llvm_build.py             shared LLVM-recipe scaffolding (env, cmake flags, install-distribution, smoke)
+  install-build-deps/           thin composite action installing host packages
 
-bin/recipe-cache       CLI wrapping the same scripts the actions use
+bin/recipe-cache                Python CLI wrapping the same modules the actions use
 
 .github/workflows/
-  publish-recipe.yml   workflow_dispatch + push-on-main publisher
+  publish-recipe.yml            push-on-main publisher (cells.yaml-driven)
+  publish-recipe-dispatch.yml   workflow_dispatch single-cell publisher
+  verify.yml                    PR-time sanity checks
+  prune-cache.yml               garbage-collect cells past caps.grace_days
 ```

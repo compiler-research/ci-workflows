@@ -197,7 +197,7 @@ runs:
         {
           echo "::error::no prebuilt for key=${KEY}"
           echo "::error::populate by running:"
-          echo "::error::  gh workflow run publish-recipe.yml \\"
+          echo "::error::  gh workflow run publish-recipe-dispatch.yml \\"
           echo "::error::    -R compiler-research/ci-workflows \\"
           echo "::error::    -f recipe=${RECIPE} -f version=${VERSION} \\"
           echo "::error::    -f os=${OS} -f arch=${ARCH}"

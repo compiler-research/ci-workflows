@@ -1,9 +1,9 @@
 name: 'Install build dependencies'
 description: |
   Installs the host-side packages a recipe build needs (ninja, zstd,
-  ccache, rsync) and a Clang host toolchain. Pulled out of
-  publish-recipe.yml so the dispatch and push jobs share the same
-  install logic.
+  ccache, rsync) and a Clang host toolchain. Pulled out of the
+  publish-recipe / publish-recipe-dispatch / verify workflows so the
+  push, dispatch, and PR-time jobs share the same install logic.
 
   Why Clang: recipes that set LLVM_USE_SANITIZER (e.g. llvm-asan)
   rely on Clang-specific UBSan flags such as `-fno-sanitize=function`
