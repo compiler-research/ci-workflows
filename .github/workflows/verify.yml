@@ -29,53 +29,6 @@ jobs:
             -v "$PWD":/repo -w /repo \
             rhysd/actionlint:latest -color
 
-  compute-key-parity:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Identical key from repo root and from sparse-checkout subdir
-        run: |
-          set -euo pipefail
-          a="$(bash actions/setup-recipe/compute-key.sh llvm-asan 22 ubuntu-24.04 x86_64)"
-          mkdir -p /tmp/sim/__ci_workflows__
-          rsync -a recipes /tmp/sim/__ci_workflows__/
-          rsync -a actions /tmp/sim/__ci_workflows__/
-          b="$(cd /tmp/sim/__ci_workflows__ && bash actions/setup-recipe/compute-key.sh llvm-asan 22 ubuntu-24.04 x86_64)"
-          c="$(bash actions/setup-recipe/compute-key.sh llvm-asan 22 ubuntu-24.04 x86_64 "$PWD/recipes")"
-          [ "$a" = "$b" ] || { echo "::error::root vs subdir key mismatch: $a vs $b"; exit 1; }
-          [ "$a" = "$c" ] || { echo "::error::relative vs absolute recipe_root mismatch: $a vs $c"; exit 1; }
-          echo "OK: $a"
-      - name: Each input perturbation moves the key
-        run: |
-          set -euo pipefail
-          base="$(bash actions/setup-recipe/compute-key.sh llvm-asan 22 ubuntu-24.04 x86_64)"
-          for change in version os arch; do
-            case "$change" in
-              version) k="$(bash actions/setup-recipe/compute-key.sh llvm-asan 99 ubuntu-24.04 x86_64)" ;;
-              os)      k="$(bash actions/setup-recipe/compute-key.sh llvm-asan 22 macos-26     x86_64)" ;;
-              arch)    k="$(bash actions/setup-recipe/compute-key.sh llvm-asan 22 ubuntu-24.04 arm64)"  ;;
-            esac
-            [ "$base" != "$k" ] || { echo "::error::$change perturbation did not move key"; exit 1; }
-          done
-          # Perturb recipe.yaml content.
-          echo "# verify-test perturbation" >> recipes/llvm-asan/recipe.yaml
-          k="$(bash actions/setup-recipe/compute-key.sh llvm-asan 22 ubuntu-24.04 x86_64)"
-          [ "$base" != "$k" ] || { echo "::error::recipe.yaml edit did not move key"; exit 1; }
-          # Restore for any later steps in this job (paranoia).
-          git checkout -- recipes/llvm-asan/recipe.yaml
-          echo "OK: all perturbations moved the key"
-
-  manifest-schema:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: build-manifest.sh emits valid JSON
-        run: |
-          set -euo pipefail
-          export SRC_COMMIT=mock-src GITHUB_SHA=mock-ci ImageOS=mock-os ImageVersion=mock-ver
-          bash actions/publish-recipe/build-manifest.sh \
-            llvm-asan 22 ubuntu-24.04 x86_64 mock-key | jq -e .
-
   recipe-yaml-no-dead-fields:
     runs-on: ubuntu-24.04
     steps:
@@ -97,13 +50,16 @@ jobs:
             recipe_dir="$(dirname "$r")"
             keys=$(grep -E '^[a-z_]+:' "$r" | sed -E 's/:.*//' | sort -u)
             for key in $keys; do
+              # Look in the recipe's own build script (build.py or build.sh)
+              # plus all action / lib / bin sources. -F = fixed string,
+              # -r = recursive (acts on the dir or single file).
               if ! grep -q -r -F "$key" \
-                "$recipe_dir/build.sh" \
+                "$recipe_dir" \
                 actions/setup-recipe/ \
                 actions/publish-recipe/ \
                 actions/lib/ \
                 bin/ 2>/dev/null; then
-                echo "::error file=$r::dead field '$key' (not read by build.sh, actions, or bin)"
+                echo "::error file=$r::dead field '$key' (not read by build script, actions, or bin)"
                 fail=1
               fi
             done
@@ -164,12 +120,16 @@ jobs:
               fail=1
               continue
             fi
-            for f in recipe.yaml build.sh; do
-              if [ ! -f "$dir/$f" ]; then
-                echo "::error file=$dir::recipe '$r' missing $f"
-                fail=1
-              fi
-            done
+            if [ ! -f "$dir/recipe.yaml" ]; then
+              echo "::error file=$dir::recipe '$r' missing recipe.yaml"
+              fail=1
+            fi
+            # Build script: build.py preferred, build.sh tolerated for
+            # any recipe still on bash. compute_key.py picks the same way.
+            if [ ! -f "$dir/build.py" ] && [ ! -f "$dir/build.sh" ]; then
+              echo "::error file=$dir::recipe '$r' has no build.py or build.sh"
+              fail=1
+            fi
           done
           exit $fail
       - name: No orphan recipe directories
@@ -195,25 +155,37 @@ jobs:
             exit 1
           fi
 
-  tar-zstd-round-trip:
-    runs-on: ubuntu-24.04
+  # Cross-OS unit tests for every Python module in the recipe pipeline.
+  # Each function has minimal-effective tests (happy path + targeted
+  # edge cases) — the publish-dryrun matrix is the broader integration
+  # check on top of these. Runs on Linux / macOS / Windows so platform
+  # divergences in the Python port surface at PR time. Total wall clock
+  # ~2-3 s per leg.
+  python-unit-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, macos-26-intel, windows-2025]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install zstd
-        run: sudo apt-get update && sudo apt-get install -y zstd
-      - name: Tiny tree round-trip via the publish/consume pipelines
-        run: |
-          set -euo pipefail
-          # Mirror the install-tree shape that real recipes produce:
-          # bin/, lib/, include/, lib/cmake/llvm/. The contents here are
-          # synthetic — what we're testing is tar+zstd, not the layout.
-          mkdir -p src/llvm-project/lib src/llvm-project/include
-          echo "header" > src/llvm-project/include/foo.h
-          printf 'binary\x00\x01\x02' > src/llvm-project/lib/libfoo.a
-          ( cd src && tar -cf - llvm-project | zstd -19 --long > /tmp/c.tar.zst )
-          mkdir dest
-          cat /tmp/c.tar.zst | zstd -d | tar -xf - -C dest
-          diff -r src/llvm-project dest/llvm-project
+      - uses: ./.github/actions/install-build-deps
+      - name: actions/lib unit tests
+        shell: bash
+        working-directory: actions/lib
+        run: python3 -W error::ResourceWarning -m unittest discover -p 'test_*.py' -v
+      - name: actions/setup-recipe unit tests
+        shell: bash
+        working-directory: actions/setup-recipe
+        run: python3 -W error::ResourceWarning -m unittest discover -p 'test_*.py' -v
+      - name: actions/publish-recipe unit tests
+        shell: bash
+        working-directory: actions/publish-recipe
+        run: python3 -W error::ResourceWarning -m unittest discover -p 'test_*.py' -v
+      - name: bin/ CLI tests
+        shell: bash
+        working-directory: bin
+        run: python3 -W error::ResourceWarning -m unittest discover -p 'test_*.py' -v
 
   # Read cells.yaml and emit a matrix-include JSON. Every cell becomes
   # one leg of the recipe-smoke matrix below — adding a cell to
@@ -235,13 +207,13 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   # Run RECIPE_QUICK_CHECK for every cells.yaml entry on its native OS.
-  # Catches install-build-deps misconfiguration (host toolchain shape),
-  # cmake configure regressions, install-distribution contract
-  # breakage, and LLVMConfig.cmake load-time issues — without paying
-  # for the full ~30-min publish build. RECIPE_QUICK_CHECK runs:
-  # cmake configure + LLVMDemangle compile + minimal install +
-  # find_package(LLVM); see actions/lib/llvm-build.sh's
-  # quick_check_or_continue. Costs ~3-5 min per leg.
+  # Catches what publish-dryrun cannot: real-recipe configure regressions
+  # (LLVM_USE_SANITIZER on macOS in llvm-asan, LLVM_EXTERNAL_PROJECTS=cling
+  # in llvm-root). publish-dryrun uses the llvm-dry-run fixture's minimal
+  # flag set, so a flag-set bug in a real recipe stays invisible to it.
+  # RECIPE_QUICK_CHECK does cmake configure + LLVMDemangle compile +
+  # quick_check_or_continue's early exit (see actions/lib/llvm_build.py).
+  # Costs ~3-5 min per leg.
   recipe-smoke:
     needs: read-cells
     strategy:
@@ -258,7 +230,17 @@ jobs:
           WORK_DIR: ${{ runner.temp }}/_recipe_work
           OUT_DIR: ${{ runner.temp }}/_recipe_out
           RECIPE_QUICK_CHECK: '1'
-        run: bash recipes/${{ matrix.recipe }}/build.sh
+        # Dispatch matches publish-recipe / setup-recipe action.yml:
+        # build.py preferred (cross-OS), build.sh tolerated for any
+        # recipe still on bash.
+        run: |
+          set -euo pipefail
+          dir="recipes/${{ matrix.recipe }}"
+          if [[ -f "$dir/build.py" ]]; then
+            python3 "$dir/build.py"
+          else
+            bash "$dir/build.sh"
+          fi
 
   # End-to-end dry-run of the real publish-recipe action against the
   # llvm-dry-run fixture recipe with cache-base: file:///... so no
@@ -309,129 +291,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          key=$(bash actions/setup-recipe/compute-key.sh \
+          key=$(python3 actions/setup-recipe/compute_key.py \
             llvm-dry-run 22 ${{ matrix.os }} x86_64 | sed 's/^key=//')
           ls -la "$RUNNER_TEMP/dryrun_cache/"
           test -f "$RUNNER_TEMP/dryrun_cache/${key}.tar.zst"
           test -f "$RUNNER_TEMP/dryrun_cache/${key}.manifest.json"
           # Round-trip the asset to confirm it's well-formed end to end.
+          # Use Python's tarfile + cache_io.cache_download — same code
+          # path consumers use, no `tar` binary involvement.
           mkdir extract
-          zstd -d < "$RUNNER_TEMP/dryrun_cache/${key}.tar.zst" \
-            | tar -xf - -C extract
+          python3 actions/lib/cache_io.py download \
+            "file://$RUNNER_TEMP/dryrun_cache" "$key" extract
           test -f extract/llvm-project/lib/cmake/llvm/LLVMConfig.cmake
           echo "::notice::publish-dryrun OK on ${{ matrix.os }}"
 
-  end-to-end-fixture:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y zstd jq
-      - name: Pack + get round-trip via the CLI
-        # Synthesises a fake recipe directory, builds it via the CLI,
-        # then fetches it back. Catches contract breaks across
-        # compute-key, cache-io, and the CLI itself in one ~10-second
-        # pass — without the 30-min real-recipe build cost.
-        run: |
-          set -euo pipefail
-          export RECIPE_CACHE_DIR=/tmp/cache
-          mkdir -p recipes/__verify_fixture
-          cat > recipes/__verify_fixture/recipe.yaml <<'EOF'
-          recipe: __verify_fixture
-          description: synthetic fixture used by verify.yml end-to-end-fixture job
-          source:
-            repo: file:///none
-            branch_template: 'none-{version}'
-          EOF
-          cat > recipes/__verify_fixture/build.sh <<'EOF'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          mkdir -p "$OUT_DIR/llvm-project/bin"
-          echo "fake clang built by recipe v${RECIPE_VERSION}" \
-            > "$OUT_DIR/llvm-project/bin/clang"
-          EOF
-          chmod +x recipes/__verify_fixture/build.sh
-          bin/recipe-cache build __verify_fixture 1 ubuntu-24.04 x86_64
-          bin/recipe-cache list
-          mkdir /tmp/out
-          bin/recipe-cache get __verify_fixture 1 ubuntu-24.04 x86_64 --out /tmp/out
-          test -f /tmp/out/llvm-project/bin/clang
-          grep -q "fake clang built by recipe v1" /tmp/out/llvm-project/bin/clang
-          # Manifest sanity
-          jq -e .recipe "/tmp/cache/$(bin/recipe-cache key __verify_fixture 1 ubuntu-24.04 x86_64).manifest.json"
-      - name: Negative — get on uncached key fails
-        # The CLI's get without --build-on-miss is the same code shape
-        # as setup-recipe's "fail on miss when build-on-miss=false"
-        # path. Exercising it via the CLI keeps the test self-contained
-        # (no need to invoke the action against an external ref).
-        run: |
-          set -euo pipefail
-          export RECIPE_CACHE_DIR=/tmp/cache-empty
-          if bin/recipe-cache get __verify_fixture 999 ubuntu-24.04 x86_64 --out /tmp/never 2>/dev/null; then
-            echo "::error::recipe-cache get should have failed for unknown key"
-            exit 1
-          fi
-      - name: patches/ folds into the cache key
-        # No real recipe ships patches today (cling will be the first).
-        # Cover the code path now so cling's patches/ gets cache-key
-        # treatment correctly when it lands.
-        run: |
-          set -euo pipefail
-          key_no_patch="$(bin/recipe-cache key __verify_fixture 1 ubuntu-24.04 x86_64)"
-          mkdir -p recipes/__verify_fixture/patches
-          echo "diff goes here" > recipes/__verify_fixture/patches/foo.patch
-          key_with_patch="$(bin/recipe-cache key __verify_fixture 1 ubuntu-24.04 x86_64)"
-          if [ "$key_no_patch" = "$key_with_patch" ]; then
-            echo "::error::adding patches/foo.patch did not move the key"
-            exit 1
-          fi
-          # Editing the patch content also moves the key.
-          echo "different diff" > recipes/__verify_fixture/patches/foo.patch
-          key_changed="$(bin/recipe-cache key __verify_fixture 1 ubuntu-24.04 x86_64)"
-          if [ "$key_with_patch" = "$key_changed" ]; then
-            echo "::error::editing patches/foo.patch did not move the key"
-            exit 1
-          fi
-
-  url-parser:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: gh_release_url_parse handles trailing slash, missing slash, non-github
-        # Unit test for the URL parser. The full upload path can't run
-        # from a fork PR (no release-write token); this covers the slug
-        # arithmetic that the action would otherwise feed to gh.
-        run: |
-          set -euo pipefail
-          source actions/lib/cache-io.sh
-          fail=0
-          assert_parse() {
-            local input="$1" want_owner="$2" want_tag="$3" desc="$4"
-            local out
-            if ! out=$(gh_release_url_parse "$input"); then
-              echo "::error::parse failed for $desc: $input"
-              fail=1
-              return
-            fi
-            local got_owner="${out%$'\t'*}"
-            local got_tag="${out#*$'\t'}"
-            if [ "$got_owner" != "$want_owner" ] || [ "$got_tag" != "$want_tag" ]; then
-              echo "::error::$desc: parsed ($got_owner, $got_tag), want ($want_owner, $want_tag)"
-              fail=1
-            fi
-          }
-          assert_reject() {
-            local input="$1" desc="$2"
-            if gh_release_url_parse "$input" >/dev/null 2>&1; then
-              echo "::error::$desc: $input was accepted, should have been rejected"
-              fail=1
-            fi
-          }
-          assert_parse "https://github.com/foo/bar/releases/download/cache/" "foo/bar" "cache" "trailing slash"
-          assert_parse "https://github.com/foo/bar/releases/download/cache"  "foo/bar" "cache" "no trailing slash"
-          assert_parse "https://github.com/compiler-research/ci-workflows/releases/download/v1" \
-                       "compiler-research/ci-workflows" "v1" "real-world URL"
-          assert_reject "file:///some/path"               "file://"
-          assert_reject "https://example.org/foo/bar"     "non-github host"
-          assert_reject "https://github.com/foo/bar"      "github URL but not a Releases path"
-          exit $fail
