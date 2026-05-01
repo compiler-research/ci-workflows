@@ -95,6 +95,13 @@ runs:
         # with no GITHUB_TOKEN available, even though the repo is
         # public. Sparse-checkout limits the working tree to the
         # two directories the rest of this action reads.
+        #
+        # `rm -rf` first so the step is idempotent: re-runs in the
+        # same workspace (act with reused containers, or any job
+        # that calls setup-recipe twice) would otherwise trip on
+        # `git remote add origin` ("remote already exists") since
+        # `git init` is the only idempotent half of the pair.
+        rm -rf __ci_workflows__
         git init __ci_workflows__
         cd __ci_workflows__
         git remote add origin https://github.com/compiler-research/ci-workflows.git
