@@ -142,12 +142,16 @@ def main() -> int:
     # consumes libclangInterpreter.a even though the clang driver doesn't
     # depend on it transitively) + StaticAnalyzerCore (cling-bundled clang
     # pulled it into CppInterOp's link in the past) + LLVMOrcDebugging
-    # (cling pulls it via LIBS) + clingInterpreter (the cling library;
-    # the `cling` binary follows transitively).
+    # (cling pulls it via LIBS) + the `cling` binary (transitively pulls
+    # every cling library: clingInterpreter, clingMetaProcessor,
+    # clingUserInterface, clingUtils -- shipping cling-cmake-exports
+    # without all of them leaves ClingTargets.cmake referencing missing
+    # `lib/libcling*.a` files and `find_package(Cling REQUIRED CONFIG)`
+    # fails on the consumer side).
     subprocess.run(
         ["ninja", "-j", ncpus,
          "clang", "clangInterpreter", "clangStaticAnalyzerCore",
-         "LLVMOrcDebugging", "clingInterpreter"],
+         "LLVMOrcDebugging", "cling"],
         check=True,
     )
 
