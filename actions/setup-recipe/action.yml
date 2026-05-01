@@ -86,14 +86,22 @@ runs:
         echo "arch=$arch" >> "$GITHUB_OUTPUT"
 
     - name: Checkout ci-workflows recipes
-      uses: actions/checkout@v4
-      with:
-        repository: compiler-research/ci-workflows
-        ref: ${{ inputs.ref }}
-        path: __ci_workflows__
-        sparse-checkout: |
-          recipes
-          actions
+      shell: bash
+      env:
+        REF: ${{ inputs.ref }}
+      run: |
+        # Plain git clone instead of actions/checkout: the latter
+        # declares `token` as required: true and fails under act
+        # with no GITHUB_TOKEN available, even though the repo is
+        # public. Sparse-checkout limits the working tree to the
+        # two directories the rest of this action reads.
+        git init __ci_workflows__
+        cd __ci_workflows__
+        git remote add origin https://github.com/compiler-research/ci-workflows.git
+        git sparse-checkout init --no-cone
+        git sparse-checkout set recipes actions
+        git fetch --depth=1 origin "$REF"
+        git checkout FETCH_HEAD
 
     - name: Compute key
       id: compute-key
