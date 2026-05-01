@@ -142,16 +142,25 @@ def main() -> int:
     # consumes libclangInterpreter.a even though the clang driver doesn't
     # depend on it transitively) + StaticAnalyzerCore (cling-bundled clang
     # pulled it into CppInterOp's link in the past) + LLVMOrcDebugging
-    # (cling pulls it via LIBS) + the `cling` binary (transitively pulls
-    # every cling library: clingInterpreter, clingMetaProcessor,
-    # clingUserInterface, clingUtils -- shipping cling-cmake-exports
-    # without all of them leaves ClingTargets.cmake referencing missing
-    # `lib/libcling*.a` files and `find_package(Cling REQUIRED CONFIG)`
-    # fails on the consumer side).
+    # (cling pulls it via LIBS) + every cling library by name. Listing
+    # cling libs explicitly (rather than ninja-ing the `cling` binary)
+    # is intentional: cling declares its libraries via
+    # `add_cling_library(... OBJECT)`, and the cling binary's link
+    # references the static archives `-l<name>` -- but those archives
+    # aren't transitive deps of the binary in ninja's graph, so
+    # `ninja cling` builds the .o files yet skips the .a files, and
+    # the binary link fails on `cannot find -lclingUserInterface`.
+    # The cling binary itself isn't shipped -- consumers (CppInterOp's
+    # cling rows, ROOT's bundled cling) link against the libs via
+    # `find_package(Cling REQUIRED CONFIG)`. ClingTargets.cmake
+    # (cling-cmake-exports) references each lib explicitly, so all
+    # four must be on disk before find_package succeeds.
     subprocess.run(
         ["ninja", "-j", ncpus,
          "clang", "clangInterpreter", "clangStaticAnalyzerCore",
-         "LLVMOrcDebugging", "cling"],
+         "LLVMOrcDebugging",
+         "clingInterpreter", "clingMetaProcessor",
+         "clingUserInterface", "clingUtils"],
         check=True,
     )
 
