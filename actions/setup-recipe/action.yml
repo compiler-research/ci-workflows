@@ -156,7 +156,14 @@ runs:
         mkdir -p _llvm_dl
         python3 actions/lib/cache_io.py download "$BASE" "$KEY" _llvm_dl
         # Recipe's tarball root is `llvm-project/`; surface at $GITHUB_WORKSPACE.
+        # `rm -rf ../llvm-project` first so the step is idempotent: a
+        # re-run in the same workspace (act with reused containers, or
+        # any flow that calls setup-recipe twice) would otherwise trip
+        # `mv: cannot overwrite '../llvm-project': Directory not empty`
+        # on the existing tree from the prior run. Mirrors the pattern
+        # in the cache-miss "Build inline" branch below.
         if [[ -d _llvm_dl/llvm-project ]]; then
+          rm -rf ../llvm-project
           mv _llvm_dl/llvm-project ../
         else
           # Defensive: some recipes may tar a different root in future.
