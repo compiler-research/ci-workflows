@@ -1,6 +1,6 @@
 name: publish-recipe
 
-# Two trigger paths:
+# Three trigger paths:
 #   workflow_dispatch — operator-driven, single cell from inputs.
 #   push to main      — auto-warm the recipe cache after a merge that
 #                       touched the recipe directory or actions. The
@@ -11,6 +11,14 @@ name: publish-recipe
 #                       steady-state cost on a no-op push is one
 #                       preflight runner (~30 s) and zero per-cell
 #                       runners.
+#   pull_request      — validate the recipe builds end-to-end before
+#                       merge, against the proposed content. Same
+#                       per-cell matrix; calls publish-recipe with
+#                       dry-run=true (no manifest, no upload, no
+#                       Release creation). The ccache-action restore
+#                       picks up the coarse-keyed cache from main, so
+#                       a PR that only edits build flags rebuilds in
+#                       minutes rather than the half-hour cold cost.
 on:
   workflow_dispatch:
     inputs:
@@ -37,7 +45,7 @@ on:
         default: x86_64
   push:
     branches: [main]
-    paths:
+    paths: &trigger_paths
       - 'cells.yaml'
       - 'recipes/**'
       - 'actions/setup-recipe/**'
@@ -50,6 +58,8 @@ on:
       # so the new artifact is uploaded once invalidation happens.
       - 'actions/lib/**'
       - '.github/workflows/publish-recipe.yml'
+  pull_request:
+    paths: *trigger_paths
 
 permissions:
   contents: write   # release upload
@@ -132,3 +142,61 @@ jobs:
           version: ${{ matrix.version }}
           os: ${{ matrix.os }}
           arch: ${{ matrix.arch }}
+
+  # PR validation: build every cell in cells.yaml against the
+  # proposed recipe content. dry-run=true skips the manifest,
+  # the tar/zstd, the Release upload, and the gh release create
+  # (PR runs from forks lack write access anyway). The ccache-action
+  # restore in the action picks up the coarse-keyed cache that the
+  # last push-on-main warmed; a PR that only edits build flags
+  # rebuilds in minutes.
+  #
+  # Reuses the cells.yaml matrix shape via a sibling preflight so
+  # the matrix evolves in lockstep with the publish path. We do NOT
+  # run the skip-if-exists probe at workflow level for PRs --
+  # publish-recipe's own skip step still no-ops when the PR's
+  # content hash matches what's already on main, which is the
+  # cheap path for "PR didn't change the recipe".
+  validate-pr-cells:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.compute.outputs.matrix }}
+      empty: ${{ steps.compute.outputs.empty }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: compute
+        run: |
+          set -euo pipefail
+          # yq emits one JSON object per cell; jq wraps the array as
+          # {include: [...]} for the matrix consumer below.
+          # `{include: .cells}` directly in yq isn't portable across
+          # mikefarah/yq versions -- the `{...}` constructor with a
+          # bare key changes shape between v4 minors.
+          matrix=$(yq -o=json -I=0 '.cells[]' cells.yaml | jq -s -c '{include: .}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          n=$(yq '.cells | length' cells.yaml)
+          if [ "$n" = "0" ]; then
+            echo "empty=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  validate-on-pr:
+    needs: validate-pr-cells
+    if: github.event_name == 'pull_request' && needs.validate-pr-cells.outputs.empty != 'true'
+    name: validate ${{ matrix.recipe }} v${{ matrix.version }} (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.validate-pr-cells.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/install-build-deps
+      - uses: ./actions/publish-recipe
+        with:
+          recipe: ${{ matrix.recipe }}
+          version: ${{ matrix.version }}
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
+          dry-run: 'true'
