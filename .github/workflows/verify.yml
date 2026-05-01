@@ -187,89 +187,22 @@ jobs:
         working-directory: bin
         run: python3 -W error::ResourceWarning -m unittest discover -p 'test_*.py' -v
 
-  # Read cells.yaml and emit a matrix-include JSON. Every cell becomes
-  # one leg of the recipe-smoke matrix below — adding a cell to
-  # cells.yaml automatically gets it covered at PR time.
-  read-cells:
-    runs-on: ubuntu-24.04
-    outputs:
-      matrix: ${{ steps.cells.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: cells
-        run: |
-          set -euo pipefail
-          matrix=$(yq -o=json '{"include": .cells}' cells.yaml)
-          {
-            echo 'matrix<<EOF'
-            echo "$matrix"
-            echo EOF
-          } >> "$GITHUB_OUTPUT"
-
-  # Run RECIPE_QUICK_CHECK for every cells.yaml entry on its native OS.
-  # Catches what publish-dryrun cannot: real-recipe configure regressions
-  # (LLVM_USE_SANITIZER on macOS in llvm-asan, LLVM_EXTERNAL_PROJECTS=cling
-  # in llvm-root). publish-dryrun uses the llvm-dry-run fixture's minimal
-  # flag set, so a flag-set bug in a real recipe stays invisible to it.
-  # RECIPE_QUICK_CHECK does cmake configure + LLVMDemangle compile +
-  # quick_check_or_continue's early exit (see actions/lib/llvm_build.py).
-  # Costs ~3-5 min per leg.
-  recipe-smoke:
-    needs: read-cells
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.read-cells.outputs.matrix) }}
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/install-build-deps
-      - name: RECIPE_QUICK_CHECK ${{ matrix.recipe }} v${{ matrix.version }} (${{ matrix.os }}/${{ matrix.arch }})
-        shell: bash
-        env:
-          RECIPE_VERSION: ${{ matrix.version }}
-          WORK_DIR: ${{ runner.temp }}/_recipe_work
-          OUT_DIR: ${{ runner.temp }}/_recipe_out
-          RECIPE_QUICK_CHECK: '1'
-        # Dispatch matches publish-recipe / setup-recipe action.yml:
-        # build.py preferred (cross-OS), build.sh tolerated for any
-        # recipe still on bash.
-        run: |
-          set -euo pipefail
-          dir="recipes/${{ matrix.recipe }}"
-          if [[ -f "$dir/build.py" ]]; then
-            python3 "$dir/build.py"
-          else
-            bash "$dir/build.sh"
-          fi
-
   # End-to-end dry-run of the real publish-recipe action against the
   # llvm-dry-run fixture recipe with cache-base: file:///... so no
-  # actual upload happens. Exercises every shared codepath a real
-  # publish runs: helper's setup_env/cmake_extra/cleanup_intermediates/
-  # run_install_distribution, cache_pack, cache_upload's file://
-  # branch — across every supported runner OS.
+  # actual upload happens. Covers exactly the steps publish-recipe.yml's
+  # validate-on-pr skips under `dry-run: true`: manifest write, cache_pack
+  # (tar/zstd portability across BSD/GNU tar, zstd flag drift),
+  # cache_upload's file:// branch, and the asset+manifest landing on
+  # disk. validate-on-pr covers the build path; this covers the upload
+  # path; together they cover the full publish pipeline at PR time.
   #
-  # What this catches at PR time that the recipe-smoke matrix doesn't:
-  #   - cache_pack tool-portability (BSD vs GNU tar, zstd flag drift).
-  #   - cache_upload's file:// branch.
-  #   - publish-recipe action orchestration (compute-key, probe, build,
-  #     manifest, pack, upload sequence).
-  #   - run_install_distribution end-to-end with real cmake reconfigure
-  #     + ninja install-distribution.
-  #
-  # What it doesn't catch:
-  #   - llvm_build::install_distribution's umbrella+walk (only
-  #     run_install_distribution is exercised; the umbrella list
-  #     real recipes use is unique to clang/cling builds).
-  #   - llvm_build::smoke (find_package post-publish).
-  #   - cache_upload's gh release branch (no upload to GitHub).
-  #   - setup-recipe consumer side (separate concerns).
-  #   - prune-cache (separate workflow).
+  # Doesn't catch: llvm_build::smoke (find_package post-publish);
+  # cache_upload's gh release branch (no upload to GitHub here);
+  # setup-recipe consumer side; prune-cache (separate workflow).
   #
   # No Windows leg yet: install-build-deps's MSVC env wiring works,
   # but the dry-run recipe uses host targets; on Windows that means
-  # cl + LLVMDemangle. Should work once verified end-to-end on a
-  # Windows runner — added in a follow-up.
+  # cl + LLVMDemangle. Added in a follow-up.
   publish-dryrun:
     strategy:
       fail-fast: false
