@@ -10,7 +10,9 @@ name: prune-cache
 #   2. List existing assets on the rolling Release.
 #   3. orphans = existing − expected.
 #   4. Drop orphans whose age > caps.grace_days (so in-flight PRs that
-#      reference an old key aren't broken mid-run by the prune).
+#      reference an old key aren't broken mid-run by the prune). On a
+#      manual run with force=true, grace is treated as zero and every
+#      orphan drops immediately.
 #   5. Tally remaining storage; warn over caps.soft_gb, fail over
 #      caps.hard_gb.
 #
@@ -19,7 +21,9 @@ name: prune-cache
 # keys; the old assets become orphans. A PR opened a day before the
 # edit and tested a day after still references the old key and pulls
 # the old asset. Holding orphans for `grace_days` (default 7) lets
-# those in-flight PRs finish before the asset disappears.
+# those in-flight PRs finish before the asset disappears. The `force`
+# input bypasses this — only use it when intentionally evicting keys
+# even at the cost of breaking in-flight builds.
 on:
   workflow_run:
     workflows: [publish-recipe]
@@ -28,6 +32,11 @@ on:
     # Weekly watchdog. UTC; pick a low-traffic time.
     - cron: '17 4 * * 1'
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force-drop every orphan now (bypass caps.grace_days). Use only when intentionally evicting in-flight keys.'
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # delete release assets
@@ -39,6 +48,11 @@ jobs:
     # always run.
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-24.04
+    env:
+      # Only the manual workflow_dispatch path can set force=true. The
+      # grace check is bypassed for that single run; the schedule and
+      # workflow_run triggers always honour caps.grace_days.
+      FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force == true }}
     steps:
       - uses: actions/checkout@v4
 
@@ -92,6 +106,10 @@ jobs:
             exit 0
           fi
           grace_days=$(yq '.caps.grace_days' cells.yaml)
+          if [ "$FORCE" = 'true' ]; then
+            echo "::notice::force=true: bypassing grace period (was ${grace_days} days)"
+            grace_days=0
+          fi
           now=$(date -u +%s)
           # For every .tar.zst whose key (filename minus .tar.zst)
           # isn't in /tmp/expected_keys.txt and whose age exceeds

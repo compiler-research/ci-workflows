@@ -238,7 +238,13 @@ the bump, the recipe builds inline (`build-on-miss: true` does
 the right thing); on the next push to ci-workflows main the new
 cell gets warmed. The previous version's cell stays cached until
 either it ages past `caps.grace_days` or you remove it from
-`cells.yaml`, at which point `prune-cache` drops it.
+`cells.yaml`, at which point `prune-cache` drops it. To evict
+orphans before they age out — e.g. when storage is over `hard_gb`
+and the grace window is holding too much back — dispatch
+`prune-cache` manually with the `force` input enabled; this
+bypasses `grace_days` for that one run and may break in-flight PRs
+that referenced the dropped keys (they fall back to building from
+source).
 
 ## Waking a self-hosted runner before a job
 
