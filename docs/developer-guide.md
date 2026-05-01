@@ -312,3 +312,57 @@ file content hashes, the runner image and version, the
 ci-workflows commit that built it, the build timestamp. If a
 cached binary surprises you in the field, the manifest is where
 you start.
+
+## Iterating on actions/ or recipes/ without pushing
+
+End-to-end:
+
+1. CI fails on a downstream PR. You'd rather not push another
+   branch every iteration.
+2. From the failing-PR repo: `bin/repro --list`. Failed rows on
+   the current branch are tagged red; pick the row you care
+   about.
+3. `bin/repro <row-name>` runs that exact row inside docker via
+   nektos/act. The shortcut handles workflow / job / matrix /
+   container-arch / pre-flight collision detection.
+4. The post-run shell drops you inside the container. Edit code,
+   recompile, rerun the tests. On shell exit you're prompted to
+   dump `git diff HEAD` to `/tmp/repro-<row>.patch` on the host;
+   `git apply <patch>` brings the edits back to your working
+   tree.
+5. To test changes to *ci-workflows itself* (this repo) without
+   pushing a branch, pass `--ci-workflows <local-path>` --
+   bin/repro overlays your local `actions/` on the workflow.
+6. Iterate. Push when green.
+
+### What `--ci-workflows <path>` does
+
+1. Copies every `actions/<name>/` from the local checkout to
+   `<downstream>/.github/act-ci-workflows-stage/<name>/` (a copy
+   rather than a symlink, because act doesn't follow directory
+   symlinks for local actions).
+2. Writes a temp workflow beside the original with each
+   `uses: compiler-research/ci-workflows/actions/<name>@<ref>`
+   rewritten to `uses: ./.github/act-ci-workflows-stage/<name>`.
+3. Runs act on the temp workflow; removes the stage and temp file
+   at exit.
+
+`~/.cache/act/` is untouched, so you can keep multiple
+ci-workflows checkouts on different branches and switch which one
+bin/repro consumes via `--ci-workflows <path>`.
+
+### Limits
+
+- The downstream's `runs-on:` slugs need to dispatch under act
+  (Linux containers; macOS / Windows rows skip).
+- `<row-name>` resolves via fnmatch against what `act -n --json`
+  enumerates; ambiguous matches print the candidates instead of
+  running.
+- act bind-mounts the consumer working tree, so workflow side
+  effects (`build/`, `llvm-project/`, `__ci_workflows__/`) persist
+  on the host after the container is removed. The workspace-clash
+  pre-flight catches these on the next run; clean them up by hand
+  for a pristine tree. Stage and temp workflow ARE cleaned at
+  exit; if a run is killed hard, remove
+  `.github/act-ci-workflows-stage/` and
+  `.github/workflows/act-*-localized-*.yml` by hand.
