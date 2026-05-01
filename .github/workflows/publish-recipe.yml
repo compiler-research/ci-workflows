@@ -67,7 +67,11 @@ permissions:
 jobs:
   publish-dispatch:
     if: github.event_name == 'workflow_dispatch'
-    name: dispatch ${{ inputs.recipe }} v${{ inputs.version }} (${{ inputs.os }}/${{ inputs.arch }})
+    # No templated `name:`. When the gate is false (push / pull_request),
+    # GitHub still enumerates the job and renders any `${{ inputs.* }}`
+    # in `name:` literally, producing a phantom Skipped row that reads
+    # like a real failure. Letting GHA fall back to the job id keeps the
+    # Skipped row clean.
     runs-on: ${{ inputs.os }}
     steps:
       - uses: actions/checkout@v4
@@ -128,7 +132,9 @@ jobs:
   publish-on-push:
     needs: read-cells
     if: github.event_name == 'push' && needs.read-cells.outputs.empty != 'true'
-    name: ${{ matrix.recipe }} v${{ matrix.version }} (${{ matrix.os }}/${{ matrix.arch }})
+    # No templated `name:`. Same reason as publish-dispatch: on the
+    # pull_request trigger this job is skipped, and a `${{ matrix.* }}`
+    # template in `name:` would render unresolved on the Skipped row.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -185,7 +191,9 @@ jobs:
   validate-on-pr:
     needs: validate-pr-cells
     if: github.event_name == 'pull_request' && needs.validate-pr-cells.outputs.empty != 'true'
-    name: validate ${{ matrix.recipe }} v${{ matrix.version }} (${{ matrix.os }}/${{ matrix.arch }})
+    # No templated `name:`. Same reason as publish-on-push: on the push
+    # trigger this job is skipped, and a `${{ matrix.* }}` template in
+    # `name:` would render unresolved on the Skipped row.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
