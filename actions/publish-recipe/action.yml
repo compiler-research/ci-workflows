@@ -236,8 +236,13 @@ runs:
     # the recipe build's CCACHE_DIR alongside the install tree under
     # the same content-hash key. Reuses the install tree's manifest;
     # cache_upload accepts no manifest in that case.
+    # Windows is gated out for now: bin/repro under nektos/act doesn't
+    # target Windows hosts, so the dev-repro consumer of the sibling
+    # asset has no Windows use case yet. Skipping here lets us avoid
+    # the chocolatey zstandard package's recurrent 404s on the publish
+    # path; revisit on demand.
     - name: Tar + zstd + upload ccache
-      if: steps.skip.outputs.exists != 'true' && inputs.dry-run != 'true'
+      if: steps.skip.outputs.exists != 'true' && inputs.dry-run != 'true' && runner.os != 'Windows'
       shell: bash
       env:
         KEY: ${{ steps.compute-key.outputs.key }}
