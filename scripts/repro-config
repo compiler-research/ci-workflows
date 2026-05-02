@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# bin/repro --devshell stages this inside the container and runs it.
+# Paths come from the env (DEVSHELL_SRC, DEVSHELL_BUILD, LLVM_PREFIX);
+# ccache knobs come from DEVSHELL_PRODUCER_COMPILER_CHECK + the
+# CCACHE_* vars bin/repro reads from the recipe's manifest. Idempotent:
+# tools install once, cmake configure no-ops when CMakeCache.txt exists.
+
+set -e
+
+if ! command -v ccache >/dev/null 2>&1; then
+  apt-get update -qq
+  # Match .github/actions/install-build-deps/action.yml (Linux path)
+  # exactly: same compiler (clang) and same set of build deps the
+  # publish-recipe pipeline used.
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    cmake ninja-build zstd ccache rsync clang libedit-dev git
+fi
+
+# Detect & install whatever libstdc++-N-dev the producer used. Read
+# CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES out of the manifest's
+# cmake_state and check for the corresponding /usr/include/c++/N
+# locally; apt-install if missing. catthehacker/ubuntu:act-24.04
+# ships libstdc++-13-dev, but the GHA-hosted ubuntu-24.04 runner has
+# libstdc++-14-dev. Clang picks the highest available libstdc++,
+# so a mismatch makes every C++ TU's preprocessor output diverge --
+# 100% ccache miss against the producer cache. For pre-cmake_state
+# manifests fall back to libstdc++-14-dev as the empirical default.
+need_cxx_n=$(python3 - <<'PY' "$DEVSHELL_MANIFEST"
+import json, os, re, sys
+try:
+    m = json.load(open(sys.argv[1]))
+except (OSError, json.JSONDecodeError):
+    sys.exit(0)
+cmf = (m.get("cmake_state") or {}).get("CMakeCXXCompiler.cmake", "")
+match = re.search(
+    r'CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES\s+"([^"]*)"', cmf
+)
+if match:
+    for p in match.group(1).split(";"):
+        m2 = re.match(r"/usr/include/c\+\+/(\d+)$", p)
+        if m2 and not os.path.isdir(p):
+            print(m2.group(1))
+            sys.exit(0)
+elif not os.path.isdir("/usr/include/c++/14"):
+    print("14")
+PY
+)
+if [[ -n "$need_cxx_n" ]]; then
+  echo "::warning::installing libstdc++-${need_cxx_n}-dev (producer used /usr/include/c++/${need_cxx_n} but it's not installed locally)"
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    "libstdc++-${need_cxx_n}-dev"
+fi
+
+# Generic dev-package divergence check. Compare the producer's
+# installed_packages map (manifest field, post-cmake_state branch)
+# against ours; for each *-dev / clang* / cmake / ninja* / ccache the
+# producer had with a different version, surface a single warning
+# line. No auto-install (versions may not be available in the local
+# apt sources, and dev tools rarely matter beyond libstdc++ which the
+# block above already handles); the warning lets the dev decide.
+python3 - <<'PY' "$DEVSHELL_MANIFEST" || true
+import json, os, subprocess, sys
+try:
+    m = json.load(open(sys.argv[1]))
+except (OSError, json.JSONDecodeError):
+    sys.exit(0)
+producer = (m.get("build_env") or {}).get("installed_packages") or {}
+if not producer:
+    sys.exit(0)
+RELEVANT = ("-dev",)
+RELEVANT_PREFIX = ("clang", "cmake", "ninja", "ccache", "lld",
+                   "libedit", "libtinfo", "libxml2", "zlib")
+candidates = {
+    n: v for n, v in producer.items()
+    if n.endswith(RELEVANT) or n.startswith(RELEVANT_PREFIX)
+}
+if not candidates:
+    sys.exit(0)
+try:
+    r = subprocess.run(
+        ["dpkg-query", "-W", "-f=${Package}\\t${Version}\\n",
+         *candidates.keys()],
+        capture_output=True, text=True,
+    )
+except FileNotFoundError:
+    sys.exit(0)
+local: dict[str, str] = {}
+for line in r.stdout.splitlines():
+    if "\t" in line:
+        n, v = line.split("\t", 1)
+        local[n] = v
+diffs = []
+for n, v in candidates.items():
+    lv = local.get(n)
+    if lv is None:
+        diffs.append(f"{n}: missing locally (producer={v})")
+    elif lv != v:
+        diffs.append(f"{n}: producer={v} local={lv}")
+if diffs:
+    print("::warning::package-version drift vs producer (may cause ccache miss):", file=sys.stderr)
+    for d in diffs[:10]:
+        print(f"  {d}", file=sys.stderr)
+    if len(diffs) > 10:
+        print(f"  ... +{len(diffs)-10} more", file=sys.stderr)
+PY
+
+ccache --max-size=5G
+# Mirror publish-recipe's compiler_check. When the manifest records
+# the producer's value, apply it verbatim (consumer's $CC --version
+# may differ in package metadata even with matching binaries) and
+# warn if the version line genuinely diverges.
+cc_version=$("$CC" --version | head -1)
+if [[ -n "${DEVSHELL_PRODUCER_COMPILER_CHECK:-}" ]]; then
+  ccache --set-config="compiler_check=$DEVSHELL_PRODUCER_COMPILER_CHECK"
+  recorded="${DEVSHELL_PRODUCER_COMPILER_CHECK#string:}"
+  if [[ "$recorded" != "$cc_version" ]]; then
+    echo "warning: compiler version differs from recipe; ccache will miss." >&2
+    echo "  recipe: $recorded" >&2
+    echo "  here:   $cc_version" >&2
+  fi
+else
+  ccache --set-config="compiler_check=string:$cc_version"
+fi
+
+build="${DEVSHELL_BUILD:?env not set; bin/repro --devshell exports it}"
+src="${DEVSHELL_SRC:?env not set; bin/repro --devshell exports it}/llvm"
+prefix="${LLVM_PREFIX:?env not set; bin/repro --devshell exports it}"
+manifest="${DEVSHELL_MANIFEST:?env not set; bin/repro --devshell exports it}"
+
+if [[ ! -f "$build/CMakeCache.txt" ]]; then
+  mkdir -p "$build"
+  cd "$build"
+  # Replay the recipe's own cmake invocation from the manifest's
+  # cmake_args field (post-#53). Substitute CMAKE_INSTALL_PREFIX with
+  # the consumer's local LLVM_PREFIX and resolve the source path
+  # relative to the build dir. ccache hashes the full compile command,
+  # so any drift here defeats the sibling-cache pre-warm. The fallback
+  # path (no cmake_args in manifest) computes flags via llvm_build for
+  # backwards compatibility with pre-#53 publishes.
+  exec_cmake_args=$(python3 - <<'PY'
+import json, os, shlex, sys
+manifest = json.load(open(os.environ["DEVSHELL_MANIFEST"]))
+args = manifest.get("cmake_args") or []
+prefix = os.environ["LLVM_PREFIX"]
+src = os.environ["DEVSHELL_SRC"] + "/llvm"
+if args:
+    out = []
+    for a in args:
+        if a == "cmake":
+            continue
+        if a.startswith("-DCMAKE_INSTALL_PREFIX="):
+            out.append(f"-DCMAKE_INSTALL_PREFIX={prefix}")
+            continue
+        if a == "../llvm":
+            out.append(src)
+            continue
+        out.append(a)
+else:
+    sys.path.insert(0, "/ci-workflows/actions/lib")
+    import llvm_build
+    out = (llvm_build.base_cmake_args(prefix)
+           + ["-DLLVM_ENABLE_PROJECTS=clang"]
+           + llvm_build.cmake_extra()
+           + [src])
+print(" ".join(shlex.quote(x) for x in out))
+PY
+)
+  eval cmake "$exec_cmake_args"
+fi
+
+# Sanity check: smoke-compile one TU every LLVM build has
+# (lib/Support/Allocator.cpp) and verify ccache hits the producer's
+# cache. Zero hits => the producer's cache doesn't reach this
+# environment (libstdc++ / compile-flag / compiler-version drift the
+# earlier checks didn't catch). Surface as ::warning:: rather than
+# exiting -- the dev may still want to iterate, just on a cold cache.
+sanity_tu="lib/Support/CMakeFiles/LLVMSupport.dir/Allocator.cpp.o"
+if [[ -f "$build/build.ninja" ]] \
+   && (cd "$build" && ninja -t commands "$sanity_tu" >/dev/null 2>&1); then
+  ccache --zero-stats
+  rm -f "$build/$sanity_tu"
+  if (cd "$build" && ninja "$sanity_tu" >/dev/null 2>&1); then
+    sanity_hits=$(ccache --show-stats \
+      | awk '/^[[:space:]]*Hits:[[:space:]]+[0-9]/ { print $2; exit }')
+    : "${sanity_hits:=0}"
+    if [[ "$sanity_hits" == "0" ]]; then
+      echo "::warning title=ccache sanity::smoke-compile of ${sanity_tu##*/} produced 0 ccache hits; producer cache likely won't apply to your builds. Compare 'ccache --show-config' to manifest.build_env.ccache and the recorded CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES."
+    else
+      echo "ccache sanity: ${sanity_hits} hit(s) on Allocator.cpp -- producer cache is reaching this consumer."
+    fi
+  fi
+fi
+
+cat <<EOF
+
+DevEnv ready. Common next steps:
+  cd \$DEVSHELL_BUILD
+  ninja clang clangInterpreter clangStaticAnalyzerCore \\
+        LLVMOrcDebugging LLVMLineEditor
+  ccache --show-stats
+  ninja install-distribution
+
+Source: \$DEVSHELL_SRC  (shallow checkout @ recipe SHA;
+                         git fetch --unshallow for history)
+EOF

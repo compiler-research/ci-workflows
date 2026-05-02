@@ -1373,5 +1373,90 @@ class SubprocessTests(unittest.TestCase):
         self.assertIn("-j NAME, --list, or -m name:", r.stderr)
 
 
+class DevshellCellTests(unittest.TestCase):
+    """Pin --devshell's cell-coord resolution: matrix-row name lookup,
+    direct recipe/version/os/arch shorthand, and the fail-fast paths
+    (typo, missing matrix.use-recipe).
+    """
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def _ns(self, name):
+        return argparse.Namespace(matrix=[f"name:{name}"])
+
+    def test_direct_coord_shorthand_returns_parsed_dict(self):
+        with mock.patch.object(self.repro, "published_cells",
+                               return_value=[]):
+            coord = self.repro._devshell_cell(
+                self._ns("llvm-release/22/ubuntu-24.04/x86_64"))
+        self.assertEqual(coord, {
+            "recipe": "llvm-release", "version": "22",
+            "os": "ubuntu-24.04", "arch": "x86_64",
+        })
+
+    def test_direct_coord_with_too_few_parts_exits(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.repro._devshell_cell(self._ns("llvm-release/22"))
+        self.assertIn("recipe/version/os/arch", str(cm.exception))
+
+    def test_direct_coord_validates_against_cells_yaml(self):
+        with mock.patch.object(
+            self.repro, "published_cells",
+            return_value=[{"recipe": "llvm-release", "version": "22",
+                           "os": "ubuntu-24.04", "arch": "arm64"}],
+        ):
+            with self.assertRaises(SystemExit) as cm:
+                # Same coord but x86_64 is not in the published list.
+                self.repro._devshell_cell(
+                    self._ns("llvm-release/22/ubuntu-24.04/x86_64"))
+        self.assertIn("not in cells.yaml", str(cm.exception))
+
+    def test_row_name_lookup_returns_recipe_coord(self):
+        rows = [{
+            "row_name": "ubu24-x86-gcc14-cling-llvm20-cppyy",
+            "matrix": {"use-recipe": "llvm-cling", "recipe-version": "20",
+                       "os": "ubuntu-24.04", "recipe-arch": "x86_64"},
+        }]
+        with mock.patch.object(self.repro, "_act_dryrun_rows",
+                               return_value=rows), \
+             mock.patch.object(self.repro, "published_cells",
+                               return_value=[]):
+            coord = self.repro._devshell_cell(
+                self._ns("ubu24-x86-gcc14-cling-llvm20-cppyy"))
+        self.assertEqual(coord["recipe"], "llvm-cling")
+        self.assertEqual(coord["version"], "20")
+
+    def test_row_without_use_recipe_exits(self):
+        rows = [{"row_name": "no-recipe-row",
+                 "matrix": {"os": "ubuntu-24.04"}}]
+        with mock.patch.object(self.repro, "_act_dryrun_rows",
+                               return_value=rows):
+            with self.assertRaises(SystemExit) as cm:
+                self.repro._devshell_cell(self._ns("no-recipe-row"))
+        self.assertIn("doesn't pull from a recipe cache", str(cm.exception))
+
+
+class DevshellImageTests(unittest.TestCase):
+    """Pin --devshell's runner-image mapping: matches act's catthehacker
+    defaults for supported Ubuntu cells, refuses other OSes."""
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def test_ubuntu_24_04_maps_to_act_image(self):
+        self.assertIn("act-24.04",
+                      self.repro._devshell_image("ubuntu-24.04"))
+
+    def test_ubuntu_22_04_maps_to_act_image(self):
+        self.assertIn("act-22.04",
+                      self.repro._devshell_image("ubuntu-22.04"))
+
+    def test_unsupported_os_exits_with_explanation(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.repro._devshell_image("macos-14")
+        self.assertIn("Linux Ubuntu cells", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

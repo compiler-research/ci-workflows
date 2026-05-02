@@ -151,6 +151,29 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="preserve the act container after the script "
                         "exits (disk NOT cleaned up). bin/repro prints "
                         "the docker exec command to re-enter it later.")
+    p.add_argument("--devshell", action="store_true",
+                   help="provision the recipe install + sibling ccache + "
+                        "matching LLVM source (per the manifest's "
+                        "SRC_COMMIT) into ~/.cache/ci-workflows/devshell/"
+                        "<cell>/ and drop into a container shell with "
+                        "CCACHE_DIR + CMAKE_*_COMPILER_LAUNCHER preset. "
+                        "Does NOT run the workflow -- this is the "
+                        "dev-bootstrap mode for editing LLVM source and "
+                        "rebuilding incrementally with ccache hits.")
+    p.add_argument("--devshell-refetch", action="store_true",
+                   help="with --devshell: re-download install/ccache/"
+                        "manifest even if the local copy already exists.")
+    p.add_argument("--devshell-script", metavar="PATH",
+                   help="with --devshell: instead of dropping into an "
+                        "interactive shell, run this script (host path) "
+                        "inside the container as the final action and "
+                        "exit with its return code. Batch mode for CI / "
+                        "automated smoke tests; the interactive shell is "
+                        "the default when this flag is omitted.")
+    p.add_argument("--devshell-rm", action="store_true",
+                   help="with --devshell: remove the persistent container "
+                        "and exit (does NOT delete ~/.cache/ci-workflows/"
+                        "devshell/<cell>/).")
 
     advanced = p.add_argument_group(
         "advanced",
@@ -902,6 +925,399 @@ def remove_container(cid: str) -> None:
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# --- devshell mode -------------------------------------------------------
+#
+# `bin/repro --devshell <cell>` provisions the cell's recipe install +
+# sibling ccache + matching LLVM source under a persistent host dir, then
+# drops into a container shell with CCACHE_DIR + CMAKE_*_COMPILER_LAUNCHER
+# preset. Devs editing LLVM source for cppyy/cppinterop debugging can
+# rebuild incrementally with ~all unmodified objects served from the
+# recipe's pre-warmed ccache.
+#
+# Distinct from the act-driven repro path: no workflow runs, no
+# nektos/act involvement, no GHA cache emulation. The container is a
+# bare runner image with the workdir bind-mounted.
+
+DEVSHELL_HOME = Path.home() / ".cache" / "ci-workflows" / "devshell"
+
+# Fallback bind-mount path for pre-#51 manifests that don't carry
+# build_env.ccache.base_dir. _devshell_workspace prefers the manifest
+# value when present.
+DEVSHELL_RUNNER_WORKSPACE = "/home/runner/work/ci-workflows/ci-workflows"
+DEVSHELL_CCACHE_SUBDIR    = ".ccache"
+DEVSHELL_SRC_SUBDIR       = "_recipe_work/llvm-project"
+DEVSHELL_BUILD_SUBDIR     = "_recipe_work/llvm-project/build"
+DEVSHELL_INSTALL_SUBDIR   = "_recipe_out/llvm-project"
+
+DEVSHELL_CONFIG_SCRIPT = REPO_ROOT / "scripts" / "repro-config"
+
+
+def _devshell_cell(args: argparse.Namespace) -> Dict[str, str]:
+    """Resolve the matrix-row name in args.matrix to a cell coord.
+
+    Mirrors `_print_fast_cells_hint._cell_for`: walks act's dry-run
+    matrix output, then validates the (recipe, version, os, arch)
+    tuple against cells.yaml (so a typo doesn't silently produce a
+    URL that 404s). Exits with a clear message on miss.
+    """
+    name = _matrix_get(args.matrix or [], "name")
+    if not name:
+        sys.exit("error: --devshell needs a row name "
+                 "(positional alias or `-m name:<row>`)")
+    # Direct-coord shorthand for cells not in any consumer matrix
+    # (e.g. llvm-release/22/ubuntu-24.04/x86_64). Skip the act matrix
+    # lookup; jump straight to cells.yaml validation below.
+    if "/" in name:
+        parts = name.split("/")
+        if len(parts) != 4:
+            sys.exit(f"error: --devshell direct-coord must be "
+                     f"recipe/version/os/arch; got '{name}'")
+        coord = {
+            "recipe": parts[0], "version": parts[1],
+            "os":     parts[2], "arch":    parts[3],
+        }
+        cells = published_cells()
+        if cells and not any(all(coord[k] == c[k]
+                                 for k in ("recipe", "version", "os", "arch"))
+                             for c in cells):
+            sys.exit(f"error: cell {coord} not in cells.yaml")
+        return coord
+    matrix_by_row = {r["row_name"]: r["matrix"]
+                     for r in _act_dryrun_rows()}
+    m = matrix_by_row.get(name)
+    if m is None:
+        sys.exit(f"error: row '{name}' not found in matrix discovery")
+    coord = {
+        "recipe":  m.get("use-recipe"),
+        "version": (m.get("recipe-version") or m.get("clang-runtime")),
+        "os":      m.get("os"),
+        "arch":    m.get("recipe-arch") or "x86_64",
+    }
+    if not all(coord.values()):
+        sys.exit(f"error: row '{name}' doesn't pull from a recipe cache "
+                 f"(matrix.use-recipe missing)")
+    cells = published_cells()
+    if cells and not any(all(coord[k] == c[k]
+                             for k in ("recipe", "version", "os", "arch"))
+                         for c in cells):
+        sys.exit(f"error: cell {coord} not in cells.yaml -- the asset "
+                 f"likely doesn't exist on Releases")
+    return coord
+
+
+def _devshell_image(os_slug: str) -> str:
+    """Pick a container image matching the cell's runner image.
+
+    Mirrors act's default mapping for the catthehacker images, since
+    that's what the recipe was built against. Linux only for now;
+    macOS/Windows cells aren't reproducible in a container shell.
+    """
+    if os_slug == "ubuntu-24.04":
+        return "ghcr.io/catthehacker/ubuntu:act-24.04"
+    if os_slug == "ubuntu-22.04":
+        return "ghcr.io/catthehacker/ubuntu:act-22.04"
+    sys.exit(f"error: --devshell currently supports Linux Ubuntu cells "
+             f"only (cell os={os_slug})")
+
+
+def _devshell_compute_key(coord: Dict[str, str]) -> str:
+    """Run actions/setup-recipe/compute_key.py the same way
+    publish-recipe/setup-recipe do, to get a content-hash key that
+    matches the published asset on Releases.
+    """
+    out = subprocess.check_output(
+        ["python3",
+         str(REPO_ROOT / "actions" / "setup-recipe" / "compute_key.py"),
+         coord["recipe"], coord["version"], coord["os"], coord["arch"]],
+        cwd=str(REPO_ROOT),
+    ).decode().strip()
+    # compute_key.py output: `key=<recipe>-<version>-<os>-<arch>-<hash>`
+    if not out.startswith("key="):
+        sys.exit(f"error: compute_key.py returned: {out!r}")
+    return out[len("key="):]
+
+
+def _devshell_fetch(base: str, key: str, work: Path,
+                    refetch: bool) -> Dict:
+    """Download <key>.tar.zst (install), <key>.ccache.tar.zst (sibling),
+    and <key>.manifest.json into `work`. Returns the parsed manifest.
+
+    `refetch` re-downloads even when the local copy is present.
+    Each download is gated independently so a partial run resumes
+    cheaply.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "actions" / "lib"))
+    import cache_io  # noqa: E402
+    import json
+    import urllib.request
+
+    # Layout under `work` (host) mirrors publish-recipe's runner
+    # workspace; _devshell_ensure_container bind-mounts it inside the
+    # container at the path recorded in the manifest.
+    install_parent = work / "_recipe_out"
+    ccache_root = work
+    manifest = work / "manifest.json"
+
+    # Install tree: archive's top-level dir is `llvm-project/`, so
+    # extracting to `<work>/_recipe_out/` lands the install at
+    # `<work>/_recipe_out/llvm-project/`.
+    install_root = install_parent / "llvm-project"
+    if refetch or not install_root.is_dir():
+        if install_parent.is_dir():
+            shutil.rmtree(install_parent)
+        install_parent.mkdir(parents=True)
+        _log(f"repro: fetching install ({key}.tar.zst)...")
+        cache_io.cache_download(base, key, str(install_parent))
+
+    # Sibling ccache: archive's top-level dir is `.ccache/`, extracting
+    # to `<work>/` lands the ccache at `<work>/.ccache/`.
+    ccache_dir = ccache_root / DEVSHELL_CCACHE_SUBDIR
+    if refetch or not ccache_dir.is_dir():
+        if ccache_dir.is_dir():
+            shutil.rmtree(ccache_dir)
+        asset = f"{key}.ccache.tar.zst"
+        _log(f"repro: fetching ccache ({asset})...")
+        if base.startswith("file://"):
+            with (Path(base[len("file://"):]) / asset).open("rb") as f:
+                cache_io._zstd_decode_into_tar(f, ccache_root)
+        else:
+            with urllib.request.urlopen(
+                    f"{base.rstrip('/')}/{asset}", timeout=300) as r:
+                cache_io._zstd_decode_into_tar(r, ccache_root)
+
+    # Manifest: plain JSON, no zstd/tar.
+    if refetch or not manifest.is_file():
+        url = f"{base.rstrip('/')}/{key}.manifest.json"
+        _log(f"repro: fetching manifest ({key}.manifest.json)...")
+        if base.startswith("file://"):
+            shutil.copy(Path(base[len("file://"):]) / f"{key}.manifest.json",
+                        manifest)
+        else:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                manifest.write_bytes(r.read())
+
+    return json.loads(manifest.read_text())
+
+
+def _devshell_source(work: Path, manifest: Dict) -> Path:
+    """Shallow-clone llvm-project at the manifest's SRC_COMMIT.
+
+    `git init` + `git fetch --depth=1 origin <commit>` instead of a
+    full-history clone: llvm-project's full history is ~3 GB and
+    several minutes; the recipe-pinned SHA only needs that one commit
+    to build. The dev can `git fetch --unshallow` from inside the
+    container if they need history (e.g. for `git blame`).
+
+    Persistent across invocations: subsequent calls find the local
+    .git, just re-fetch the commit (no-op if already present) and
+    re-checkout. Recipe ladder bumps that move SRC_COMMIT pull only
+    the new commit.
+    """
+    src = manifest.get("source") or {}
+    repo = src.get("repo")
+    commit = src.get("commit")
+    if not repo or not commit or commit == "unknown":
+        sys.exit(f"error: manifest missing source.{{repo,commit}}; "
+                 f"cannot reproduce")
+    src_dir = work / DEVSHELL_SRC_SUBDIR
+    if not (src_dir / ".git").is_dir():
+        _log(f"repro: shallow-fetching {repo} @ {commit[:12]} "
+             f"(use `git fetch --unshallow` inside the container "
+             f"for history)...")
+        src_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "-C", str(src_dir), "init", "-q"],
+                       check=True)
+        subprocess.run(["git", "-C", str(src_dir),
+                        "remote", "add", "origin", repo], check=True)
+    subprocess.run(["git", "-C", str(src_dir),
+                    "fetch", "--depth=1", "origin", commit],
+                   check=True)
+    _log(f"repro: checking out {commit[:12]}...")
+    subprocess.run(["git", "-C", str(src_dir),
+                    "checkout", "--detach", commit], check=True)
+    return src_dir
+
+
+def _devshell_ccache_cfg(manifest: Dict) -> Dict[str, str]:
+    """build_env.ccache from the manifest, or {} for pre-#51 publishes."""
+    return ((manifest.get("build_env") or {}).get("ccache") or {})
+
+
+def _devshell_workspace(manifest: Dict) -> str:
+    """In-container path mirroring the recipe's runner workspace.
+
+    Drives the bind-mount and CCACHE_BASEDIR so recipe-side ccache
+    entries key on the same path as dev-side compiles.
+    """
+    base = _devshell_ccache_cfg(manifest).get("base_dir", "")
+    if base and base != "unknown":
+        return base
+    return DEVSHELL_RUNNER_WORKSPACE
+
+
+def _devshell_container_name(cell_id: str) -> str:
+    return f"devshell-{cell_id}"
+
+
+def _devshell_container_running(name: str) -> bool:
+    r = subprocess.run(
+        ["docker", "container", "inspect", "-f", "{{.State.Running}}", name],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def _devshell_container_exists(name: str) -> bool:
+    r = subprocess.run(
+        ["docker", "container", "inspect", name],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
+def _devshell_ensure_container(name: str, image: str, work: Path,
+                               manifest: Dict) -> None:
+    """Idempotently start a long-lived container named `name` with
+    `work` bind-mounted at the manifest's recorded workspace path and
+    the dev-env vars exported. Tool installation + build-dir configure
+    happens via scripts/repro-config -- see _devshell_run_config().
+    """
+    if _devshell_container_exists(name):
+        if not _devshell_container_running(name):
+            subprocess.run(["docker", "start", name], check=True,
+                           stdout=subprocess.DEVNULL)
+        return
+    ws = _devshell_workspace(manifest)
+    cfg = _devshell_ccache_cfg(manifest)
+    no_hash_dir = "true" if cfg.get("hash_dir") == "false" else "false"
+    env_args: list[str] = [
+        "-e", "CC=clang",
+        "-e", "CXX=clang++",
+        "-e", f"CCACHE_DIR={ws}/{DEVSHELL_CCACHE_SUBDIR}",
+        "-e", f"CCACHE_BASEDIR={ws}",
+        "-e", f"CCACHE_NOHASHDIR={no_hash_dir}",
+        "-e", "CMAKE_C_COMPILER_LAUNCHER=ccache",
+        "-e", "CMAKE_CXX_COMPILER_LAUNCHER=ccache",
+        "-e", f"LLVM_PREFIX={ws}/{DEVSHELL_INSTALL_SUBDIR}",
+        "-e", f"DEVSHELL_SRC={ws}/{DEVSHELL_SRC_SUBDIR}",
+        "-e", f"DEVSHELL_BUILD={ws}/{DEVSHELL_BUILD_SUBDIR}",
+        "-e", f"DEVSHELL_MANIFEST={ws}/manifest.json",
+        "-e", f"CCACHE_LOGFILE={ws}/{DEVSHELL_CCACHE_SUBDIR}/ccache.log",
+    ]
+    cc = cfg.get("compiler_check", "")
+    if cc and cc != "unknown":
+        # Producer's ccache.compiler_check verbatim. repro-config
+        # applies it on the consumer side and warns on $CC --version
+        # divergence.
+        env_args += ["-e", f"DEVSHELL_PRODUCER_COMPILER_CHECK={cc}"]
+    subprocess.run(
+        ["docker", "run", "-d",
+         "--name", name,
+         "-v", f"{work}:{ws}",
+         "-v", f"{REPO_ROOT}:/ci-workflows:ro",
+         "-w", ws,
+         *env_args,
+         image, "sleep", "infinity"],
+        check=True, stdout=subprocess.DEVNULL,
+    )
+
+
+def _devshell_run_config(name: str, work: Path, manifest: Dict) -> None:
+    """Stage scripts/repro-config into /work and run it inside the
+    container. Idempotent on re-runs (script is no-op when build dir
+    already configured + tools already installed). Emits the hint
+    block for the dev to copy-paste.
+    """
+    if not DEVSHELL_CONFIG_SCRIPT.is_file():
+        sys.exit(f"error: {DEVSHELL_CONFIG_SCRIPT} not found "
+                 f"-- ci-workflows checkout incomplete?")
+    staged = work / "repro-config"
+    shutil.copy(DEVSHELL_CONFIG_SCRIPT, staged)
+    os.chmod(staged, 0o755)
+    ws = _devshell_workspace(manifest)
+    subprocess.run(
+        ["docker", "exec", "-w", ws, name,
+         "bash", f"{ws}/repro-config"],
+        check=True,
+    )
+
+
+def cmd_devshell(args: argparse.Namespace) -> int:
+    """Provision install + ccache + LLVM source for the cell, then
+    drop into a container shell. See module-level comment.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "actions" / "lib"))
+    import cache_io  # noqa: E402
+
+    coord = _devshell_cell(args)
+    image = _devshell_image(coord["os"])
+    key = _devshell_compute_key(coord)
+    base = cache_io.resolve_cache_base()
+
+    cell_id = "-".join(coord[k] for k in ("recipe", "version", "os", "arch"))
+    name = _devshell_container_name(cell_id)
+    work = DEVSHELL_HOME / cell_id
+
+    if args.devshell_rm:
+        if _devshell_container_exists(name):
+            _log(f"repro: removing devshell container {name}")
+            subprocess.run(["docker", "rm", "-f", name],
+                           check=True, stdout=subprocess.DEVNULL)
+        else:
+            _log(f"repro: no container named {name}; nothing to remove")
+        _log(f"repro: workdir at {work} preserved")
+        return 0
+
+    work.mkdir(parents=True, exist_ok=True)
+
+    manifest = _devshell_fetch(base, key, work, args.devshell_refetch)
+    src_dir = _devshell_source(work, manifest)
+
+    fresh = not _devshell_container_exists(name)
+    _devshell_ensure_container(name, image, work, manifest)
+    _devshell_run_config(name, work, manifest)
+
+    ws = _devshell_workspace(manifest)
+    _log("")
+    _log(f"repro: --devshell ready ({cell_id})")
+    _log(f"  {ws}/{DEVSHELL_INSTALL_SUBDIR}")
+    _log(f"      <- {key}.tar.zst (install tree)")
+    _log(f"  {ws}/{DEVSHELL_CCACHE_SUBDIR}")
+    _log(f"      <- {key}.ccache.tar.zst (warm ccache, paths match recipe build)")
+    _log(f"  {ws}/{DEVSHELL_SRC_SUBDIR}")
+    _log(f"      <- {manifest['source']['repo']} @ "
+         f"{manifest['source']['commit'][:12]}")
+    _log(f"  container              {name} ({'fresh' if fresh else 'reused'})")
+    _log("")
+    _log(f"repro: re-enter later with `bin/repro --devshell <cell>` "
+         f"or `docker exec -it {name} bash`")
+    _log(f"repro: tear down with `bin/repro --devshell --devshell-rm <cell>`")
+    _log("")
+
+    if args.devshell_script:
+        # Batch mode: stage the host script into the bind-mounted workdir
+        # so the container can exec it without a second mount, run it,
+        # exit with its rc. No interactive shell.
+        script_host = Path(args.devshell_script).resolve()
+        if not script_host.is_file():
+            sys.exit(f"error: --devshell-script: {script_host} not a file")
+        staged = work / ".devshell-script.sh"
+        shutil.copy(script_host, staged)
+        os.chmod(staged, 0o755)
+        _log(f"repro: running --devshell-script ({script_host.name})...")
+        return subprocess.run(
+            ["docker", "exec", "-w", ws, name,
+             "bash", f"{ws}/.devshell-script.sh"]).returncode
+
+    # scripts/repro-config printed its own next-step hints above;
+    # don't duplicate. The quickstart-once marker is no longer
+    # needed.
+
+    return _run_interactive(["docker", "exec", "-it", name, "bash"])
+
+
+
+
 def _container_tree_dirty(cid: str, workspace: str) -> bool:
     """True when `git -C <workspace> diff HEAD` reports changes.
 
@@ -1163,6 +1579,12 @@ def main() -> int:
         pattern = args.passthrough[0]
         args.passthrough = args.passthrough[1:]
         _resolve_pattern(pattern, args)
+
+    # --devshell short-circuits the act run: provision the cell's
+    # recipe install + sibling ccache + matching LLVM source, then
+    # spawn a container shell. No workflow execution.
+    if args.devshell:
+        return cmd_devshell(args)
 
     # Auto-fill -W / -j from `-m name:<row>` when both are omitted.
     # discover_matrix_rows already cross-references act -l + act -n,
