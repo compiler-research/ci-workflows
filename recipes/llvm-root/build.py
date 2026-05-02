@@ -93,11 +93,12 @@ def main() -> int:
     # ROOT consumes libclangInterpreter.a even though the clang driver
     # doesn't depend on it transitively) + StaticAnalyzerCore (cling's
     # bundled clang pulled it into CppInterOp's link in the past) +
-    # LLVMOrcDebugging (cling pulls it via LIBS).
+    # LLVMOrcDebugging (cling pulls it via LIBS) + LLVMLineEditor
+    # (cling's UserInterface declares it via LLVM_LINK_COMPONENTS).
     subprocess.run(
         ["ninja", "-j", ncpus,
          "clang", "clangInterpreter", "clangStaticAnalyzerCore",
-         "LLVMOrcDebugging"],
+         "LLVMOrcDebugging", "LLVMLineEditor"],
         check=True,
     )
 
