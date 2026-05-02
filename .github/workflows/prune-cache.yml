@@ -119,8 +119,9 @@ jobs:
           while IFS= read -r asset; do
             name=$(echo "$asset" | jq -r .name)
             case "$name" in
+              *.ccache.tar.zst) key="${name%.ccache.tar.zst}" ;;
               *.tar.zst)        key="${name%.tar.zst}" ;;
-              *.manifest.json)  continue ;;  # handled with its tarball
+              *.manifest.json)  continue ;;
               *)                echo "::warning::unexpected asset: $name"; continue ;;
             esac
             if grep -qxF "$key" /tmp/expected_keys.txt; then
@@ -142,6 +143,8 @@ jobs:
             fi
             echo "::notice::dropping orphan ($age_days days old): $key"
             gh release delete-asset cache "${key}.tar.zst" \
+              -R "$GITHUB_REPOSITORY" --yes || true
+            gh release delete-asset cache "${key}.ccache.tar.zst" \
               -R "$GITHUB_REPOSITORY" --yes || true
             gh release delete-asset cache "${key}.manifest.json" \
               -R "$GITHUB_REPOSITORY" --yes || true
