@@ -98,6 +98,39 @@ A team-internal HTTP cache works the same way — point `cache-base` at
 URL are read-only at the moment (only `file://` and `gh release upload`
 are supported sinks).
 
+## Reproducing a CI failure locally
+
+When a matrix row fails on a downstream PR, `bin/repro` runs that
+exact row inside docker via [nektos/act](https://github.com/nektos/act)
+— no branch push, no waiting for CI:
+
+```bash
+cd ~/sources/CppInterOp                     # the failing-PR repo
+bin/repro --list                            # jobs + cell-cache hits
+                                            # + red [failed] tags
+bin/repro <row-name>                        # reproduce one row
+```
+
+The row-name shortcut resolves to `-W <workflow> -j <job> -m
+name:<row>` via fnmatch against `act -n --json`. `bin/repro` picks
+the right `--container-architecture` from the row's `os:` slug,
+refuses to launch when stale `build/` or `llvm-project/` in cwd
+would collide with the workflow's `mkdir`, and drops you into a
+shell inside the post-run container. On shell exit you're prompted
+to dump any in-container edits as a patch on the host.
+
+Iterate on a `ci-workflows` action without pushing:
+
+```bash
+~/sources/ci-workflows/bin/repro \
+    --ci-workflows ~/sources/ci-workflows \
+    <row-name>
+```
+
+Stage / temp-workflow files are cleaned at exit; disk after the
+run is zero (image cache aside). See `bin/repro --help` and
+[docs/developer-guide.md](docs/developer-guide.md) for the rest.
+
 ## Layout
 
 ```

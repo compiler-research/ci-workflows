@@ -1,0 +1,1315 @@
+#!/usr/bin/env python3
+"""bin/repro -- nektos/act wrapper for local CI-failure reproduction.
+
+Modes:
+  --list / -l            List jobs in the workflow (calls `act -l`).
+                         Each matrix row is annotated with a
+                         copy-pastable `bin/repro <name>` invocation.
+                         Rows whose Linux cell is already published
+                         in compiler-research/ci-workflows' cache are
+                         tagged so you know which ones download the
+                         LLVM tree (~seconds) vs. build inline
+                         (~30 min). Failed rows on the current
+                         branch's upstream tip are tagged red.
+  bin/repro <NAME>       Positional row-name glob (fnmatch). Resolves
+                         to `-W <workflow> -j <job> -m name:<NAME>`
+                         when the glob matches a unique matrix row;
+                         ambiguous matches print the candidates and
+                         exit. No flags needed for the common case.
+  -j NAME                Run the job. Default: drop into a bash shell
+                         inside the container after act exits, then
+                         remove the container.
+  -m KEY:VALUE           Filter to a specific matrix row. Repeatable.
+                         e.g. -m name:osx26-arm-clang-cling-llvm20-cppyy
+                         (passed to `act --matrix KEY:VALUE`).
+                         Auto-arch: when the cell targets an arch
+                         different from the host, bin/repro sets
+                         `act --container-architecture linux/<X>` so
+                         docker pulls the right platform variant of
+                         the runner image. The arch is resolved (in
+                         order) from `-m arch:X`, then `-m os:X`
+                         (ubuntu-24.04 -> x86_64, ubuntu-24.04-arm
+                         -> arm64), then by looking the row up in
+                         act's matrix expansion via `-m name:X`. The
+                         common `bin/repro <name>` form picks up the
+                         right arch with no further flags.
+
+Default behavior: shell drops in after act exits. When the shell
+exits, you're asked whether to remove the container (default: yes,
+so bare Enter cleans up; --save-temps short-circuits to keep). Two
+opt-outs:
+
+  --no-shell             Skip the post-run shell. Container is still
+                         removed unless --save-temps is given.
+                         (No interactive prompt -- there's no shell
+                         session in which to ask.)
+  --save-temps           Keep the container after the script exits
+                         (disk NOT cleaned up). Skip the prompt.
+                         bin/repro prints the `docker exec` command
+                         to re-enter it.
+
+When stdin is not a TTY (piped / scripted invocations), the prompt
+is bypassed and the documented default (remove) applies, so
+unattended runs stay clean.
+
+Pre-flight workspace clash check: bin/repro mounts the consumer's
+working tree into the act container. If a top-level dir matching a
+known offender (`build/`, `llvm-project/`) already exists, the
+workflow's `mkdir build` / setup-recipe's `mv ../llvm-project` will
+trip under `set -e` before any actionable error appears. The
+pre-flight lists the colliding paths and refuses to proceed by
+default. Move them aside (`mv build build.local`) or pass
+`--skip-clash-check` to bypass.
+
+Patch export on shell exit: when the in-container git tree differs
+from HEAD at the time the shell session ends (you edited / built /
+poked something inside the container), bin/repro offers to dump
+`git diff HEAD` to /tmp/repro-<row>.patch on the host before the
+container is removed. Default Y -- losing in-container edits is the
+worse failure mode. Apply on the host with `git apply /tmp/repro-
+<row>.patch`. Untracked files aren't included; `git add` them
+inside the container first if you need them in the patch.
+
+Network: only what act + setup-recipe naturally fetch (catthehacker
+image one-time pull, then setup-recipe's tarball download inside the
+container). Nothing pre-fetched by this script.
+
+Disk: container is removed at exit (unless --save-temps). The
+consumer working tree, however, accumulates whatever the workflow
+writes into $GITHUB_WORKSPACE -- act bind-mounts the working tree
+into the container, so `mkdir build`, setup-recipe's `mv ../llvm-
+project`, etc. land directly on the host. The workspace-clash
+pre-flight (above) catches the resulting `build/` / `llvm-project/`
+on the next run; clean them up by hand if you want a pristine tree.
+
+Anything after `--` is passed verbatim to act.
+
+Examples
+========
+
+    cd ~/sources/CppInterOp
+    bin/repro --list                              # see jobs + cells
+    bin/repro ubu24-x86-gcc14-cling-llvm20-cppyy  # row-name shortcut
+    bin/repro -j build -m name:osx26-arm-...      # explicit -j / -m
+    bin/repro -j test --no-shell                  # scripted: act, then rm
+    bin/repro -j test --save-temps                # keep container around
+    bin/repro -j test -- --verbose                # passthrough to act
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import platform
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CELLS_YAML = REPO_ROOT / "cells.yaml"
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="bin/repro",
+        description=__doc__.split("\n\n", 1)[0],
+        epilog=__doc__.split("\n\n", 1)[1],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("-l", "--list", action="store_true",
+                   help="list jobs in the workflow and exit")
+    p.add_argument("-j", "--job",
+                   help="job name (passed to act -j)")
+    p.add_argument("-m", "--matrix", action="append", default=[],
+                   metavar="KEY:VALUE",
+                   help="filter to a specific matrix row, e.g. "
+                        "`-m os:ubuntu-24.04`. Repeatable; each "
+                        "becomes a separate `act --matrix KEY:VALUE`.")
+    p.add_argument("-W", "--workflow",
+                   help="workflow file (passed to act -W). act "
+                        "defaults to scanning ./.github/workflows/ "
+                        "when omitted; pass -W only to disambiguate "
+                        "when the same job NAME exists in more than "
+                        "one workflow.")
+    p.add_argument("-n", "--dry-run", action="store_true",
+                   help="pass -n to act: validate the workflow "
+                        "without spinning up containers. Useful for "
+                        "quick disambiguation checks (does -j + -m "
+                        "identify a unique row?).")
+    p.add_argument("--no-shell", dest="shell", action="store_false",
+                   default=True,
+                   help="exit when act finishes; do NOT drop into a "
+                        "shell. Container is still removed unless "
+                        "--save-temps is given.")
+    p.add_argument("--save-temps", action="store_true",
+                   help="preserve the act container after the script "
+                        "exits (disk NOT cleaned up). bin/repro prints "
+                        "the docker exec command to re-enter it later.")
+
+    advanced = p.add_argument_group(
+        "advanced",
+        "rarely needed; opt-in flags for testing local changes "
+        "and overriding act's defaults.")
+    advanced.add_argument(
+        "--ci-workflows", type=Path, metavar="PATH",
+        help="run against a local checkout of "
+             "compiler-research/ci-workflows. Symlinks every "
+             "actions/<name> from PATH under "
+             ".github/.act-ci-workflows-stage/<name> in the "
+             "consumer repo, writes a temp workflow next to the "
+             "original with each "
+             "`uses: compiler-research/ci-workflows/actions/<name>@<ref>` "
+             "rewritten to `uses: ./.github/.act-ci-workflows-stage/"
+             "<name>` (act's local-action form), and runs that. "
+             "Stage and temp file are removed at exit. Requires "
+             "-W <workflow>.")
+    advanced.add_argument(
+        "--skip-clash-check", action="store_true",
+        help="skip the pre-flight scan for workspace dirs (e.g. "
+             "stale `build/` from local development) that the "
+             "workflow will mkdir into. Default is to warn and "
+             "prompt; pass this to proceed unconditionally.")
+
+    p.add_argument("passthrough", nargs=argparse.REMAINDER,
+                   help="anything after `--` is passed to act verbatim")
+    return p.parse_args(argv)
+
+
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def host_arch() -> str:
+    """Hardware arch slug, robust to Rosetta on Darwin.
+
+    `platform.machine()` reflects the *current process's* arch. On
+    Apple Silicon under Rosetta an x86_64 Python reports x86_64, so
+    a host-vs-cell-arch comparison without sysctl correction would
+    silently treat the host as Intel and miss the chance to suggest
+    a native-arch cell when one is published.
+    """
+    if platform.system() == "Darwin":
+        try:
+            r = subprocess.run(["sysctl", "-n", "hw.optional.arm64"],
+                               capture_output=True, text=True, check=True)
+            if r.stdout.strip() == "1":
+                return "arm64"
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            pass
+    m = platform.machine().lower()
+    return {
+        "arm64":   "arm64",
+        "aarch64": "arm64",
+        "x86_64":  "x86_64",
+        "amd64":   "x86_64",
+    }.get(m, m)
+
+
+def _require(tool: str) -> str:
+    if shutil.which(tool):
+        return tool
+    sys.exit(f"error: `{tool}` is not on PATH.")
+
+
+def _run_interactive(cmd: List[str]) -> int:
+    """Run cmd interactively; ignore SIGINT in this Python parent.
+
+    act and `docker exec -it` share the controlling TTY's foreground
+    process group with this Python process. Without SIG_IGN, Python's
+    default reaction to Ctrl+C (raise KeyboardInterrupt out of
+    subprocess.run, which then SIGTERMs the docker child) tears the
+    container down even when the user just wanted to interrupt cmake/
+    ninja running INSIDE it. Restoring the handler on exit, even if
+    Popen.wait raises, keeps the parent's signal disposition clean.
+    """
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        return subprocess.Popen(cmd).wait()
+    finally:
+        signal.signal(signal.SIGINT, old)
+
+
+def list_jobs(args: argparse.Namespace) -> int:
+    cmd = [_require("act"), "-l"]
+    if args.workflow:
+        cmd += ["-W", args.workflow]
+    rc = _run_interactive(cmd)
+    _print_fast_cells_hint()
+    return rc
+
+
+def published_cells(path: Optional[Path] = None) -> List[Dict[str, str]]:
+    """Parse cells.yaml's `cells:` array into a list of dicts.
+
+    cells.yaml lists each cell as one inline-flow YAML row:
+        - { recipe: llvm-asan, version: '22', os: ubuntu-24.04, arch: x86_64 }
+    Hand-rolled parser instead of pulling in PyYAML to keep the
+    script stdlib-only. Returns [] on missing file or parse failure
+    -- the caller treats this purely as a hint, never a hard error.
+    `path` defaults to the in-tree cells.yaml; tests inject a
+    different path.
+    """
+    if path is None:
+        path = CELLS_YAML
+    if not path.is_file():
+        return []
+    out: List[Dict[str, str]] = []
+    in_cells = False
+    for line in path.read_text().splitlines():
+        if line.startswith("cells:"):
+            in_cells = True
+            continue
+        if not in_cells:
+            continue
+        # Any new top-level key ends the cells: section.
+        if line and not line[0].isspace() and not line.startswith("#"):
+            break
+        s = line.strip()
+        if not s.startswith("- {") or not s.endswith("}"):
+            continue
+        body = s[3:-1].strip()  # strip leading "- {" and trailing "}"
+        cell: Dict[str, str] = {}
+        for kv in body.split(","):
+            if ":" not in kv:
+                continue
+            k, _, v = kv.partition(":")
+            cell[k.strip()] = v.strip().strip("'").strip('"')
+        if all(k in cell for k in ("recipe", "version", "os", "arch")):
+            out.append(cell)
+    return out
+
+
+def _act_listing() -> List[Dict[str, str]]:
+    """Parse `act -l` into one dict per row with keys: job_id,
+    job_name, workflow_name, workflow_file. The columns are
+    whitespace-aligned; we split on 2+ spaces to keep multi-word
+    `Job name` values intact.
+    """
+    act = shutil.which("act")
+    if not act:
+        return []
+    try:
+        proc = subprocess.run(
+            [act, "-l"], capture_output=True, text=True, check=False,
+        )
+    except Exception:
+        return []
+    rows: List[Dict[str, str]] = []
+    headers: Optional[List[str]] = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("Stage"):
+            headers = [h.strip().lower().replace(" ", "_")
+                       for h in re.split(r"\s{2,}", line.strip())]
+            continue
+        if headers is None or not line.strip():
+            continue
+        parts = re.split(r"\s{2,}", line.strip())
+        if len(parts) != len(headers):
+            continue
+        rows.append(dict(zip(headers, parts)))
+    return rows
+
+
+def discover_matrix_rows() -> List[Tuple[str, str, str]]:
+    """Enumerate every (workflow_file, job_id, row_name) the user
+    can target. Drives off `act -n --json`: act has already done
+    the matrix expansion and emits one dryrun line per row with
+    the resolved matrix dict, so we just read it.
+    """
+    listing = _act_listing()
+    wf_name_to_file = {r["workflow_name"]: r["workflow_file"]
+                       for r in listing}
+    out: List[Tuple[str, str, str]] = []
+    out_set: set = set()
+    for r in _act_dryrun_rows():
+        wf_file = wf_name_to_file.get(r["workflow_name"])
+        if not wf_file:
+            continue
+        key = (wf_file, r["jobID"], r["row_name"])
+        if key not in out_set:
+            out.append(key)
+            out_set.add(key)
+    return out
+
+
+def _origin_repo_slug() -> Optional[str]:
+    """Return `owner/repo` parsed from the `origin` remote URL,
+    or None when not in a git repo or origin isn't a github URL.
+    """
+    try:
+        url = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+    except Exception:
+        return None
+    # SSH form: git@github.com:owner/repo(.git)?
+    # HTTPS form: https://github.com/owner/repo(.git)?
+    m = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$", url)
+    if not m:
+        return None
+    return f"{m.group(1)}/{m.group(2)}"
+
+
+def _failed_rows_for_branch() -> set:
+    """Return the set of matrix-row names that failed in the latest
+    CI run for this branch's upstream tip. Uses GitHub's anonymous
+    Checks API -- public repos serve it without authentication, so
+    we don't need `gh` (and the broad token scopes that come with
+    `gh auth login`). Trade-offs:
+      - 60 requests/hour anonymous rate limit; one request per
+        `bin/repro --list` is fine for interactive use.
+      - Private repos return 404; the result is just an empty set
+        (no annotations), no error message.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+    slug = _origin_repo_slug()
+    if not slug:
+        return set()
+    try:
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        if not branch or branch == "HEAD":
+            return set()
+        # Prefer the upstream tip's sha (what CI actually ran on);
+        # fall back to local HEAD when the branch isn't tracked.
+        sha = subprocess.run(
+            ["git", "rev-parse", f"origin/{branch}"],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        if not sha:
+            sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True, text=True, check=False,
+            ).stdout.strip()
+        if not sha:
+            return set()
+        url = (f"https://api.github.com/repos/{slug}/commits/{sha}"
+               f"/check-runs?per_page=100")
+        req = urllib.request.Request(
+            url, headers={
+                "User-Agent": "ci-workflows-bin-repro",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.load(resp)
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                _log("repro: github anonymous API rate-limited; "
+                     "[failed] annotations skipped.")
+            return set()
+        except Exception:
+            return set()
+        failed: set = set()
+        for cr in data.get("check_runs", []):
+            if cr.get("conclusion") not in (
+                    "failure", "cancelled", "timed_out"):
+                continue
+            # GitHub renders matrix-row check names as
+            # "<workflow> / <row_name>"; strip the prefix.
+            name = cr.get("name", "")
+            if " / " in name:
+                name = name.split(" / ", 1)[-1]
+            failed.add(name.strip())
+        return failed
+    except Exception:
+        return set()
+
+
+def _act_dryrun_rows() -> List[Dict[str, object]]:
+    """Run `act -n --json` for both push and pull_request events
+    and return one dict per matrix-expanded job (jobID, matrix,
+    workflow_name, row_name). Two events because workflows like
+    CppInterOp's root.yml only trigger on pull_request and would
+    otherwise be invisible to the default (push) dispatch.
+    """
+    act = shutil.which("act")
+    if not act:
+        return []
+    import json
+    out: List[Dict[str, object]] = []
+    seen_keys: set = set()
+    for event in ("push", "pull_request"):
+        cmd = [act, "-n", "--json"]
+        if event != "push":
+            cmd.append(event)
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, check=False,
+            )
+        except Exception:
+            continue
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if not obj.get("dryrun"):
+                continue
+            job_id = obj.get("jobID")
+            matrix = obj.get("matrix") or {}
+            # `job`: "CI/prepare-dell                         " --
+            # workflow display name lives before the slash.
+            job_field = (obj.get("job") or "").strip()
+            wf_name = (job_field.split("/", 1)[0].strip()
+                       if "/" in job_field else "")
+            row_name = matrix.get("name") or job_id
+            key = (wf_name, job_id, row_name)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            out.append({"jobID": job_id, "matrix": matrix,
+                        "workflow_name": wf_name, "row_name": row_name})
+    return out
+
+
+def _print_fast_cells_hint() -> None:
+    """After `act -l`, print copy-pastable `bin/repro` invocations
+    for each matrix row, annotating rows that hit a published Linux
+    cell (download instead of inline build).
+    """
+    cells = published_cells()
+    rows = discover_matrix_rows()
+    if not rows:
+        return
+    # Index act-resolved matrices by row_name so cell tagging uses
+    # the same data act has already computed.
+    matrix_by_row: Dict[str, Dict[str, str]] = {
+        r["row_name"]: r["matrix"] for r in _act_dryrun_rows()
+    }
+
+    def _cell_for(row_name: str) -> Optional[Dict[str, str]]:
+        m = matrix_by_row.get(row_name) or {}
+        # Standard mapping convention used by main.yml's setup-recipe
+        # step: recipe = matrix.use-recipe, version = recipe-version
+        # || clang-runtime, arch = recipe-arch || x86_64.
+        coord = {
+            "recipe":  m.get("use-recipe"),
+            "version": (m.get("recipe-version")
+                        or m.get("clang-runtime")),
+            "os":      m.get("os"),
+            "arch":    m.get("recipe-arch") or "x86_64",
+        }
+        if not all(coord.values()):
+            return None
+        for c in cells:
+            if all(coord[k] == c[k]
+                   for k in ("recipe", "version", "os", "arch")):
+                return c
+        return None
+
+    # Count name occurrences so we know whether the user needs `-W`
+    # / `-j` to disambiguate. Unique row names get the minimal
+    # `bin/repro -m name:<row>` -- main() auto-detects the rest.
+    name_count: Dict[str, int] = {}
+    for _wf, _job, name in rows:
+        name_count[name] = name_count.get(name, 0) + 1
+
+    failed = _failed_rows_for_branch()
+    # Color the [failed] tag red on a TTY; plain text everywhere
+    # else (pipes, redirects, CI logs) so copy-paste stays clean.
+    red = "\033[31m" if sys.stderr.isatty() else ""
+    reset = "\033[0m" if sys.stderr.isatty() else ""
+
+    _log("")
+    _log("Matrix rows -- copy-paste any line. Rows tagged [cell: ...]")
+    _log("download a prebuilt LLVM tree instead of inline build;")
+    _log("[failed] marks rows whose latest run on this branch failed.")
+    _log("")
+    for wf_file, job_id, row_name in rows:
+        cell = _cell_for(row_name) if cells else None
+        tags = []
+        if cell:
+            tags.append(f"[cell: {cell['recipe']}/{cell['version']}/"
+                        f"{cell['os']}/{cell['arch']}]")
+        if row_name in failed or job_id in failed:
+            tags.append(f"{red}[failed]{reset}")
+        suffix = "  # " + " ".join(tags) if tags else ""
+        is_matrix = job_id != row_name
+        if is_matrix and name_count[row_name] == 1:
+            inv = f"bin/repro {row_name}"
+        elif is_matrix:
+            inv = f"bin/repro -W {wf_file} -j {job_id} -m name:{row_name}"
+        else:
+            inv = f"bin/repro -W {wf_file} -j {job_id}"
+        _log(f"  {inv}{suffix}")
+
+
+_ARCH_TO_DOCKER = {
+    "x86_64":  "amd64",
+    "amd64":   "amd64",
+    "arm64":   "arm64",
+    "aarch64": "arm64",
+}
+
+
+def _matrix_get(matrix_args: List[str], key: str) -> Optional[str]:
+    """Return the value of `-m <key>:<value>` if present, else None."""
+    prefix = f"{key}:"
+    for m in matrix_args:
+        if m.startswith(prefix):
+            return m[len(prefix):]
+    return None
+
+
+# Map ubuntu runner-image slugs to their target arch. Linux rows on
+# GitHub-hosted runners are x86_64 unless the slug ends in `-arm`. We
+# only need ubuntu-* here: act doesn't run macOS / Windows containers,
+# so non-Linux rows never reach the auto-arch logic.
+_OS_TO_ARCH = {
+    "ubuntu-24.04":     "x86_64",
+    "ubuntu-22.04":     "x86_64",
+    "ubuntu-20.04":     "x86_64",
+    "ubuntu-24.04-arm": "arm64",
+    "ubuntu-22.04-arm": "arm64",
+}
+
+
+def _resolve_cell_arch(matrix_args: List[str]) -> Optional[str]:
+    """Best-effort target arch for this matrix row.
+
+    Tried in order:
+      1. `-m arch:X`   — caller stated it directly.
+      2. `-m os:X`     — Linux slug uniquely implies arch.
+      3. `-m name:X`   — look up the row's matrix dict via the same
+                         act -n --json data `--list` already uses, and
+                         derive from `arch` / `recipe-arch` / `os`.
+    None when nothing matches; caller falls back to host arch.
+    """
+    explicit = _matrix_get(matrix_args, "arch")
+    if explicit:
+        return explicit
+    derived = _OS_TO_ARCH.get(_matrix_get(matrix_args, "os") or "")
+    if derived:
+        return derived
+    name = _matrix_get(matrix_args, "name")
+    if not name:
+        return None
+    for r in _act_dryrun_rows():
+        mat = r.get("matrix") or {}
+        if mat.get("name") != name:
+            continue
+        # Row's own matrix may carry arch directly (recipe-arch on
+        # mac arm rows); prefer it over deriving from os.
+        row_arch = mat.get("arch") or mat.get("recipe-arch")
+        if row_arch:
+            return str(row_arch)
+        return _OS_TO_ARCH.get(str(mat.get("os") or ""))
+    return None
+
+
+_CELL_TO_MATRIX_KEY = {
+    "recipe":  "use-recipe",
+    "version": "recipe-version",
+    "os":      "os",
+    "arch":    "recipe-arch",
+}
+
+
+_DEFAULT_PLATFORMS = [
+    # act has no built-in mapping for these slugs; without -P it
+    # emits "Skipping unsupported platform" and dispatches no work.
+    # Image choice (`act-XX.04`, the lean ~1.5 GiB variant) is a
+    # default -- override per-slug via `~/.actrc` (which we honour
+    # below) or `-- -P <slug>=<image>` on the command line.
+    "ubuntu-24.04=ghcr.io/catthehacker/ubuntu:act-24.04",
+    "ubuntu-24.04-arm=ghcr.io/catthehacker/ubuntu:act-24.04",
+    "ubuntu-22.04=ghcr.io/catthehacker/ubuntu:act-22.04",
+]
+
+
+def _actrc_platforms() -> set:
+    """Return the set of platform slugs the user has already mapped
+    in `~/.actrc`. We skip our defaults for those so the user's
+    image choice wins instead of being silently overridden by ours.
+    """
+    rc = Path.home() / ".actrc"
+    if not rc.is_file():
+        return set()
+    slugs: set = set()
+    try:
+        for line in rc.read_text().splitlines():
+            # Match `-P slug=image` (with or without the space).
+            m = re.match(r"\s*-P\s+([^=\s]+)=", line)
+            if m:
+                slugs.add(m.group(1))
+    except Exception:
+        return set()
+    return slugs
+
+
+def _translate_matrix(raw: List[str]) -> List[str]:
+    """Map cell-coord aliases (recipe/version/arch) to real matrix
+    keys (use-recipe/recipe-version/recipe-arch). Real matrix keys
+    pass through unchanged so users can still target rows directly.
+    """
+    out = []
+    for m in raw:
+        if ":" in m:
+            k, v = m.split(":", 1)
+            k = _CELL_TO_MATRIX_KEY.get(k, k)
+            out.append(f"{k}:{v}")
+        else:
+            out.append(m)
+    return out
+
+
+def build_act_command(args: argparse.Namespace) -> List[str]:
+    cmd = [_require("act"), "-j", args.job]
+    if args.workflow:
+        cmd += ["-W", args.workflow]
+    # Default -P fallbacks for slugs act doesn't ship a mapping
+    # for. Skip the slug if `~/.actrc` already maps it -- that's
+    # the user's preferred image and command-line -P would silently
+    # override it.
+    rc_slugs = _actrc_platforms()
+    for plat in _DEFAULT_PLATFORMS:
+        slug = plat.split("=", 1)[0]
+        if slug in rc_slugs:
+            continue
+        cmd += ["-P", plat]
+    for m in _translate_matrix(args.matrix or []):
+        cmd += ["--matrix", m]
+
+    # Auto-set --container-architecture when the matrix row targets
+    # an arch different from the host. `act --help`: "If not specified,
+    # will use host default architecture." On Apple Silicon, a row
+    # whose `os: ubuntu-24.04` (x86_64) would otherwise land in an
+    # arm64 container, and an x86_64 LLVM cache asset extracted there
+    # crashes at exec time. Resolution order is `arch:` → `os:` →
+    # row-name lookup, so the common `bin/repro -m name:<row>` form
+    # picks up the right arch without the user spelling it out.
+    cell_arch = _resolve_cell_arch(args.matrix or [])
+    if cell_arch and cell_arch != host_arch():
+        docker_arch = _ARCH_TO_DOCKER.get(cell_arch, cell_arch)
+        cmd += ["--container-architecture", f"linux/{docker_arch}"]
+
+    if args.dry_run:
+        cmd += ["-n"]
+
+    # The container must outlive `act` for either of two reasons:
+    #   - --shell: bin/repro execs bash into it, then rm's.
+    #   - --save-temps: container is kept past script exit.
+    # Without --reuse, act sets autoremove=true and the container
+    # is gone before bin/repro can do anything with it.
+    if args.shell or args.save_temps:
+        cmd += ["--reuse"]
+    extra = args.passthrough or []
+    if extra and extra[0] == "--":
+        extra = extra[1:]
+    cmd += extra
+    return cmd
+
+
+def _find_setup_recipe_job(text: str) -> Optional[str]:
+    """Hand-rolled scan: in a workflow YAML, return the first
+    jobs.<id> whose body references a setup-recipe action.
+    Tolerates 2- or 4-space indentation. Used by the matrix-driven
+    workflow auto-detection below; never raises -- worst case
+    returns None and the caller falls back to requiring -W."""
+    in_jobs = False
+    current_job = None
+    has_setup_recipe = False
+    for line in text.splitlines():
+        if line.rstrip() == "jobs:":
+            in_jobs = True
+            continue
+        if not in_jobs:
+            continue
+        if line and not line[0].isspace() and not line.startswith("#"):
+            break
+        m = re.match(r"^( {2}|\t)([\w-]+):\s*$", line)
+        if m:
+            if current_job and has_setup_recipe:
+                return current_job
+            current_job = m.group(2)
+            has_setup_recipe = False
+            continue
+        if "setup-recipe" in line and current_job:
+            has_setup_recipe = True
+    if current_job and has_setup_recipe:
+        return current_job
+    return None
+
+
+def find_workflow_for_cell_matrix(matrix: List[str],
+                                  cwd: Optional[Path] = None
+                                  ) -> Optional[Tuple[str, str]]:
+    """Auto-detect (workflow_file, job_id) when the user's -m flags
+    pin a recipe.
+
+    Goal: most downstream repos have multiple workflows but only one
+    of them consumes a given cells.yaml recipe. The recipe name in
+    -m recipe:<X> is enough to identify that workflow uniquely. The
+    user shouldn't also have to type -W.
+
+    Strategy: text-grep .github/workflows/*.yml for files that
+    mention BOTH `setup-recipe` AND the recipe name (literal or in a
+    matrix definition). Return only when exactly one matches; on
+    ambiguity, return None and let check_job_ambiguous error with
+    the per-workflow list.
+    """
+    recipe = _matrix_get(matrix or [], "recipe")
+    if not recipe:
+        return None
+    base = cwd or Path.cwd()
+    workflows = base / ".github" / "workflows"
+    if not workflows.is_dir():
+        return None
+    candidates: List[Tuple[str, str]] = []
+    for wf in sorted(list(workflows.glob("*.yml"))
+                     + list(workflows.glob("*.yaml"))):
+        try:
+            text = wf.read_text(errors="replace")
+        except OSError:
+            continue
+        if "setup-recipe" not in text or recipe not in text:
+            continue
+        job = _find_setup_recipe_job(text)
+        if not job:
+            continue
+        try:
+            rel = wf.relative_to(base)
+        except ValueError:
+            rel = wf
+        candidates.append((str(rel), job))
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def find_workflow_via_dry_run(args: argparse.Namespace
+                              ) -> Optional[Tuple[str, str]]:
+    """Disambiguation fallback: when text-grep can't pick a unique
+    workflow but act -l shows multiple candidates, run `act -n -W
+    <wf> -j <job> -m <flags>` against each and keep only those
+    whose dry-run accepts the filter (act prints the ⭐ Run-Set-up-
+    job marker for each row that would actually run; a workflow
+    whose matrix doesn't admit the filter or whose job has a
+    different shape gets zero rows).
+
+    Slower than text-grep (one act invocation per candidate) but
+    precise: act itself decides whether the matrix flags pin
+    something runnable in each workflow.
+
+    Returns (workflow_path, args.job) on unique match, else None.
+    """
+    listing = _act_listing()
+    if not listing:
+        return None
+    candidates = sorted({r["workflow_file"] for r in listing
+                         if r["job_id"] == args.job})
+    if len(candidates) <= 1:
+        return None
+    matches: List[Tuple[str, str]] = []
+    for wf_basename in candidates:
+        wf_path = resolve_workflow(wf_basename)
+        if not Path(wf_path).is_file():
+            continue
+        cmd = [_require("act"), "-W", wf_path, "-j", args.job, "-n"]
+        for m in args.matrix or []:
+            cmd += ["--matrix", m]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=60, check=False)
+        except subprocess.TimeoutExpired:
+            continue
+        # act -n exits 0 on a valid workflow. The "⭐" marker
+        # (Run Set up job) appears once per matrix row that would
+        # actually run -- absent if our filter excluded everything.
+        if r.returncode == 0 and "⭐" in r.stdout:
+            matches.append((wf_path, args.job))
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def resolve_workflow(w: Optional[str]) -> Optional[str]:
+    """If `-W foo.yml` is a bare basename and the literal path doesn't
+    exist, expand it to `.github/workflows/foo.yml`. The literal-path
+    case (-W full/path/to/file.yml) passes through unchanged. Falls
+    through to the original value if neither resolves -- act will
+    emit its own error.
+    """
+    if not w:
+        return w
+    if Path(w).is_file():
+        return w
+    candidate = Path(".github") / "workflows" / w
+    if candidate.is_file():
+        return str(candidate)
+    return w
+
+
+def check_job_ambiguous(args: argparse.Namespace) -> None:
+    """If `-j NAME` matches the same job ID across multiple workflow
+    files and -W wasn't given, refuse to proceed with a clear error
+    listing the workflows. Otherwise act would silently run ALL of
+    them in parallel; the "Detected multiple jobs" line act prints
+    is informational, not blocking."""
+    if not args.job or args.workflow:
+        return
+    rows = _act_listing()
+    if not rows:
+        return  # listing failed; let act handle
+    matching = [r for r in rows if r["job_id"] == args.job]
+    workflows = sorted({r["workflow_file"] for r in matching})
+    if len(workflows) <= 1:
+        return
+    lines = [f"error: job ID '{args.job}' is defined in multiple workflows:"]
+    for r in matching:
+        lines.append(f"  {r['workflow_file']}  ({r['workflow_name']})")
+    lines.append("")
+    lines.append("Pass -W <path> to pick one, e.g.:")
+    lines.append(f"  bin/repro -W {workflows[0]} -j {args.job}")
+    lines.append("(bare basenames work too; -W <foo>.yml resolves to "
+                 ".github/workflows/<foo>.yml)")
+    sys.exit("\n".join(lines))
+
+
+def find_recent_act_container() -> Optional[str]:
+    """Most recent act-* container ID (running or stopped), or None."""
+    r = subprocess.run(
+        ["docker", "ps", "-aq", "--filter", "name=act-", "--latest"],
+        capture_output=True, text=True, check=False)
+    cid = r.stdout.strip()
+    return cid if cid else None
+
+
+def shell_into(cid: str) -> int:
+    subprocess.run(["docker", "start", cid], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return _run_interactive(["docker", "exec", "-it", cid, "bash"])
+
+
+def remove_container(cid: str) -> None:
+    subprocess.run(["docker", "rm", "-f", cid], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _container_tree_dirty(cid: str, workspace: str) -> bool:
+    """True when `git -C <workspace> diff HEAD` reports changes.
+
+    Uses --quiet and rc-based detection: 0 = clean, 1 = changes,
+    128 = not a git repo / no HEAD / git missing. Treat anything but
+    1 as "no patch to export" -- a missing-git diagnostic isn't
+    actionable here, and the user can always docker exec themselves.
+    """
+    r = subprocess.run(
+        ["docker", "exec", cid, "git", "-C", workspace,
+         "diff", "--quiet", "HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    return r.returncode == 1
+
+
+def _export_container_patch(cid: str, workspace: str, dest: Path) -> bool:
+    """Capture `git diff HEAD` from inside the container; write to dest.
+    Returns True on success, False on diagnostic-worthy failure.
+    """
+    r = subprocess.run(
+        ["docker", "exec", cid, "git", "-C", workspace, "diff", "HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        _log(f"repro: docker exec git diff failed (rc={r.returncode}): "
+             f"{r.stderr.strip()}")
+        return False
+    dest.write_text(r.stdout)
+    return True
+
+
+def maybe_export_in_container_patch(cid: str,
+                                    row: Optional[str]) -> None:
+    """Pre-cleanup hook: if the container's git tree has unstaged or
+    staged changes vs HEAD, prompt to save a patch on the host.
+
+    Why: `--shell` lets the user edit / recompile / retest inside the
+    container. Without an export step, those changes evaporate when
+    the container is removed. Default-Y on the prompt -- losing edits
+    is the worse failure mode; the user can always `n` if they don't
+    want a file.
+
+    Untracked files aren't included (`git diff HEAD` doesn't see them).
+    Users wanting those in the patch should `git add` first inside
+    the container before exiting the shell.
+    """
+    workspace = os.getcwd()
+    if not _container_tree_dirty(cid, workspace):
+        return
+    name = (row or "session").replace("/", "_")
+    dest = Path(f"/tmp/repro-{name}.patch")
+    if not _confirm(
+            f"repro: in-container changes detected. "
+            f"Export `git diff HEAD` to {dest}?",
+            default=True):
+        return
+    if _export_container_patch(cid, workspace, dest):
+        _log(f"repro: patch saved -- apply on host with:")
+        _log(f"  git apply {dest}")
+
+
+def _confirm(prompt: str, default: bool = True) -> bool:
+    """y/n prompt with `default` selected on bare Enter. Falls back to
+    `default` when stdin isn't a TTY -- scripted / piped invocations
+    can't answer interactively, so we honor the documented default
+    (rm the container) instead of hanging the script."""
+    if not sys.stdin.isatty():
+        return default
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    print(prompt + suffix, file=sys.stderr, end="", flush=True)
+    try:
+        response = sys.stdin.readline().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("", file=sys.stderr)
+        return default
+    if not response:
+        return default
+    return response in ("y", "yes")
+
+
+# Top-level dir names that compiler-research workflows we drive
+# typically `mkdir` (CppInterOp build) or `mv` into (setup-recipe
+# extracts here). Hand-rolled list -- a YAML scan would be more
+# general but also catches ephemeral working dirs like `_recipe_work`
+# we don't care about. Add names here when a new clash bites someone.
+_LIKELY_CLASH_DIRS = (
+    "build",
+    "llvm-project",
+)
+
+
+def detect_workspace_clashes() -> List[Path]:
+    """Top-level dirs in cwd that match `_LIKELY_CLASH_DIRS`.
+
+    Returns absolute paths. Empty list when nothing matches.
+    """
+    cwd = Path.cwd()
+    return [cwd / name for name in _LIKELY_CLASH_DIRS
+            if (cwd / name).is_dir()]
+
+
+def warn_workspace_clashes(args: argparse.Namespace) -> None:
+    """Pre-flight: refuse to proceed when the consumer workspace has
+    dirs that the workflow will collide with.
+
+    Why: bin/repro mounts the consumer's working tree into the act
+    container. CppInterOp's Build_and_Test_CppInterOp action does
+    `mkdir build && cd build && cmake ...` -- a stale `build/` from
+    local development trips `mkdir` under `set -e`, and the job
+    aborts before any cmake output appears. The act log shows
+    "Job failed" with no actionable cause; the actual diagnosis is
+    that this directory existed at start.
+
+    Bypass with `--skip-clash-check` when you've already cleaned up
+    or know the workflow is defensive (`rm -rf build` before mkdir).
+    """
+    if args.dry_run or args.skip_clash_check:
+        return
+    paths = detect_workspace_clashes()
+    if not paths:
+        return
+    _log("repro: workspace clash -- the following dirs already exist and")
+    _log("repro:   the workflow will try to (re)create them. Under")
+    _log("repro:   `set -e`, `mkdir <dir>` fails with 'File exists' and")
+    _log("repro:   the act job aborts before reaching cmake.")
+    for p in paths:
+        _log(f"repro:     {p}")
+    _log("repro: choose one before re-running:")
+    _log("repro:     - `rm -rf <dir>`  (loses local build state)")
+    _log("repro:     - `mv <dir> <dir>.local`  (preserves it)")
+    _log("repro:     - re-run with `--skip-clash-check` to proceed anyway")
+    if not _confirm("repro: proceed without removing them?", default=False):
+        sys.exit(1)
+
+
+_STAGE_DIR_NAME = "act-ci-workflows-stage"
+
+
+def _localize_workflow_for_ci_workflows(
+        workflow_path: Path, ci_workflows: Path) -> Path:
+    """Stage the local ci-workflows actions under
+    `.github/.act-ci-workflows-stage/<name>` as symlinks, rewrite
+    every `uses: compiler-research/ci-workflows/actions/<name>@<ref>`
+    in `workflow_path` to `uses: ./.github/.act-ci-workflows-stage/
+    <name>` (act's local-action form), and return the path to a
+    temp workflow file beside the original.
+
+    Why this shape:
+      - `uses: ./<path>` makes act treat the action as a local
+        action and read `<path>/action.yml` directly -- no fetch,
+        no `~/.cache/act/` involvement.
+      - `<path>` must be inside the consumer's repo (act resolves
+        relative to cwd / the workflow's repo root), so we stage
+        symlinks under `.github/`.
+      - Each ci-workflows action becomes its own symlink target
+        rather than the whole repo, so consumers reading the temp
+        workflow see a clean stage layout.
+    """
+    consumer = Path.cwd()
+    stage = consumer / ".github" / _STAGE_DIR_NAME
+    if stage.exists() or stage.is_symlink():
+        shutil.rmtree(stage, ignore_errors=True)
+        if stage.is_symlink():
+            stage.unlink()
+    stage.mkdir(parents=True)
+    actions_dir = ci_workflows / "actions"
+    if not actions_dir.is_dir():
+        sys.exit(f"error: {actions_dir} not found")
+    for action_dir in sorted(actions_dir.iterdir()):
+        if not action_dir.is_dir() or action_dir.name == "lib":
+            continue
+        if not (action_dir / "action.yml").is_file():
+            continue
+        # act doesn't follow directory symlinks for local actions
+        # (`uses: ./<path>`), so copy the action's contents instead
+        # of symlinking. Each action is a few small files; fast.
+        shutil.copytree(action_dir, stage / action_dir.name)
+
+    text = workflow_path.read_text()
+    rel = f"./.github/{_STAGE_DIR_NAME}"
+    text = re.sub(
+        r"uses:\s*compiler-research/ci-workflows/actions/(\w[\w-]*)@\S+",
+        lambda m: f"uses: {rel}/{m.group(1)}",
+        text,
+    )
+    fd, tmp = tempfile.mkstemp(
+        prefix=f"act-{workflow_path.stem}-localized-",
+        suffix=".yml", dir=str(workflow_path.parent),
+    )
+    os.close(fd)
+    Path(tmp).write_text(text)
+    _log(f"repro: --ci-workflows: staged {ci_workflows} under "
+         f"{stage.relative_to(consumer)}; running act on {Path(tmp).name}")
+    return Path(tmp)
+
+
+def _cleanup_ci_workflows_overlay() -> None:
+    """Remove the .github/.act-ci-workflows-stage/ symlink tree and
+    any act-*-localized-*.yml temp workflow we wrote. Idempotent;
+    best-effort."""
+    consumer = Path.cwd()
+    stage = consumer / ".github" / _STAGE_DIR_NAME
+    if stage.exists() or stage.is_symlink():
+        shutil.rmtree(stage, ignore_errors=True)
+    workflows = consumer / ".github" / "workflows"
+    if workflows.is_dir():
+        for p in workflows.glob("act-*-localized-*.yml"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+def _resolve_pattern(pattern: str, args: argparse.Namespace) -> None:
+    """Glob `pattern` against matrix-row names; on unique match,
+    populate args.workflow, args.job, and args.matrix; on ambiguous
+    or empty match, print the candidates and exit. `fnmatch` so the
+    user can write `asan*`, `*cling*`, or a literal name.
+    """
+    import fnmatch
+    rows = discover_matrix_rows()
+    matches = [(wf, j, n) for wf, j, n in rows
+               if fnmatch.fnmatch(n, pattern)]
+    if not matches:
+        # Literal matches that aren't actual rows are a common typo;
+        # fall through to printing the row list so the user can pick.
+        candidates = sorted({n for _wf, _j, n in rows})
+        msg = [f"error: no matrix row matches pattern '{pattern}'."]
+        if candidates:
+            msg.append("Available rows:")
+            msg += [f"  {n}" for n in candidates]
+        sys.exit("\n".join(msg))
+    if len(matches) > 1:
+        _log(f"repro: pattern '{pattern}' matches {len(matches)} rows; "
+             f"narrow it:")
+        for wf, j, n in matches:
+            _log(f"repro:   {n}  (in {wf}, job {j})")
+        sys.exit(1)
+    wf, job, name = matches[0]
+    if not args.workflow:
+        args.workflow = wf
+    args.job = job
+    args.matrix = (args.matrix or []) + [f"name:{name}"]
+
+
+def main() -> int:
+    args = parse_args()
+    if args.list:
+        return list_jobs(args)
+
+    # First non-flag passthrough argument is treated as a row-name
+    # glob -- `bin/repro asan-ubsan` or `bin/repro *cling*` resolves
+    # to a unique matrix row and auto-fills -W/-j/-m. Anything after
+    # an explicit `--` continues to flow into act verbatim.
+    if (args.passthrough and args.passthrough[0] != "--"
+            and not args.passthrough[0].startswith("-")
+            and not args.job):
+        pattern = args.passthrough[0]
+        args.passthrough = args.passthrough[1:]
+        _resolve_pattern(pattern, args)
+
+    # Auto-fill -W / -j from `-m name:<row>` when both are omitted.
+    # discover_matrix_rows already cross-references act -l + act -n,
+    # so a unique row name resolves to (workflow_file, job_id) with
+    # no extra plumbing; ambiguous names print which workflows they
+    # match and bail.
+    if not args.job:
+        wanted = _matrix_get(args.matrix or [], "name")
+        if wanted:
+            matches = [(wf, j) for wf, j, n in discover_matrix_rows()
+                       if n == wanted]
+            if len(matches) == 1:
+                wf, job = matches[0]
+                if not args.workflow:
+                    args.workflow = wf
+                args.job = job
+                _log(f"repro: auto-detected -W {wf} -j {job} "
+                     f"from -m name:{wanted}")
+            elif len(matches) > 1:
+                conflicts = "\n  ".join(f"{wf} (job {j})"
+                                        for wf, j in matches)
+                sys.exit(f"error: row name '{wanted}' matches multiple "
+                         f"workflows; pass -W to disambiguate:\n  "
+                         f"{conflicts}")
+    if not args.job:
+        sys.exit("error: -j NAME, --list, or -m name:<row> required")
+
+    # `-W foo.yml` (bare basename) -> `.github/workflows/foo.yml`.
+    args.workflow = resolve_workflow(args.workflow)
+
+    # Auto-detect -W from the matrix flags when the user didn't
+    # pin one explicitly. Two-step:
+    #
+    #   Fast (text-grep): if -m recipe:<X> appears, find the unique
+    #   workflow that uses setup-recipe AND mentions <X>.
+    #
+    #   Slow (act dry-run): if text-grep is ambiguous, run `act -n`
+    #   against each candidate workflow with the matrix flags
+    #   applied. Only the workflow whose matrix actually admits the
+    #   filter emits the ⭐ Run-Set-up-job marker. act decides for
+    #   us; bin/repro doesn't have to YAML-parse matrix definitions.
+    if not args.workflow and args.matrix:
+        detected = find_workflow_for_cell_matrix(args.matrix)
+        if not detected:
+            _log("repro: text-grep auto-detect ambiguous; iterating "
+                 "candidates via act dry-run ...")
+            detected = find_workflow_via_dry_run(args)
+        if detected:
+            wf_path, _ = detected
+            _log(f"repro: auto-detected -W {wf_path}")
+            args.workflow = wf_path
+
+    # Pre-flight: refuse to proceed if -j still matches multiple
+    # workflows and -W wasn't given. Without this, act silently
+    # runs ALL matching jobs across all workflows in parallel.
+    check_job_ambiguous(args)
+
+    # Pre-flight: warn (and prompt) when stale workspace dirs would
+    # collide with `mkdir build` etc. -- bin/repro mounts the
+    # consumer tree as-is, so leftover local builds break `set -e`
+    # under act before any actionable error appears.
+    warn_workspace_clashes(args)
+
+    # `--ci-workflows`: stage local actions under .github/<dir>/ and
+    # rewrite the workflow's `uses: compiler-research/ci-workflows/...`
+    # to `uses: ./<dir>/<name>` so act reads them as local actions.
+    # Cleanup on exit (success or failure).
+    if args.ci_workflows:
+        if not args.workflow:
+            sys.exit("error: --ci-workflows requires -W <workflow>")
+        args.workflow = str(_localize_workflow_for_ci_workflows(
+            Path(args.workflow).resolve(),
+            Path(args.ci_workflows).resolve(),
+        ))
+
+    cmd = build_act_command(args)
+    _log("+ " + " ".join(shlex.quote(c) for c in cmd))
+    try:
+        rc = _run_interactive(cmd)
+    finally:
+        if args.ci_workflows:
+            _cleanup_ci_workflows_overlay()
+
+    # --dry-run: act validated only; no container exists. Skip the
+    # shell + cleanup dance entirely -- there's nothing to drop into
+    # and nothing to remove. Returning early also avoids the
+    # misleading "no act-* container found" message.
+    if args.dry_run:
+        return rc
+
+    # Container cleanup matrix (orthogonal flags, four combinations):
+    #
+    #   --shell  --save-temps  | post-act behaviour
+    #   ------   -----------   | ------------------------------
+    #   yes      no  (default) | shell, then rm
+    #   yes      yes           | shell, keep container
+    #   no       no            | nothing (act --rm'd already)
+    #   no       yes           | keep, log how to re-enter
+    #
+    # build_act_command passed --reuse to act when shell or save_temps
+    # was set, so the container is around to interact with here.
+
+    cid = find_recent_act_container() if (args.shell or args.save_temps) else None
+
+    if args.shell:
+        if not cid:
+            _log("repro: no act-* container found; nothing to shell into")
+            return rc
+        if args.save_temps:
+            _log(f"repro: dropping into shell of container {cid[:12]} "
+                 f"(--save-temps: kept on exit)")
+        else:
+            _log(f"repro: dropping into shell of container {cid[:12]}")
+        try:
+            return shell_into(cid)
+        finally:
+            # In-container edits made during the shell session would
+            # evaporate when the container is removed. Offer to dump
+            # `git diff HEAD` to /tmp/repro-<row>.patch first; the user
+            # then `git apply`s on the host. No-ops silently when the
+            # tree is clean.
+            maybe_export_in_container_patch(
+                cid, _matrix_get(args.matrix or [], "name"))
+            # --save-temps short-circuits the prompt (user already
+            # said keep). Otherwise ask, defaulting to remove (TTY
+            # absent => default applies, so scripted runs stay
+            # unattended and clean up).
+            if args.save_temps:
+                _log_keep_hint(cid)
+            elif _confirm(f"repro: remove container {cid[:12]}?",
+                          default=True):
+                _log(f"repro: removing container {cid[:12]}")
+                remove_container(cid)
+            else:
+                _log_keep_hint(cid)
+
+    if args.save_temps and cid:
+        _log_keep_hint(cid, prefix="repro: --save-temps: ")
+
+    return rc
+
+
+def _log_keep_hint(cid: str, prefix: str = "repro: ") -> None:
+    _log(f"{prefix}container {cid[:12]} preserved. Re-enter with:")
+    _log(f"repro:   docker start {cid[:12]} && "
+         f"docker exec -it {cid[:12]} bash")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
