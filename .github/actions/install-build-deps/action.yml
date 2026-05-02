@@ -30,7 +30,10 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y ninja-build zstd ccache rsync clang
+        # libedit-dev so LLVM's HAVE_LIBEDIT is on; LLVMLineEditor is a
+        # link dependency of cling's UserInterface (root-project/cling
+        # 9cdffe0c44 LineEditor migration).
+        sudo apt-get install -y ninja-build zstd ccache rsync clang libedit-dev
         # Pin the host compiler for every subsequent step in this job.
         echo "CC=clang" >> "$GITHUB_ENV"
         echo "CXX=clang++" >> "$GITHUB_ENV"
@@ -39,6 +42,7 @@ runs:
       if: runner.os == 'macOS'
       shell: bash
       run: |
+        # libedit ships with macOS's libc; no brew package needed for it.
         brew install ninja zstd ccache rsync
         echo "CC=clang" >> "$GITHUB_ENV"
         echo "CXX=clang++" >> "$GITHUB_ENV"
