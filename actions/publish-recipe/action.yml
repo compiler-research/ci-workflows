@@ -231,3 +231,23 @@ runs:
         echo "::notice::uploading ${KEY} to ${release_url}"
         python3 "$REPO_ROOT/actions/lib/cache_io.py" upload \
           "$BASE" "$KEY" "${KEY}.tar.zst" "${KEY}.manifest.json"
+
+    # Sibling asset for bin/repro --with-ccache: ships a snapshot of
+    # the recipe build's CCACHE_DIR alongside the install tree under
+    # the same content-hash key. Reuses the install tree's manifest;
+    # cache_upload accepts no manifest in that case.
+    - name: Tar + zstd + upload ccache
+      if: steps.skip.outputs.exists != 'true' && inputs.dry-run != 'true'
+      shell: bash
+      env:
+        KEY: ${{ steps.compute-key.outputs.key }}
+        BASE: ${{ steps.skip.outputs.base }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        REPO_ROOT="$(pwd)"
+        cd "${{ github.workspace }}"
+        python3 "$REPO_ROOT/actions/lib/cache_io.py" pack \
+          . "$KEY" . .ccache .ccache
+        ls -lh "${KEY}.ccache.tar.zst"
+        python3 "$REPO_ROOT/actions/lib/cache_io.py" upload \
+          "$BASE" "$KEY" "${KEY}.ccache.tar.zst"

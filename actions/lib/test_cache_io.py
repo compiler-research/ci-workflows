@@ -137,14 +137,34 @@ class CachePackRoundTripTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 cache_io.cache_pack(d, "k", d)
 
+    def test_pack_ccache_sibling(self):
+        # cache_pack(src_name=".ccache", key_suffix=".ccache") packs an
+        # arbitrary sibling directory under a suffixed asset name. Used
+        # by publish-recipe to ship a ccache snapshot next to the
+        # install tree.
+        with tempfile.TemporaryDirectory() as d:
+            in_dir = Path(d) / "in"
+            (in_dir / ".ccache" / "0" / "ab").mkdir(parents=True)
+            (in_dir / ".ccache" / "0" / "ab" / "obj.o").write_bytes(b"o")
+
+            out_dir = Path(d) / "out"
+            out_dir.mkdir()
+            cache_io.cache_pack(
+                str(in_dir), "k", str(out_dir),
+                src_name=".ccache", key_suffix=".ccache",
+            )
+
+            asset = out_dir / "k.ccache.tar.zst"
+            self.assertTrue(asset.is_file())
+
 
 @unittest.skipUnless(_have_zstd(), "zstd not available")
 class CacheUploadFileTests(unittest.TestCase):
     def test_file_backend_copies(self):
         with tempfile.TemporaryDirectory() as d:
-            asset = Path(d) / "asset.tar.zst"
+            asset = Path(d) / "k.tar.zst"
             asset.write_bytes(b"compressed")
-            manifest = Path(d) / "manifest.json"
+            manifest = Path(d) / "k.manifest.json"
             manifest.write_text(json.dumps({"k": "v"}))
             dest = Path(d) / "cache"
 
@@ -157,6 +177,21 @@ class CacheUploadFileTests(unittest.TestCase):
                 json.loads((dest / "k.manifest.json").read_text()),
                 {"k": "v"},
             )
+
+    def test_file_backend_optional_manifest(self):
+        # Sibling assets (e.g. <key>.ccache.tar.zst) reuse the install
+        # tree's manifest -- cache_upload accepts a None manifest.
+        with tempfile.TemporaryDirectory() as d:
+            asset = Path(d) / "k.ccache.tar.zst"
+            asset.write_bytes(b"ccache")
+            dest = Path(d) / "cache"
+
+            cache_io.cache_upload(f"file://{dest}", "k", str(asset))
+
+            self.assertEqual(
+                (dest / "k.ccache.tar.zst").read_bytes(), b"ccache"
+            )
+            self.assertEqual(list(dest.iterdir()), [dest / "k.ccache.tar.zst"])
 
     def test_unsupported_backend_raises(self):
         with self.assertRaises(ValueError):

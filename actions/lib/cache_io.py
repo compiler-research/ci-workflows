@@ -116,22 +116,30 @@ def gh_release_url_parse(base: str) -> Optional[Tuple[str, str]]:
     return owner_repo, tag
 
 
-def cache_upload(base: str, key: str, asset: str, manifest: str) -> None:
-    """Store the asset and manifest at the cache backend.
+def cache_upload(base: str, key: str, asset: str,
+                 manifest: Optional[str] = None) -> None:
+    """Store the asset (and optional manifest) at the cache backend.
 
     file://         - cp into the directory (creates if missing).
     https://github.com/.../releases/download/TAG/  - gh release upload.
     anything else   - error (read-only backend).
+
+    Files are stored under their own basename, so callers are
+    responsible for naming the asset correctly (e.g. ``<key>.tar.zst``
+    for the install tree, ``<key>.ccache.tar.zst`` for a sibling
+    ccache snapshot). `manifest` is optional: pass None when uploading
+    a sibling asset that reuses the install tree's manifest.
     """
     base = _strip_trailing_slash(base)
     asset_path = Path(asset)
-    manifest_path = Path(manifest)
+    manifest_path = Path(manifest) if manifest else None
 
     if base.startswith("file://"):
         dest_dir = Path(base[len("file://"):])
         dest_dir.mkdir(parents=True, exist_ok=True)
-        _copy(asset_path,    dest_dir / f"{key}.tar.zst")
-        _copy(manifest_path, dest_dir / f"{key}.manifest.json")
+        _copy(asset_path, dest_dir / asset_path.name)
+        if manifest_path is not None:
+            _copy(manifest_path, dest_dir / manifest_path.name)
         return
 
     parsed = gh_release_url_parse(base)
@@ -141,15 +149,21 @@ def cache_upload(base: str, key: str, asset: str, manifest: str) -> None:
             f"support writes; got: {base}"
         )
     owner_repo, tag = parsed
-    subprocess.run(
-        ["gh", "release", "upload", tag, str(asset_path), str(manifest_path),
-         "-R", owner_repo, "--clobber"],
-        check=True,
-    )
+    cmd = ["gh", "release", "upload", tag, str(asset_path)]
+    if manifest_path is not None:
+        cmd.append(str(manifest_path))
+    cmd.extend(["-R", owner_repo, "--clobber"])
+    subprocess.run(cmd, check=True)
 
 
-def cache_pack(in_dir: str, key: str, out_dir: Optional[str] = None) -> None:
-    """Tar+zstd ``in_dir/llvm-project`` to ``out_dir/<key>.tar.zst``.
+def cache_pack(in_dir: str, key: str, out_dir: Optional[str] = None,
+               *, src_name: str = "llvm-project",
+               key_suffix: str = "") -> None:
+    """Tar+zstd ``in_dir/<src_name>`` to ``out_dir/<key><key_suffix>.tar.zst``.
+
+    Defaults match the install tree (src_name="llvm-project",
+    key_suffix=""). For a sibling ccache snapshot pass src_name=".ccache",
+    key_suffix=".ccache".
 
     Uses Python's tarfile module to produce the archive (POSIX format,
     same as GNU/BSD tar can read) and pipes through the zstd binary
@@ -159,12 +173,13 @@ def cache_pack(in_dir: str, key: str, out_dir: Optional[str] = None) -> None:
     `out_dir` defaults to the current working directory.
     """
     out_dir_path = Path(out_dir) if out_dir else Path.cwd()
-    out_path = out_dir_path / f"{key}.tar.zst"
-    src = Path(in_dir) / "llvm-project"
+    out_name = f"{key}{key_suffix}.tar.zst"
+    out_path = out_dir_path / out_name
+    src = Path(in_dir) / src_name
     if not src.is_dir():
         raise FileNotFoundError(f"cache_pack: {src} does not exist")
 
-    print(f"::notice::compressing {key}.tar.zst (zstd -19 --long -T0)",
+    print(f"::notice::compressing {out_name} (zstd -19 --long -T0)",
           flush=True)
 
     with out_path.open("wb") as out_f:
@@ -174,7 +189,7 @@ def cache_pack(in_dir: str, key: str, out_dir: Optional[str] = None) -> None:
         )
         try:
             with tarfile.open(fileobj=zstd.stdin, mode="w|") as tar:
-                tar.add(src, arcname="llvm-project")
+                tar.add(src, arcname=src_name)
         finally:
             assert zstd.stdin is not None
             zstd.stdin.close()
@@ -247,13 +262,24 @@ def _main(argv: list[str]) -> int:
         cache_download(base, key, out_dir)
         return 0
     if op == "upload":
-        base, key, asset, manifest = rest
-        cache_upload(base, key, asset, manifest)
+        # upload BASE KEY ASSET [MANIFEST]
+        if len(rest) == 3:
+            base, key, asset = rest
+            cache_upload(base, key, asset)
+        else:
+            base, key, asset, manifest = rest
+            cache_upload(base, key, asset, manifest)
         return 0
     if op == "pack":
+        # pack IN_DIR KEY [OUT_DIR [SRC_NAME [KEY_SUFFIX]]]
         in_dir, key = rest[:2]
         out_dir = rest[2] if len(rest) > 2 else None
-        cache_pack(in_dir, key, out_dir)
+        kwargs = {}
+        if len(rest) > 3:
+            kwargs["src_name"] = rest[3]
+        if len(rest) > 4:
+            kwargs["key_suffix"] = rest[4]
+        cache_pack(in_dir, key, out_dir, **kwargs)
         return 0
     if op == "release-url-parse":
         base = rest[0]
