@@ -33,7 +33,7 @@ runs:
         # libedit-dev so LLVM's HAVE_LIBEDIT is on; LLVMLineEditor is a
         # link dependency of cling's UserInterface (root-project/cling
         # 9cdffe0c44 LineEditor migration).
-        sudo apt-get install -y ninja-build zstd ccache rsync clang libedit-dev
+        sudo apt-get install -y cmake ninja-build zstd ccache rsync clang libedit-dev
         # Pin the host compiler for every subsequent step in this job.
         echo "CC=clang" >> "$GITHUB_ENV"
         echo "CXX=clang++" >> "$GITHUB_ENV"
@@ -58,7 +58,7 @@ runs:
       if: runner.os == 'Windows'
       shell: bash
       run: |
-        choco install -y ninja zstandard
+        choco install -y ninja zstandard ccache
         # Pin the host compiler. CC/CXX use cl from msvc-dev-cmd's
         # PATH addition above. cmake -G Ninja honors these.
         echo "CC=cl" >> "$GITHUB_ENV"

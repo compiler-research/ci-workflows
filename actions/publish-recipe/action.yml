@@ -92,22 +92,43 @@ runs:
           echo "exists=false" >> "$GITHUB_OUTPUT"
         fi
 
-    # Why: ccache is keyed only on (recipe, version, os, arch) — *not* on
-    # the recipe-content hash that drives the Releases key. When build.sh
-    # or recipe.yaml changes, the Releases key invalidates and we must
-    # rebuild, but most LLVM object files are still hits because their
-    # source inputs didn't change. Coarse-keying ccache is what makes a
-    # flag bump cheap. See https://ccache.dev/manual/latest.html
+    # ccache key matches the Releases content-hash so PR runs hit
+    # main's saved entry as long as recipe.yaml / build.{sh,py} /
+    # patches / actions/lib didn't move. restore-keys falls back to
+    # the most recent prior content-hash on the same cell so a
+    # recipe-content edit still warm-starts off the previous ccache.
+    # save runs only on a primary-key miss, so the cache pool holds at
+    # most one entry per (recipe x version x os x arch x content-hash)
+    # tuple instead of one per run.
     #
-    # Restore happens *after* the skip-probe so an already-published
-    # key doesn't pay restore cost.
-    # TODO: pin to a sha (not just @v1) before the v1 contract freezes.
-    - name: Restore ccache (coarse-keyed, survives recipe-content bumps)
+    # CCACHE_DIR is pinned so the same path is restored, cached and
+    # consumed by ccache during the build (avoiding the action's
+    # implicit OS-specific defaults).
+    - name: Configure CCACHE_DIR
       if: steps.skip.outputs.exists != 'true'
-      uses: hendrikmuhs/ccache-action@v1
+      shell: bash
+      env:
+        WS: ${{ github.workspace }}
+      run: |
+        echo "CCACHE_DIR=${WS}/.ccache" >> "$GITHUB_ENV"
+
+    - name: Restore ccache
+      if: steps.skip.outputs.exists != 'true'
+      uses: actions/cache/restore@v4
+      id: ccache
       with:
-        key: ${{ inputs.recipe }}-${{ inputs.version }}-${{ steps.slugs.outputs.os }}-${{ steps.slugs.outputs.arch }}
-        max-size: 5G
+        path: ${{ github.workspace }}/.ccache
+        key: ccache-${{ steps.compute-key.outputs.key }}
+        restore-keys: |
+          ccache-${{ inputs.recipe }}-${{ inputs.version }}-${{ steps.slugs.outputs.os }}-${{ steps.slugs.outputs.arch }}-
+
+    - name: Configure ccache (5G cap)
+      if: steps.skip.outputs.exists != 'true'
+      shell: bash
+      run: |
+        mkdir -p "$CCACHE_DIR"
+        ccache --max-size=5G
+        ccache --zero-stats
 
     # Only github-Releases backends need a Release object created up
     # front. file:// backends just need the directory to exist; the
@@ -148,6 +169,25 @@ runs:
         else
           bash "recipes/${{ inputs.recipe }}/build.sh"
         fi
+
+    # Surfaces miss-rate in the run log; if it grows persistently the
+    # primary key (compute-key content-hash) is no longer tracking the
+    # source closely enough and the key composition needs revisiting.
+    - name: ccache --show-stats
+      if: steps.skip.outputs.exists != 'true'
+      shell: bash
+      run: ccache --show-stats
+
+    # Dry-run saves too: the content-hash key is per (recipe x version
+    # x os x arch x recipe-content), so a PR that touches recipe.yaml /
+    # build.{sh,py} / patches / actions/lib gets its own entry; a PR
+    # that doesn't simply hits main's. No timestamp-suffixed pile-up.
+    - name: Save ccache
+      if: steps.skip.outputs.exists != 'true' && steps.ccache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: ${{ steps.ccache.outputs.cache-primary-key }}
 
     - name: Build manifest
       if: steps.skip.outputs.exists != 'true' && inputs.dry-run != 'true'
