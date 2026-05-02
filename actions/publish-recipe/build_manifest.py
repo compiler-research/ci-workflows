@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +41,22 @@ def _grep_yaml_value(yaml_path: Path, key: str) -> Optional[str]:
     except OSError:
         pass
     return None
+
+
+def _ccache_config() -> dict:
+    """Snapshot the ccache knobs that decide off-runner reuse."""
+    keys = ("compiler_check", "hash_dir", "base_dir")
+    out: dict[str, str] = {}
+    for k in keys:
+        try:
+            r = subprocess.run(
+                ["ccache", "--get-config", k],
+                check=True, capture_output=True, text=True,
+            )
+            out[k] = r.stdout.strip()
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            out[k] = "unknown"
+    return out
 
 
 def _build_script(recipe_dir: Path) -> Optional[Path]:
@@ -86,6 +103,13 @@ def build_manifest(recipe: str, version: str, os_: str, arch: str,
             "repo":   repo,
             "branch": branch,
             "commit": os.environ.get("SRC_COMMIT", "unknown"),
+        },
+        # Toolchain + ccache config consumers (bin/repro --devshell)
+        # need to replicate to hit the sibling cache.
+        "build_env": {
+            "cc":  os.environ.get("CC",  "unknown"),
+            "cxx": os.environ.get("CXX", "unknown"),
+            "ccache": _ccache_config(),
         },
         "ci_workflows_sha": os.environ.get("GITHUB_SHA", "unknown"),
         "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
