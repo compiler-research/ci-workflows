@@ -1,0 +1,22 @@
+recipe: llvm-release
+description: |
+  Vanilla LLVM/Clang built from release/{version}.x. Acts as setup-llvm's
+  tier-2 fallback: when the host's package manager doesn't ship the
+  requested LLVM major (typically only the bleeding-edge release for a
+  few weeks after upstream tags it), setup-llvm pulls this recipe's
+  prebuilt artifact instead of rebuilding inline. Older majors are
+  served by apt-llvm.org / brew llvm@N / choco llvm and bypass this
+  recipe entirely.
+
+  For LLVM >= 22, build.py also enables compiler-rt with everything
+  off except orc_rt + llvm-jitlink-executor — same shape as llvm-asan
+  — so consumers that exercise the OOP-JIT runtime (CppInterOp's
+  clang-repl driver) get the bundled bits in the artifact.
+
+# Only fields read by build_manifest.py live here. The cmake invocation
+# and trim list are authoritative in build.py — having them duplicated
+# here as decorative metadata would silently drift. Add a field here
+# only when something else (manifest, dispatcher) actually reads it.
+source:
+  repo: https://github.com/llvm/llvm-project
+  branch_template: release/{version}.x
