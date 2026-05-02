@@ -32,6 +32,18 @@ caps:
 
 cells:
   - { recipe: llvm-asan, version: '22',            os: ubuntu-24.04,    arch: x86_64 }
+  # llvm-release: vanilla LLVM/Clang for the latest major across every
+  # supported runner image. setup-llvm's default flavor pulls these
+  # cells; consumers asking for older majors pick `flavor: system`,
+  # which goes through the platform package manager and needs no cell.
+  # When LLVM 23 ships, bump the version on these rows; the LLVM 22
+  # cells age out via prune-cache after grace_days.
+  - { recipe: llvm-release, version: '22',         os: ubuntu-24.04,     arch: x86_64 }
+  - { recipe: llvm-release, version: '22',         os: ubuntu-24.04-arm, arch: arm64  }
+  - { recipe: llvm-release, version: '22',         os: macos-26,         arch: arm64  }
+  - { recipe: llvm-release, version: '22',         os: macos-26-intel,   arch: x86_64 }
+  - { recipe: llvm-release, version: '22',         os: windows-2025,     arch: x86_64 }
+  - { recipe: llvm-release, version: '22',         os: windows-11-arm,   arch: arm64  }
   # llvm-root: `version` doubles as a flavor selector and substitutes
   # into recipes/llvm-root/recipe.yaml's branch_template. Two flavors
   # track root-project/llvm-project's paired branches:
