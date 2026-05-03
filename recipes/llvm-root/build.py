@@ -85,6 +85,7 @@ def main() -> int:
         + llvm_build.cmake_extra()
         + ["../llvm"]
     )
+    llvm_build.record_cmake_args(cmake_args)
     subprocess.run(cmake_args, check=True)
 
     llvm_build.quick_check_or_continue()

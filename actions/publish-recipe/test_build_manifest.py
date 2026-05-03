@@ -141,6 +141,33 @@ class BuildManifestTests(unittest.TestCase):
             # And it must be a real hash (64 hex chars), not "unknown".
             self.assertRegex(m["build_script_sha256"], r"^[0-9a-f]{64}$")
 
+    def test_cmake_args_inlined_from_work_dir(self):
+        with tempfile.TemporaryDirectory() as d, \
+             tempfile.TemporaryDirectory() as work:
+            (Path(work) / "cmake-args.json").write_text(
+                json.dumps(["cmake", "-G", "Ninja", "-DFOO=bar"])
+            )
+            with mock.patch.dict(os.environ, {"WORK_DIR": work}, clear=True):
+                _make_recipe(Path(d), "r")
+                m = build_manifest.build_manifest(
+                    "r", "1", "ubuntu-24.04", "x86_64", "k",
+                    recipe_root=d,
+                )
+            self.assertEqual(
+                m["cmake_args"],
+                ["cmake", "-G", "Ninja", "-DFOO=bar"],
+            )
+
+    def test_cmake_args_empty_when_unrecorded(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.dict(os.environ, {}, clear=True):
+            _make_recipe(Path(d), "r")
+            m = build_manifest.build_manifest(
+                "r", "1", "ubuntu-24.04", "x86_64", "k",
+                recipe_root=d,
+            )
+            self.assertEqual(m["cmake_args"], [])
+
     def test_missing_recipe_yaml_unknown(self):
         with tempfile.TemporaryDirectory() as d, \
              mock.patch.dict(os.environ, {}, clear=True):

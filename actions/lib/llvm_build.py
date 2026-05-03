@@ -23,6 +23,7 @@ Optional env:
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -116,6 +117,21 @@ def cmake_extra() -> List[str]:
         if v:
             flags.append(f"{flag}={v}")
     return flags
+
+
+def record_cmake_args(args: Sequence[str]) -> None:
+    """Persist the cmake invocation for build_manifest to inline.
+
+    Consumers compare against their own recipe-derived flags to catch
+    drift that would invalidate the sibling ccache.
+    """
+    work = os.environ.get("WORK_DIR", "")
+    if not work:
+        return
+    Path(work).mkdir(parents=True, exist_ok=True)
+    (Path(work) / "cmake-args.json").write_text(
+        json.dumps(list(args), indent=2)
+    )
 
 
 def quick_check_or_continue() -> None:

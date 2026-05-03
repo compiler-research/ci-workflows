@@ -59,6 +59,23 @@ def _ccache_config() -> dict:
     return out
 
 
+def _cmake_args() -> list:
+    """cmake invocation written by llvm_build.record_cmake_args.
+
+    Empty list = not recorded (older recipe or no WORK_DIR), not "no flags".
+    """
+    work = os.environ.get("WORK_DIR", "")
+    if not work:
+        return []
+    p = Path(work) / "cmake-args.json"
+    if not p.is_file():
+        return []
+    try:
+        return json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
 def _build_script(recipe_dir: Path) -> Optional[Path]:
     sh = recipe_dir / "build.sh"
     py = recipe_dir / "build.py"
@@ -111,6 +128,7 @@ def build_manifest(recipe: str, version: str, os_: str, arch: str,
             "cxx": os.environ.get("CXX", "unknown"),
             "ccache": _ccache_config(),
         },
+        "cmake_args": _cmake_args(),
         "ci_workflows_sha": os.environ.get("GITHUB_SHA", "unknown"),
         "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }

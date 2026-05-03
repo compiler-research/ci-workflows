@@ -212,6 +212,7 @@ runs:
         VERSION: ${{ inputs.version }}
         OS: ${{ steps.slugs.outputs.os }}
         ARCH: ${{ steps.slugs.outputs.arch }}
+        WORK_DIR: ${{ github.workspace }}/_recipe_work
       run: |
         python3 actions/publish-recipe/build_manifest.py \
           "$RECIPE" "$VERSION" "$OS" "$ARCH" "$KEY" \
