@@ -46,8 +46,15 @@ def _oop_targets(build_dir: Path) -> list[str]:
     seen = set()
     for line in out.splitlines():
         m = re.match(r"^(orc_rt[^:]*):", line)
-        if m:
-            seen.add(m.group(1))
+        if not m:
+            continue
+        target = m.group(1)
+        # Skip the static-archive aliases ninja prints next to the
+        # cmake target ("orc_rt-x86_64.lib" on Windows, "...a" on
+        # Linux); only the bare target has an install rule.
+        if target.endswith((".lib", ".a")):
+            continue
+        seen.add(target)
     return sorted(seen)
 
 
