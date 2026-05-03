@@ -122,6 +122,22 @@ runs:
         restore-keys: |
           ccache-${{ inputs.recipe }}-${{ inputs.version }}-${{ steps.slugs.outputs.os }}-${{ steps.slugs.outputs.arch }}-
 
+    # Surface why the build may compile cold even though a cache exists
+    # for this cell. Only emits when the exact-match primary key didn't
+    # restore (cache-hit=false); silent on a clean primary hit.
+    - name: Warn on ccache primary miss
+      if: steps.skip.outputs.exists != 'true' && steps.ccache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        WANTED: ccache-${{ steps.compute-key.outputs.key }}
+        MATCHED: ${{ steps.ccache.outputs.cache-matched-key }}
+      run: |
+        if [ -z "$MATCHED" ]; then
+          echo "::warning title=ccache cold start::no cache matched '$WANTED'; no prior content-hash cache and no cell-prefix fallback for this cell. Build will cold-compile every translation unit."
+        else
+          echo "::warning title=ccache primary miss::wanted '$WANTED', restored '$MATCHED'. The exact-match cache for this content hash isn't in the GHA cache pool (not yet saved, or LRU-evicted). Restore fell back to the cell prefix; ccache entries written under a different recipe content / compile flags may not hit current lookups."
+        fi
+
     - name: Configure ccache (5G cap)
       if: steps.skip.outputs.exists != 'true'
       shell: bash
@@ -184,13 +200,30 @@ runs:
           bash "recipes/${{ inputs.recipe }}/build.sh"
         fi
 
-    # Surfaces miss-rate in the run log; if it grows persistently the
-    # primary key (compute-key content-hash) is no longer tracking the
-    # source closely enough and the key composition needs revisiting.
+    # Surfaces miss-rate in the run log + the workflow summary. If
+    # the notice persistently shows ~100% miss, the primary key
+    # (compute-key content-hash) is no longer tracking the source
+    # closely enough and the key composition needs revisiting.
     - name: ccache --show-stats
       if: steps.skip.outputs.exists != 'true'
       shell: bash
-      run: ccache --show-stats
+      run: |
+        ccache --show-stats
+        # Pull headline counters into a ::notice:: so the workflow
+        # summary shows hit/miss without scrolling the full step log.
+        # Parses the ccache 4.x text format ("Hits: N / total" and
+        # "Misses: N"); missing fields default to 0.
+        stats="$(ccache --show-stats 2>/dev/null || true)"
+        hits=$(echo "$stats"   | awk '/^[[:space:]]*Hits:[[:space:]]+[0-9]/   { print $2; exit }')
+        misses=$(echo "$stats" | awk '/^[[:space:]]*Misses:[[:space:]]+[0-9]/ { print $2; exit }')
+        : "${hits:=0}" "${misses:=0}"
+        total=$(( hits + misses ))
+        if [ "$total" -gt 0 ]; then
+          rate=$(( hits * 100 / total ))
+          echo "::notice title=ccache hit rate::$rate% (hits=$hits, misses=$misses)"
+        else
+          echo "::notice title=ccache hit rate::no compiles routed through ccache (total=0)"
+        fi
 
     # Dry-run saves too: the content-hash key is per (recipe x version
     # x os x arch x recipe-content), so a PR that touches recipe.yaml /
