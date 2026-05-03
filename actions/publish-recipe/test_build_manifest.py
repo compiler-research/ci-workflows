@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -167,6 +168,65 @@ class BuildManifestTests(unittest.TestCase):
                 recipe_root=d,
             )
             self.assertEqual(m["cmake_args"], [])
+
+    def test_cmake_state_collects_three_files(self):
+        # Embed CMakeCache.txt + CMake{C,CXX}Compiler.cmake content
+        # from the build dir under $WORK_DIR.
+        with tempfile.TemporaryDirectory() as work:
+            build = Path(work) / "llvm-project" / "build"
+            cmf = build / "CMakeFiles" / "3.28.3"
+            cmf.mkdir(parents=True)
+            (build / "CMakeCache.txt").write_text(
+                "CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/clang++\n"
+                "CMAKE_CXX_STANDARD:STRING=17\n"
+            )
+            (cmf / "CMakeCXXCompiler.cmake").write_text(
+                'set(CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES '
+                '"/usr/include/c++/14")\n'
+            )
+            (cmf / "CMakeCCompiler.cmake").write_text(
+                'set(CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES "/usr/include")\n'
+            )
+            with mock.patch.dict(os.environ, {"WORK_DIR": work}, clear=True):
+                state = build_manifest._cmake_state()
+        self.assertIn("CMakeCache.txt", state)
+        self.assertIn("CMakeCXXCompiler.cmake", state)
+        self.assertIn("CMakeCCompiler.cmake", state)
+        self.assertIn("CMAKE_CXX_STANDARD:STRING=17", state["CMakeCache.txt"])
+        self.assertIn("/usr/include/c++/14",
+                      state["CMakeCXXCompiler.cmake"])
+        self.assertIn("/usr/include", state["CMakeCCompiler.cmake"])
+
+    def test_cmake_state_empty_without_work_dir(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(build_manifest._cmake_state(), {})
+
+    def test_cmake_state_empty_when_files_absent(self):
+        with tempfile.TemporaryDirectory() as work, \
+             mock.patch.dict(os.environ, {"WORK_DIR": work}, clear=True):
+            self.assertEqual(build_manifest._cmake_state(), {})
+
+    def test_installed_packages_parses_dpkg_query(self):
+        sample = (
+            "libstdc++-14-dev\t14.2.0-4ubuntu2~24.04.1\n"
+            "clang-18\t1:18.1.3-1ubuntu1\n"
+            "libedit-dev\t3.1-20230828-1build1\n"
+        )
+        with mock.patch.object(build_manifest.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                [], 0, stdout=sample, stderr="",
+            )
+            pkgs = build_manifest._installed_packages()
+        self.assertEqual(pkgs, {
+            "libstdc++-14-dev": "14.2.0-4ubuntu2~24.04.1",
+            "clang-18": "1:18.1.3-1ubuntu1",
+            "libedit-dev": "3.1-20230828-1build1",
+        })
+
+    def test_installed_packages_empty_without_dpkg(self):
+        with mock.patch.object(build_manifest.subprocess, "run",
+                               side_effect=FileNotFoundError):
+            self.assertEqual(build_manifest._installed_packages(), {})
 
     def test_missing_recipe_yaml_unknown(self):
         with tempfile.TemporaryDirectory() as d, \

@@ -43,6 +43,69 @@ def _grep_yaml_value(yaml_path: Path, key: str) -> Optional[str]:
     return None
 
 
+def _cmake_state() -> dict:
+    """Snapshot of cmake's configured-state files from the build dir.
+
+    Captures the producer's cmake-probe output so consumers can detect
+    environment drift before iterating. Three files:
+      CMakeCache.txt           top-level vars (CMAKE_CXX_COMPILER,
+                               _STANDARD, _FLAGS, _COMPILER_LAUNCHER, ...)
+      CMakeCXXCompiler.cmake   compiler probe + IMPLICIT_INCLUDE_DIRECTORIES
+                               (the libstdc++ resolution that decides
+                               what /usr/include/c++/N is loaded)
+      CMakeCCompiler.cmake     same for C
+    The content lets consumers diff against their own equivalents and
+    fail loudly on mismatches -- the libstdc++-13 vs libstdc++-14 drift
+    that produced 100% ccache miss in the catthehacker/ubuntu container
+    would have surfaced as a one-line diff against
+    CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES.
+    """
+    work = os.environ.get("WORK_DIR", "")
+    if not work:
+        return {}
+    workp = Path(work)
+    out: dict[str, str] = {}
+    cache = next(workp.glob("**/build/CMakeCache.txt"), None)
+    if cache:
+        try:
+            out["CMakeCache.txt"] = cache.read_text()
+        except OSError:
+            pass
+    for name in ("CMakeCXXCompiler.cmake", "CMakeCCompiler.cmake"):
+        for p in workp.glob(f"**/CMakeFiles/*/{name}"):
+            try:
+                out[name] = p.read_text()
+                break
+            except OSError:
+                continue
+    return out
+
+
+def _installed_packages() -> dict:
+    """Map {pkg-name: version} of packages installed on the producer.
+
+    Recorded so consumers can diff against their local package set and
+    apt-install whatever's missing. Catches any divergence cmake's
+    IMPLICIT_INCLUDE doesn't surface (zlib-dev, libedit-dev, libtinfo,
+    ...) plus the libstdc++ case (libstdc++-N-dev). dpkg-query is
+    debian-only; the empty fallback on macOS/Windows is fine since the
+    runtime-package class of ccache-miss only happens on Linux.
+    """
+    try:
+        r = subprocess.run(
+            ["dpkg-query", "-W", "-f=${Package}\\t${Version}\\n"],
+            check=True, capture_output=True, text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return {}
+    out: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        if "\t" in line:
+            name, ver = line.split("\t", 1)
+            out[name] = ver
+    return out
+
+
 def _ccache_config() -> dict:
     """Snapshot the ccache knobs that decide off-runner reuse."""
     keys = ("compiler_check", "hash_dir", "base_dir")
@@ -127,8 +190,10 @@ def build_manifest(recipe: str, version: str, os_: str, arch: str,
             "cc":  os.environ.get("CC",  "unknown"),
             "cxx": os.environ.get("CXX", "unknown"),
             "ccache": _ccache_config(),
+            "installed_packages": _installed_packages(),
         },
         "cmake_args": _cmake_args(),
+        "cmake_state": _cmake_state(),
         "ci_workflows_sha": os.environ.get("GITHUB_SHA", "unknown"),
         "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
