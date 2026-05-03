@@ -50,9 +50,18 @@ runs:
     # MSVC env: sets cl.exe on PATH plus INCLUDE/LIB/LIBPATH. Pinned
     # to a tagged release (not @v1) so a future ilammy/msvc-dev-cmd
     # behavior change can't silently break our publish runs.
+    #
+    # arch follows runner.arch so the publish runner targets its own
+    # architecture. The action's default is x64, which on a windows-
+    # 11-arm runner cross-compiles to x64 -- the resulting .lib files
+    # land at lib/<name>.lib but carry x64 machine type, so consumers
+    # on the same arm64 runner image fail to link with LNK4272 ("library
+    # machine type 'x64' conflicts with target machine type 'ARM64'").
     - name: Set up MSVC developer environment (Windows)
       if: runner.os == 'Windows'
       uses: ilammy/msvc-dev-cmd@v1.13.0
+      with:
+        arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
 
     - name: Install build dependencies (Windows)
       if: runner.os == 'Windows'
