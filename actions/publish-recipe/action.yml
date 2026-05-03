@@ -130,6 +130,20 @@ runs:
         ccache --max-size=5G
         ccache --zero-stats
 
+    # Decouple the ccache key from runner-local state so the sibling
+    # asset is reusable off-runner. Skipped on Windows: `cl` rejects
+    # `--version`, and the sibling upload is already Windows-gated.
+    - name: Configure ccache portable hashing
+      if: steps.skip.outputs.exists != 'true' && runner.os != 'Windows'
+      shell: bash
+      env:
+        WS: ${{ github.workspace }}
+      run: |
+        cc_version=$("$CC" --version | head -1)
+        ccache --set-config="compiler_check=string:$cc_version"
+        ccache --set-config="hash_dir=false"
+        ccache --set-config="base_dir=$WS"
+
     # Only github-Releases backends need a Release object created up
     # front. file:// backends just need the directory to exist; the
     # cache_upload helper handles that.
