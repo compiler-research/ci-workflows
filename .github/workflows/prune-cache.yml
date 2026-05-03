@@ -105,15 +105,37 @@ jobs:
             echo "::notice::no existing assets; nothing to do"
             exit 0
           fi
+          # An empty expected_keys with non-empty existing assets is
+          # almost certainly upstream tooling failure (yq/jq/compute_key).
+          # Without this guard the orphan classifier drops every cell.
+          if [ ! -s /tmp/expected_keys.txt ]; then
+            echo "::error::expected_keys.txt is empty but assets exist; refusing to prune."
+            exit 1
+          fi
           grace_days=$(yq '.caps.grace_days' cells.yaml)
           if [ "$FORCE" = 'true' ]; then
             echo "::notice::force=true: bypassing grace period (was ${grace_days} days)"
             grace_days=0
           fi
+          # Pre-list existing asset names so delete-asset only fires for
+          # files actually on the release; avoids "asset X not found"
+          # noise for sibling files that legitimately don't exist
+          # (Windows cells skip the .ccache.tar.zst sibling).
+          asset_names=/tmp/asset_names.txt
+          jq -r .name /tmp/existing_assets.jsonl > "$asset_names"
+          delete_if_exists() {
+            local n="$1"
+            if grep -qxF "$n" "$asset_names"; then
+              gh release delete-asset cache "$n" \
+                -R "$GITHUB_REPOSITORY" --yes \
+                || echo "::warning::failed to delete $n; will retry next prune"
+            fi
+          }
           now=$(date -u +%s)
-          # For every .tar.zst whose key (filename minus .tar.zst)
-          # isn't in /tmp/expected_keys.txt and whose age exceeds
-          # grace_days, delete it and its sibling .manifest.json.
+          # The same key surfaces once per sibling filename (.tar.zst
+          # AND .ccache.tar.zst on Linux/macOS). Dedup so the orphan /
+          # kept tallies and the delete loop run once per unique key.
+          declare -A seen=()
           dropped=0
           kept=0
           while IFS= read -r asset; do
@@ -124,6 +146,8 @@ jobs:
               *.manifest.json)  continue ;;
               *)                echo "::warning::unexpected asset: $name"; continue ;;
             esac
+            [ -n "${seen[$key]:-}" ] && continue
+            seen[$key]=1
             if grep -qxF "$key" /tmp/expected_keys.txt; then
               kept=$((kept + 1))
               continue
@@ -142,12 +166,9 @@ jobs:
               continue
             fi
             echo "::notice::dropping orphan ($age_days days old): $key"
-            gh release delete-asset cache "${key}.tar.zst" \
-              -R "$GITHUB_REPOSITORY" --yes || true
-            gh release delete-asset cache "${key}.ccache.tar.zst" \
-              -R "$GITHUB_REPOSITORY" --yes || true
-            gh release delete-asset cache "${key}.manifest.json" \
-              -R "$GITHUB_REPOSITORY" --yes || true
+            delete_if_exists "${key}.tar.zst"
+            delete_if_exists "${key}.ccache.tar.zst"
+            delete_if_exists "${key}.manifest.json"
             dropped=$((dropped + 1))
           done < /tmp/existing_assets.jsonl
           echo "::notice::prune summary: dropped=$dropped kept=$kept"
