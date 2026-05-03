@@ -169,6 +169,26 @@ class CmakeExtraTests(unittest.TestCase):
             self.assertEqual(llvm_build.cmake_extra(), [])
 
 
+class RecordCmakeArgsTests(unittest.TestCase):
+    def test_writes_json_when_work_dir_set(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {"WORK_DIR": d}, clear=True):
+                llvm_build.record_cmake_args(
+                    ["cmake", "-G", "Ninja", "-DFOO=bar", "../llvm"]
+                )
+            written = json.loads((Path(d) / "cmake-args.json").read_text())
+            self.assertEqual(
+                written, ["cmake", "-G", "Ninja", "-DFOO=bar", "../llvm"]
+            )
+
+    def test_no_op_without_work_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                llvm_build.record_cmake_args(["cmake", "../llvm"])
+            self.assertFalse((Path(d) / "cmake-args.json").exists())
+
+
 class CleanupIntermediatesTests(unittest.TestCase):
     def test_removes_o_and_obj_recursively(self):
         with tempfile.TemporaryDirectory() as d:

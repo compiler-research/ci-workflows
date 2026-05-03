@@ -66,6 +66,7 @@ def main() -> int:
         '-DLLVM_INCLUDE_EXAMPLES=OFF',
         '-DLLVM_INCLUDE_TESTS=OFF',
     ] + llvm_build.cmake_extra() + ["../llvm"]
+    llvm_build.record_cmake_args(cmake_args)
     subprocess.run(cmake_args, check=True)
 
     subprocess.run(["ninja", "-j", ncpus, "LLVMDemangle"], check=True)
