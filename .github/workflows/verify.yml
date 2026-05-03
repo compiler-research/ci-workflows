@@ -238,3 +238,74 @@ jobs:
           test -f extract/llvm-project/lib/cmake/llvm/LLVMConfig.cmake
           echo "::notice::publish-dryrun OK on ${{ matrix.os }}"
 
+  # setup-llvm flavor=system smoke. Exercises the apt-llvm.org path
+  # with an older LLVM major (20) that's been stable on apt-llvm.org
+  # for noble for a long time, so the install should reliably succeed.
+  # Asserts:
+  #   - source output reports package-manager
+  #   - prefix is a symlink (not a real directory) — catches a
+  #     regression where the install lands at a real path
+  #   - LLVMConfig.cmake is reachable through it
+  # The second invocation step is a regression test for the
+  # symlink-over-directory bug: `ln` without `rm -rf` first fails on
+  # the second call when the first left a real symlink at the path.
+  #
+  # Default-flavor smoke (recipe-cache path) is NOT included here:
+  # setup-llvm's internal `uses: compiler-research/...@main` would
+  # resolve to upstream main, which doesn't see this PR's
+  # llvm-release recipe. publish-recipe.yml's validate-on-pr already
+  # builds + caches the recipe end-to-end at PR time, which covers
+  # the recipe path indirectly.
+  setup-llvm-system-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: flavor=system smoke (apt-llvm.org llvm-20)
+        id: first
+        uses: ./actions/setup-llvm
+        with:
+          version: '20'
+          os: ubuntu-24.04
+          arch: x86_64
+          flavor: system
+      - name: Assert source=package-manager + symlink + LLVMConfig.cmake
+        shell: bash
+        env:
+          SOURCE: ${{ steps.first.outputs.source }}
+          PREFIX: ${{ steps.first.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          if [[ "$SOURCE" != "package-manager" ]]; then
+            echo "::error::expected source=package-manager, got '$SOURCE'"
+            exit 1
+          fi
+          if [[ ! -L "$PREFIX" ]]; then
+            echo "::error::expected $PREFIX to be a symlink, got $(stat -c '%F' "$PREFIX" 2>/dev/null || echo 'missing')"
+            exit 1
+          fi
+          test -f "$PREFIX/lib/cmake/llvm/LLVMConfig.cmake" || {
+            echo "::error::LLVMConfig.cmake missing under $PREFIX"
+            ls -la "$PREFIX/lib/cmake/llvm/" || true
+            exit 1
+          }
+          echo "::notice::flavor=system smoke OK: source=$SOURCE prefix=$PREFIX"
+      - name: Idempotency (re-invoke against existing symlink)
+        id: second
+        uses: ./actions/setup-llvm
+        with:
+          version: '20'
+          os: ubuntu-24.04
+          arch: x86_64
+          flavor: system
+      - name: Assert second invocation also reports source=package-manager
+        shell: bash
+        env:
+          SOURCE: ${{ steps.second.outputs.source }}
+        run: |
+          set -euo pipefail
+          if [[ "$SOURCE" != "package-manager" ]]; then
+            echo "::error::idempotency regression: expected source=package-manager, got '$SOURCE'"
+            exit 1
+          fi
+          echo "::notice::flavor=system idempotency OK"
+

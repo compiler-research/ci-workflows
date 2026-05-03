@@ -1,0 +1,340 @@
+name: 'Setup LLVM'
+description: |
+  Resolves an LLVM/Clang installation by `flavor`. Each flavor takes
+  exactly one path — the consumer's matrix row declares intent rather
+  than relying on a runtime fall-through. Flavor table:
+
+    ''        recipe `llvm-release` from compiler-research/ci-workflows
+              Releases cache. Binary-identical to what `bin/recipe-cache`
+              produces locally; pick this for the latest LLVM major
+              where the cache cell exists (today: LLVM 22 on every
+              supported platform).
+
+    'system'  Platform package manager — apt-llvm.org on Linux,
+              `brew llvm@N` on macOS. Pick this for older LLVM majors
+              (20, 21, …) that the package manager has caught up on.
+              Not yet supported on Windows.
+
+    'asan'    Recipe `llvm-asan`. Sanitizer-instrumented LLVM.
+
+    'cling'   Recipe `llvm-root` plus a cling-on-top build.
+
+  All paths land their LLVM at $GITHUB_WORKSPACE/llvm-project so the
+  consumer contract is uniform. The `source` output reports which
+  path won so failure-debug logs can show it.
+
+inputs:
+  version:
+    required: true
+    description: 'LLVM major version, e.g. "20", "21", "22".'
+  os:
+    required: true
+    description: |
+      Runner-image slug for the cache key (e.g. "ubuntu-24.04",
+      "macos-26", "windows-2025"). Must match what publish-recipe
+      used; ignored for flavor=system.
+  arch:
+    required: false
+    default: ''
+    description: |
+      Architecture slug for the cache key (e.g. "x86_64", "arm64").
+      Empty (default) derives from the `os` slug — adequate for every
+      runner image GHA ships today (ubuntu-24.04-arm → arm64,
+      macos-26 → arm64 by Apple-Silicon convention, macos-26-intel →
+      x86_64, windows-11-arm → arm64, everything else → x86_64).
+      Override only for unusual hosts where the os slug doesn't carry
+      the architecture.
+  flavor:
+    required: false
+    default: ''
+    description: |
+      Selects the LLVM source. One of: '' (llvm-release recipe),
+      'system' (package manager), 'asan' (llvm-asan recipe), 'cling'
+      (llvm-root recipe + cling-on-top).
+  flavor-version:
+    required: false
+    default: ''
+    description: |
+      Overrides the recipe `version` input for variant flavors. For
+      flavor=cling: 'cling-llvm20' or 'ROOT-llvm20' (selects branch on
+      root-project/llvm-project). Defaults to `version` when empty.
+  build-on-miss:
+    required: false
+    default: 'false'
+    description: |
+      Forwarded to setup-recipe. Default 'false' — fail fast with a
+      publish-recipe hint when the cell is unwarmed; rebuilding LLVM
+      inline (~30 min) on every PR run defeats the cache. Ignored
+      when flavor=system.
+  cling-repo:
+    required: false
+    default: 'https://github.com/root-project/cling.git'
+    description: 'Cling source repository. Only consulted when flavor=cling.'
+  cling-ref:
+    required: false
+    default: ''
+    description: |
+      Cling git ref to clone. Empty (default) clones the default
+      branch. Only consulted when flavor=cling.
+  ref:
+    required: false
+    default: 'main'
+    description: 'ci-workflows ref for setup-recipe to read recipes/ from.'
+  cache-base:
+    required: false
+    default: ''
+    description: |
+      Forwarded to setup-recipe. Empty uses the upstream Releases
+      cache; set to file:///abs/path or https://lab.local/recipes/
+      to point at a private backend. Ignored when flavor=system.
+
+outputs:
+  source:
+    description: '"recipe-cache" | "inline-build" | "package-manager"'
+    value: ${{ steps.finalize.outputs.source }}
+  prefix:
+    description: 'Install prefix (always $GITHUB_WORKSPACE/llvm-project).'
+    value: ${{ steps.finalize.outputs.prefix }}
+
+runs:
+  using: composite
+  steps:
+    # Single dispatch table: validate flavor, resolve recipe name,
+    # refuse unsupported (flavor, OS) pairs early. Output drives the
+    # downstream `if:` gates so each subsequent step references one
+    # variable rather than re-evaluating the flavor.
+    - name: Resolve flavor → recipe
+      id: resolve
+      shell: bash
+      env:
+        FLAVOR: ${{ inputs.flavor }}
+        VERSION: ${{ inputs.version }}
+        FLAVOR_VERSION: ${{ inputs.flavor-version }}
+        ARCH_IN: ${{ inputs.arch }}
+        OS: ${{ inputs.os }}
+      run: |
+        set -euo pipefail
+        case "${FLAVOR}" in
+          '')      recipe=llvm-release ;;
+          asan)    recipe=llvm-asan    ;;
+          cling)   recipe=llvm-root    ;;
+          system)
+            recipe=''
+            # Windows: chocolatey doesn't carry pinned LLVM majors with
+            # the same coverage apt-llvm.org / brew do. Refuse here so
+            # consumers get a clear error rather than a silent miss.
+            if [[ "${RUNNER_OS}" == "Windows" ]]; then
+              echo "::error::flavor=system is not yet supported on Windows; pick the default flavor (llvm-release recipe) or pin to an LLVM major served by an existing cell" >&2
+              exit 1
+            fi
+            ;;
+          *) echo "::error::unknown flavor '${FLAVOR}' (expected: '', 'system', 'asan', 'cling')" >&2
+             exit 1 ;;
+        esac
+        # Derive arch from the os slug when the consumer didn't pass
+        # one explicitly. Mapping covers the runner images GHA ships
+        # today; consumers on unusual hosts still pass `arch:` to
+        # override. macOS is the only case where the slug doesn't
+        # carry the architecture by name (macos-N is Apple Silicon by
+        # GHA convention; macos-N-intel is the x86_64 variant).
+        if [[ -n "${ARCH_IN}" ]]; then
+          arch="${ARCH_IN}"
+        else
+          case "${OS}" in
+            macos-*-intel) arch=x86_64 ;;
+            macos-*)       arch=arm64  ;;
+            *-arm)         arch=arm64  ;;
+            *)             arch=x86_64 ;;
+          esac
+        fi
+        echo "recipe=$recipe"                                   >> "$GITHUB_OUTPUT"
+        echo "recipe-version=${FLAVOR_VERSION:-$VERSION}"       >> "$GITHUB_OUTPUT"
+        echo "arch=$arch"                                       >> "$GITHUB_OUTPUT"
+
+    # System path (Linux): apt-llvm.org. No fallback — if the major
+    # isn't available, the action fails so the consumer knows their
+    # matrix row needs a different flavor or a different version.
+    - name: System install (apt-llvm.org)
+      if: inputs.flavor == 'system' && runner.os == 'Linux'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-}")"
+        if [[ -z "$codename" ]]; then
+          echo "::error::no UBUNTU_CODENAME in /etc/os-release; flavor=system requires an Ubuntu host" >&2
+          exit 1
+        fi
+        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+          | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+        echo "deb http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-${VERSION} main" \
+          | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+        sudo apt-get update -qq
+        sudo apt-get install -y \
+          llvm-${VERSION}-dev libclang-${VERSION}-dev clang-${VERSION} \
+          libpolly-${VERSION}-dev libzstd-dev
+        # libclang-rt-N-dev: ships compiler-rt's orc_rt + jitlink-executor
+        # for the OOP-JIT runtime that LLVM >= 22 callers expect (matches
+        # recipe llvm-release's compiler-rt branch). Hard-fail when
+        # unavailable so the consumer gets a clear error instead of a
+        # half-functional install. For LLVM <= 21 the runtime isn't
+        # bundled, so the package's absence is benign — best-effort.
+        set +e
+        sudo apt-get install -y libclang-rt-${VERSION}-dev
+        rt_rc=$?
+        set -e
+        if [[ "${VERSION}" -ge 22 && $rt_rc -ne 0 ]]; then
+          echo "::error::libclang-rt-${VERSION}-dev unavailable on apt-llvm.org for ${codename}; flavor=system can't satisfy the OOP-JIT runtime requirement at this version. Pick the default flavor (llvm-release recipe) instead." >&2
+          exit 1
+        fi
+        if [[ "${VERSION}" -lt 22 && $rt_rc -ne 0 ]]; then
+          echo "::notice::libclang-rt-${VERSION}-dev not in apt-llvm.org for ${codename}; harmless for LLVM <= 21 (no bundled OOP runtime)"
+        fi
+        # Symlink the apt prefix at the consumer-side path. `rm -rf`
+        # first so the step is idempotent: re-runs in the same
+        # workspace (act with reused containers, or any pipeline that
+        # invokes setup-llvm twice) leave a real directory or stale
+        # symlink at this path, and `ln -s` over a non-symlink
+        # directory fails on both GNU and BSD ln.
+        rm -rf "${GITHUB_WORKSPACE}/llvm-project"
+        ln -s "/usr/lib/llvm-${VERSION}" "${GITHUB_WORKSPACE}/llvm-project"
+        echo "::notice::flavor=system: apt-llvm.org llvm-${VERSION} on ${codename}"
+
+    - name: System install (Homebrew)
+      if: inputs.flavor == 'system' && runner.os == 'macOS'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        # `brew install` exits non-zero on unknown formula; let it
+        # propagate to fail the action — the consumer asked for a
+        # flavor the host can't satisfy, and there's no fallback.
+        brew install "llvm@${VERSION}"
+        prefix="$(brew --prefix "llvm@${VERSION}")"
+        # `rm -rf` first for idempotency — see Linux branch comment.
+        # brew's llvm@N formula bundles compiler-rt as part of the
+        # install, so no separate runtime probe needed (unlike
+        # apt-llvm.org's split libclang-rt-N-dev package).
+        rm -rf "${GITHUB_WORKSPACE}/llvm-project"
+        ln -s "${prefix}" "${GITHUB_WORKSPACE}/llvm-project"
+        echo "::notice::flavor=system: brew llvm@${VERSION} at ${prefix}"
+
+    # Recipe path (everything except flavor=system): delegate to
+    # setup-recipe. cache-base + ref are passthroughs so consumers
+    # can point at a private cache or pin a different ci-workflows
+    # ref without setup-llvm becoming a bottleneck.
+    - name: Recipe (cache or inline build)
+      id: recipe
+      if: inputs.flavor != 'system'
+      uses: compiler-research/ci-workflows/actions/setup-recipe@main
+      with:
+        recipe:        ${{ steps.resolve.outputs.recipe }}
+        version:       ${{ steps.resolve.outputs.recipe-version }}
+        os:            ${{ inputs.os }}
+        arch:          ${{ steps.resolve.outputs.arch }}
+        build-on-miss: ${{ inputs.build-on-miss }}
+        ref:           ${{ inputs.ref }}
+        cache-base:    ${{ inputs.cache-base }}
+
+    # Cling-on-top: only for flavor=cling. Builds root-project/cling
+    # against the LLVM tree the recipe step produced and installs
+    # into the same prefix so consumers find ClingConfig.cmake at
+    # $LLVM/lib/cmake/cling/.
+    #
+    # Workarounds for upstream cling bugs (drop both once
+    # root-project/root#22123 lands and root-project/cling syncs):
+    # * UserInterface gate (cling 2fdcb6d) — forced via CLING_INCLUDE_TESTS=ON.
+    # * libcling LIBS missing clangInterpreter (cling 0307632f31) —
+    #   patched inline via awk (GNU vs BSD sed: `a\TEXT` is GNU-only).
+    - name: Cling-on-top (Unix)
+      if: inputs.flavor == 'cling' && runner.os != 'Windows'
+      shell: bash
+      env:
+        CLING_REPO: ${{ inputs.cling-repo }}
+        CLING_REF:  ${{ inputs.cling-ref }}
+      run: |
+        set -euo pipefail
+        # ncpus: detect inside the action so we don't depend on a
+        # consumer-side Select_Default_Build_Type having run first.
+        if [[ "$(uname)" == "Darwin" ]]; then
+          ncpus=$(sysctl -n hw.ncpu)
+        else
+          ncpus=$(nproc)
+        fi
+        LLVM_PREFIX="${GITHUB_WORKSPACE}/llvm-project"
+        rm -rf cling
+        if [[ -n "${CLING_REF}" ]]; then
+          git clone --depth=1 -b "${CLING_REF}" "${CLING_REPO}" cling
+        else
+          git clone --depth=1 "${CLING_REPO}" cling
+        fi
+        f=cling/tools/libcling/CMakeLists.txt
+        awk '/^  clangEdit$/ {print; print "  clangInterpreter"; next} 1' "$f" > "$f.tmp" \
+          && mv "$f.tmp" "$f"
+        mkdir cling/build && cd cling/build
+        cmake .. \
+            -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="$LLVM_PREFIX/lib/cmake/llvm" \
+            -DClang_DIR="$LLVM_PREFIX/lib/cmake/clang" \
+            -DCMAKE_INSTALL_PREFIX="$LLVM_PREFIX" \
+            -DCLING_INCLUDE_TESTS=ON \
+            -DLLVM_INCLUDE_TESTS=OFF
+        cmake --build . --parallel "${ncpus}"
+        cmake --install .
+
+    - name: Cling-on-top (Windows)
+      if: inputs.flavor == 'cling' && runner.os == 'Windows'
+      shell: pwsh
+      env:
+        CLING_REPO: ${{ inputs.cling-repo }}
+        CLING_REF:  ${{ inputs.cling-ref }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $ncpus = [Environment]::ProcessorCount
+        $LLVM_PREFIX = "$env:GITHUB_WORKSPACE\llvm-project"
+        if (Test-Path cling) { Remove-Item -Recurse -Force cling }
+        if ($env:CLING_REF) {
+          git clone --depth=1 -b $env:CLING_REF $env:CLING_REPO cling
+        } else {
+          git clone --depth=1 $env:CLING_REPO cling
+        }
+        # Mirror the bash awk: insert clangInterpreter after clangEdit
+        # in tools/libcling/CMakeLists.txt LIBS.
+        $f = "cling\tools\libcling\CMakeLists.txt"
+        (Get-Content $f) | ForEach-Object {
+          $_
+          if ($_ -ceq "  clangEdit") { "  clangInterpreter" }
+        } | Set-Content $f
+        New-Item -ItemType Directory -Path cling\build | Out-Null
+        Set-Location cling\build
+        cmake .. `
+          -DCMAKE_BUILD_TYPE=Release `
+          "-DLLVM_DIR=$LLVM_PREFIX\lib\cmake\llvm" `
+          "-DClang_DIR=$LLVM_PREFIX\lib\cmake\clang" `
+          "-DCMAKE_INSTALL_PREFIX=$LLVM_PREFIX" `
+          -DCLING_INCLUDE_TESTS=ON `
+          -DLLVM_INCLUDE_TESTS=OFF
+        cmake --build . --config Release --parallel $ncpus
+        cmake --install . --config Release
+
+    - name: Finalize outputs
+      id: finalize
+      shell: bash
+      env:
+        FLAVOR: ${{ inputs.flavor }}
+        RECIPE_HIT: ${{ steps.recipe.outputs.cache-hit }}
+      run: |
+        set -euo pipefail
+        if [[ "${FLAVOR}" == "system" ]]; then
+          src=package-manager
+        elif [[ "${RECIPE_HIT}" == "true" ]]; then
+          src=recipe-cache
+        else
+          src=inline-build
+        fi
+        echo "source=${src}"                            >> "$GITHUB_OUTPUT"
+        echo "prefix=${GITHUB_WORKSPACE}/llvm-project"  >> "$GITHUB_OUTPUT"
+        echo "::notice title=setup-llvm::flavor=${FLAVOR:-llvm-release} source=${src} prefix=${GITHUB_WORKSPACE}/llvm-project"
