@@ -140,6 +140,14 @@ runs:
           echo "hit=false" >> "$GITHUB_OUTPUT"
         fi
 
+    - name: Ensure zstd (Windows)
+      if: steps.probe.outputs.hit == 'true' && runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        if (-not (Get-Command zstd -ErrorAction SilentlyContinue)) {
+          choco install -y zstandard
+        }
+
     - name: Download + extract from cache
       if: steps.probe.outputs.hit == 'true'
       shell: bash
