@@ -131,6 +131,48 @@ Stage / temp-workflow files are cleaned at exit; disk after the
 run is zero (image cache aside). See `bin/repro --help` and
 [docs/developer-guide.md](docs/developer-guide.md) for the rest.
 
+## Iterating on LLVM with a warm ccache: `--devshell`
+
+`bin/repro <cell> --devshell` skips the workflow and instead drops
+you into a long-lived container with the cell's published install,
+sibling ccache, and matching LLVM source already in place. Edits to
+`llvm-project/` rebuild incrementally against the producer's cache,
+so a single TU changes in seconds rather than the ~30 minutes a
+cold compile would take.
+
+```bash
+bin/repro ubu24-x86-gcc14-cling-llvm20-cppyy --devshell
+# inside the container:
+cd $DEVSHELL_BUILD && ninja clang
+```
+
+The cell argument is either a matrix-row name (validated against
+`act -n --json` for the consumer repo) or a direct
+`recipe/version/os/arch` coord (e.g. `llvm-release/22/ubuntu-24.04/x86_64`)
+for cells no consumer matrix references yet. Files live under
+`~/.cache/ci-workflows/devshell/<cell>/`; the container is named
+`devshell-<cell>` and persists across invocations. Common knobs:
+
+| flag | effect |
+|------|--------|
+| `--devshell-rm` | remove the container; preserve the host workdir |
+| `--devshell-refetch` | re-download install / ccache / manifest |
+| `--devshell-script PATH` | run PATH inside the container instead of an interactive shell (CI / smoke use) |
+
+`scripts/repro-config` runs at first entry and on each subsequent
+fetch: it installs the same apt deps as `install-build-deps`,
+auto-installs the libstdc++-N-dev that matches the producer's
+`/usr/include/c++/N` (catches the ~100% ccache-miss class caused by
+catthehacker's libstdc++-13 vs GHA's libstdc++-14), applies the
+producer's ccache `compiler_check`, replays the recipe's own cmake
+invocation from `manifest.cmake_args`, and warns on dev-package
+version drift. A smoke compile of `lib/Support/Allocator.cpp.o`
+verifies that the producer cache actually reaches the consumer
+environment before handing off the shell.
+
+Linux-only for now (Ubuntu cells); macOS hosts work via the bundled
+Linux container, with the platform-mismatch overhead under Rosetta.
+
 ## Layout
 
 ```

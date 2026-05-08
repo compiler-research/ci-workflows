@@ -366,3 +366,106 @@ bin/repro consumes via `--ci-workflows <path>`.
   exit; if a run is killed hard, remove
   `.github/act-ci-workflows-stage/` and
   `.github/workflows/act-*-localized-*.yml` by hand.
+
+## Iterating on LLVM with `--devshell`
+
+`bin/repro <cell> --devshell` is a different mode: it doesn't run
+a workflow. It downloads the cell's published install +
+sibling-ccache + manifest, shallow-clones llvm-project at the
+manifest's pinned `SRC_COMMIT`, and drops you into a long-lived
+container ready for incremental rebuilds against the producer's
+ccache.
+
+Use it when:
+
+- A workflow ran clean in CI but you want to edit something *in
+  LLVM itself* and rebuild fast (the `bin/repro <row>` shell only
+  reproduces the row's own build, which doesn't iterate well).
+- You're triaging a cppyy / CppInterOp issue that needs a
+  patched LLVM.
+- You want to verify a recipe's published install actually compiles
+  the next dependent layer (CppInterOp, cling) before relying on it.
+
+### Cell argument
+
+Either form works:
+
+- A matrix-row name from a consumer repo (`bin/repro --list` from
+  that repo enumerates them). Looked up against `act -n --json`,
+  which gives `bin/repro` the recipe coord to download.
+- A direct `recipe/version/os/arch` coord, e.g.
+  `llvm-release/22/ubuntu-24.04/x86_64`. Use this when no consumer
+  matrix references the cell yet (e.g. you just published it and
+  haven't migrated downstream `setup-llvm` callers).
+
+The cell is validated against `cells.yaml`; a typo fails fast
+rather than 404'ing on Releases.
+
+### Workdir layout
+
+```
+~/.cache/ci-workflows/devshell/<cell>/
+  _recipe_out/llvm-project/        install tree (LLVM_PREFIX)
+  .ccache/                         producer's sibling ccache
+  _recipe_work/llvm-project/       shallow llvm-project @ SRC_COMMIT
+  manifest.json                    producer manifest
+```
+
+The container (`devshell-<cell>`) bind-mounts this directory at the
+recipe's runner workspace path (read from
+`manifest.build_env.ccache.base_dir`), so ccache's recorded paths
+match. Re-invoking `bin/repro <cell> --devshell` re-uses the
+container; `--devshell-rm` deletes it but keeps the workdir.
+
+### Knobs
+
+| flag | effect |
+|------|--------|
+| `--devshell-rm` | remove the container; workdir is kept |
+| `--devshell-refetch` | re-download install/ccache/manifest |
+| `--devshell-script PATH` | run host PATH inside the container, exit with its rc (batch mode) |
+
+### What `scripts/repro-config` does on entry
+
+Idempotent — runs once per fetch, no-ops on rebuild:
+
+1. **apt deps**: same set as `install-build-deps` Linux step
+   (clang, cmake, ninja, ccache, libedit-dev, ...).
+2. **libstdc++ auto-detect**: reads
+   `manifest.cmake_state.CMakeCXXCompiler.cmake`, extracts the
+   `CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES` path, and apt-installs
+   the matching `libstdc++-N-dev` if it isn't local. Catches the
+   catthehacker `libstdc++-13` vs GHA `libstdc++-14` drift that
+   makes every C++ TU's preprocessed output diverge — 100%
+   ccache-miss against the producer cache. For pre-`cmake_state`
+   manifests, defaults to `libstdc++-14-dev` (matches the GHA
+   `ubuntu-24.04` runner the recipes target).
+3. **package-drift warning**: diffs the producer's
+   `manifest.build_env.installed_packages` against local
+   `dpkg-query` output, filtered to dev / clang / cmake / ninja /
+   ccache / lld packages. Surfaces a `::warning::` line per
+   divergent package; no auto-install.
+4. **ccache `compiler_check`**: applies the producer's value
+   verbatim (exported by `bin/repro` from
+   `manifest.build_env.ccache.compiler_check`). Warns when the
+   consumer's `$CC --version` diverges.
+5. **cmake configure**: replays the recipe's own cmake invocation
+   from `manifest.cmake_args`, substituting
+   `CMAKE_INSTALL_PREFIX` and the source path. Pre-`cmake_args`
+   manifests fall back to `llvm_build.base_cmake_args() +
+   LLVM_ENABLE_PROJECTS=clang`.
+6. **smoke compile**: builds
+   `lib/Support/CMakeFiles/LLVMSupport.dir/Allocator.cpp.o`. Zero
+   ccache hits ⇒ producer cache isn't reaching the consumer (drift
+   the earlier checks didn't catch); surfaces a `::warning::`
+   rather than aborting.
+
+### Limits
+
+- Linux Ubuntu cells only (`ubuntu-22.04`, `ubuntu-24.04`); other
+  cell OSes refuse with a clear error.
+- macOS hosts work via the Linux container, paying Rosetta
+  emulation overhead on Apple Silicon.
+- Pre-portable-ccache manifests (no `build_env.ccache`) provision
+  correctly but miss on the first compile until a republish writes
+  the portable-hashing config alongside.
