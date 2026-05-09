@@ -179,6 +179,31 @@ runs:
             --notes "Rolling cache of prebuilt recipe artifacts. Each asset is keyed by sha256 of (recipe.yaml, build.{sh,py}, patches, version, os, arch). See <key>.manifest.json for the inputs that produced any given <key>.tar.zst."
         fi
 
+    # Cross-recipe build-time dependency. Recipes that need a
+    # prebuilt clang to compile (e.g. llvm-msan, where libc++ from
+    # release/{N}.x uses Clang-{N+}-only builtins) declare a
+    # `bootstrap:` block in recipe.yaml; this step downloads the
+    # named cell and exports its bin/ as BOOTSTRAP_CLANG_BIN. Recipes
+    # without a bootstrap block: fetch_bootstrap.py exits silently and
+    # the env var stays empty.
+    - name: Fetch bootstrap compiler if recipe declares one
+      if: steps.skip.outputs.exists != 'true'
+      shell: bash
+      env:
+        OS: ${{ inputs.os }}
+        ARCH: ${{ inputs.arch }}
+        RECIPE: ${{ inputs.recipe }}
+        WORK_DIR: ${{ github.workspace }}/_recipe_work
+      run: |
+        mkdir -p "$WORK_DIR"
+        bin=$(python3 actions/publish-recipe/fetch_bootstrap.py \
+                "recipes/$RECIPE" "$OS" "$ARCH" \
+                "$WORK_DIR/_bootstrap")
+        if [ -n "$bin" ]; then
+          echo "BOOTSTRAP_CLANG_BIN=$bin" >> "$GITHUB_ENV"
+          echo "::notice::bootstrap compiler at $bin"
+        fi
+
     - name: Build recipe
       if: steps.skip.outputs.exists != 'true'
       shell: bash
