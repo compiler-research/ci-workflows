@@ -32,6 +32,10 @@ caps:
 
 cells:
   - { recipe: llvm-asan, version: '22',            os: ubuntu-24.04,    arch: x86_64 }
+  # llvm-msan: Linux only -- macOS toolchain doesn't ship the
+  # MSan-instrumented libc++ stage build cleanly (libcxxabi-on-Mach-O
+  # uses Apple's libunwind), and Windows lacks MSan support upstream.
+  - { recipe: llvm-msan,  version: '22',            os: ubuntu-24.04,    arch: x86_64 }
   # llvm-release: vanilla LLVM/Clang for the latest major across every
   # supported runner image. setup-llvm's default flavor pulls these
   # cells; consumers asking for older majors pick `flavor: system`,

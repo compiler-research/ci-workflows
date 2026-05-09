@@ -27,6 +27,7 @@ on:
         required: true
         options:
           - llvm-asan
+          - llvm-msan
       version:
         type: string
         required: true

@@ -1,0 +1,63 @@
+recipe: llvm-msan
+description: |
+  LLVM/Clang built with MemorySanitizer (Memory; Origins available
+  via MSAN_FLAVOR=MemoryWithOrigins), against release/{version}.x.
+  Consumed by projects whose test suites run under -fsanitize=memory.
+
+  Bootstrapped from the llvm-release cell to avoid host-clang version
+  drift: building libc++ from llvm-project release/{N}.x requires a
+  Clang at least N (header builtins like __builtin_ctzg landed in
+  Clang 19), and apt-noble's clang-18 is too old. The published
+  llvm-release cell is exactly the matching clang, so consume it
+  via recipe.yaml's `bootstrap` field rather than rebuilding a
+  scaffolding clang here.
+
+  Two-stage bootstrap on top of that: stage 1 builds msan-instrumented
+  libc++/libcxxabi/libunwind from llvm-project/runtimes; stage 2
+  builds clang/compiler-rt with -fsanitize=memory and links against
+  stage 1's libc++. MSan needs every transitive write to memory it
+  later reads to be either instrumented or covered by a compiler-rt
+  interceptor; an uninstrumented system libc++ / libstdc++ trips
+  false positives on the first allocator-fed buffer the resident
+  clang ever reads. Inspired by llvm-zorg's
+  buildbot_bootstrap_msan.sh.
+
+  Consumer link contract -- every link line that pulls in this cell
+  needs all three:
+    -fsanitize=memory                  (mandatory; libc++.so.1 is
+                                        instrumented but does not
+                                        carry libclang_rt.msan as
+                                        DT_NEEDED, so an unadorned
+                                        link errors with `undefined
+                                        reference to __msan_*`)
+    -stdlib=libc++                     (the bundled libc++ is the only
+                                        supported stdlib -- libstdc++
+                                        has no MSan-aware annotations
+                                        and the MSan docs themselves
+                                        recommend libc++)
+    -L$LLVM/lib -Wl,-rpath,$LLVM/lib   (binaries find libc++.so.1 +
+                                        libunwind.so.1 from this cell
+                                        without LD_LIBRARY_PATH games)
+
+  cmake-driven consumers can shorten the above by setting
+  LLVM_USE_SANITIZER=Memory + LLVM_ENABLE_LIBCXX=ON; LLVM's own
+  HandleLLVMOptions.cmake then does the right thing including
+  dropping `-Wl,-z,defs` (which would otherwise reject libc++.so.1's
+  unresolved __msan_init).
+
+# Only fields read by build_manifest.py live here. The cmake invocation
+# and trim list are authoritative in build.py — having them duplicated
+# here as decorative metadata would silently drift. Add a field here
+# only when something else (manifest, dispatcher) actually reads it.
+source:
+  repo: https://github.com/llvm/llvm-project
+  branch_template: release/{version}.x
+
+# Cross-recipe dependency. publish-recipe's fetch_bootstrap step
+# downloads this cell into the build env and exports its bin/ as
+# BOOTSTRAP_CLANG_BIN before invoking build.py. Pin the version here
+# (not derived from RECIPE_VERSION) so the bootstrap clang is always
+# the same major as this msan build.
+bootstrap:
+  recipe: llvm-release
+  version: '22'
