@@ -17,11 +17,19 @@ description: |
 
     'asan'    Recipe `llvm-asan`. Sanitizer-instrumented LLVM.
 
+    'msan'    Recipe `llvm-msan`. MemorySanitizer-instrumented LLVM
+              with a bundled libc++. Linux x86_64 only (MSan upstream
+              doesn't support other triples).
+
     'cling'   Recipe `llvm-root` plus a cling-on-top build.
 
-  All paths land their LLVM at $GITHUB_WORKSPACE/llvm-project so the
-  consumer contract is uniform. The `source` output reports which
-  path won so failure-debug logs can show it.
+  All paths land at $GITHUB_WORKSPACE/llvm-project. The `source`
+  output reports which path won.
+
+  If the install ships <install>/etc/cmake-toolchain.cmake, this
+  action exports CMAKE_TOOLCHAIN_FILE pointing at it -- consumers
+  pick up recipe-side compiler/flag/libcxx settings without any
+  matrix-row plumbing. Recipes that don't need one don't ship one.
 
 inputs:
   version:
@@ -49,8 +57,9 @@ inputs:
     default: ''
     description: |
       Selects the LLVM source. One of: '' (llvm-release recipe),
-      'system' (package manager), 'asan' (llvm-asan recipe), 'cling'
-      (llvm-root recipe + cling-on-top).
+      'system' (package manager), 'asan' (llvm-asan recipe), 'msan'
+      (llvm-msan recipe, Linux x86_64 only), 'cling' (llvm-root
+      recipe + cling-on-top).
   flavor-version:
     required: false
     default: ''
@@ -117,6 +126,16 @@ runs:
         case "${FLAVOR}" in
           '')      recipe=llvm-release ;;
           asan)    recipe=llvm-asan    ;;
+          msan)
+            recipe=llvm-msan
+            # MSan upstream is Linux x86_64 only; refuse here so the
+            # consumer gets a clear error instead of a 404 on an
+            # unpublished cell key.
+            if [[ "${RUNNER_OS}" != "Linux" ]]; then
+              echo "::error::flavor=msan is supported on Linux only (host=${RUNNER_OS})" >&2
+              exit 1
+            fi
+            ;;
           cling)   recipe=llvm-root    ;;
           system)
             recipe=''
@@ -128,7 +147,7 @@ runs:
               exit 1
             fi
             ;;
-          *) echo "::error::unknown flavor '${FLAVOR}' (expected: '', 'system', 'asan', 'cling')" >&2
+          *) echo "::error::unknown flavor '${FLAVOR}' (expected: '', 'system', 'asan', 'msan', 'cling')" >&2
              exit 1 ;;
         esac
         # Derive arch from the os slug when the consumer didn't pass
@@ -319,6 +338,20 @@ runs:
           -DLLVM_INCLUDE_TESTS=OFF
         cmake --build . --config Release --parallel $ncpus
         cmake --install . --config Release
+
+    # Generic, recipe-agnostic. Today only llvm-msan ships one;
+    # future recipes opt in by dropping a file at this path. shell:
+    # bash on Windows uses Git for Windows' bash (CMAKE_TOOLCHAIN_FILE
+    # handles forward slashes fine).
+    - name: Export recipe toolchain file (if shipped)
+      shell: bash
+      run: |
+        set -euo pipefail
+        tc="${GITHUB_WORKSPACE}/llvm-project/etc/cmake-toolchain.cmake"
+        if [[ -f "$tc" ]]; then
+          echo "CMAKE_TOOLCHAIN_FILE=$tc" >> "$GITHUB_ENV"
+          echo "::notice title=setup-llvm::recipe ships cmake-toolchain.cmake; CMAKE_TOOLCHAIN_FILE=$tc"
+        fi
 
     - name: Finalize outputs
       id: finalize
