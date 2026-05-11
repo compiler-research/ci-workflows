@@ -80,7 +80,7 @@ def main() -> int:
     os.chdir(build_dir)
 
     cmake_args = (
-        llvm_build.base_cmake_args(str(out_dir / "llvm-project"))
+        llvm_build.base_cmake_args(str(out_dir / "install"))
         + ['-DLLVM_ENABLE_PROJECTS=clang']
         + llvm_build.cmake_extra()
         + ["../llvm"]

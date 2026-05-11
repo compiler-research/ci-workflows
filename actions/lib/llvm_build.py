@@ -11,7 +11,7 @@ in the recipe's own build.py.
 Required env (every recipe; setup_env asserts these):
   RECIPE_VERSION   recipe-defined version/flavor selector
   WORK_DIR         scratch directory; clone + build live here
-  OUT_DIR          install prefix is "$OUT_DIR/llvm-project"; the
+  OUT_DIR          install prefix is "$OUT_DIR/install"; the
                    install lands directly there for tar/upload.
 
 Optional env:
@@ -265,7 +265,7 @@ def smoke(required_files: Optional[Sequence[str]] = None,
     exist (e.g. "lib/libclingInterpreter.a" — cling has no Config.cmake).
     """
     out_dir = os.environ["OUT_DIR"]
-    prefix = Path(out_dir) / "llvm-project"
+    prefix = Path(out_dir) / "install"
     pkg_calls = "\n".join(
         f'find_package({p} REQUIRED CONFIG PATHS "${{SMOKE_LLVM_PREFIX}}/lib/cmake/{p.lower()}" NO_DEFAULT_PATH)'
         for p in packages

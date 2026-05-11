@@ -132,8 +132,8 @@ def main() -> int:
     download_dir.mkdir(parents=True, exist_ok=True)
     cache_io.cache_download(base, key, str(download_dir))
 
-    # Cells extract as <download_dir>/llvm-project/{bin,lib,include}.
-    bin_dir = download_dir / "llvm-project" / "bin"
+    # Cells extract as <download_dir>/install/{bin,lib,include}.
+    bin_dir = download_dir / "install" / "bin"
     if not (bin_dir / "clang").is_file():
         print(f"fetch_bootstrap: bootstrap cell extracted but "
               f"{bin_dir}/clang is missing; cell layout changed?",

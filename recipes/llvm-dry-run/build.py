@@ -59,7 +59,7 @@ def main() -> int:
     # since it never builds clang.
     cmake_args = [
         "cmake", "-G", "Ninja",
-        f"-DCMAKE_INSTALL_PREFIX={out_dir / 'llvm-project'}",
+        f"-DCMAKE_INSTALL_PREFIX={out_dir / 'install'}",
         '-DLLVM_TARGETS_TO_BUILD=host',
         '-DCMAKE_BUILD_TYPE=Release',
         '-DLLVM_INCLUDE_BENCHMARKS=OFF',

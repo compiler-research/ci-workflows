@@ -96,12 +96,12 @@ class PackGetRmTests(_CLITestCase):
             self.assertEqual(manifest_data["kind"], "mockup")
             self.assertEqual(manifest_data["recipe"], "llvm-asan")
 
-            # Get extracts the tarball under --out/llvm-project/.
+            # Get extracts the tarball under --out/install/.
             self._run(
                 "get", "llvm-asan", "22", "ubuntu-24.04", "x86_64",
                 "--out", out_dir,
             )
-            extracted = Path(out_dir) / "llvm-project"
+            extracted = Path(out_dir) / "install"
             self.assertTrue(extracted.is_dir())
             self.assertEqual(
                 (extracted / "include" / "llvm" / "foo.h").read_text(),

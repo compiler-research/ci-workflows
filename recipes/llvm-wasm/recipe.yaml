@@ -5,13 +5,13 @@ description: |
   emscripten matrix.
 
   Two stages: (1) host llvm-tblgen + clang-tblgen under
-  llvm-project/native_build/ -- the wasm clang cannot build host
-  binaries, LLVM_NATIVE_TOOL_DIR points at this; (2) emcmake/emmake
-  cross-build under llvm-project/build/. Source-tree layout is
-  preserved (not a cmake install): consumers point at
-  build/lib/cmake/ for find_package and at {llvm,clang}/include for
-  headers; LLVM_DISTRIBUTION_COMPONENTS does not apply across the
-  host/wasm boundary.
+  install/native_build/ -- the wasm clang cannot build host binaries,
+  LLVM_NATIVE_TOOL_DIR points at this; (2) emcmake/emmake cross-build
+  under install/build/. Source-tree layout is preserved (not a cmake
+  install): consumers point at install/build/lib/cmake/ for
+  find_package and at install/{llvm,clang}/include for headers;
+  LLVM_DISTRIBUTION_COMPONENTS does not apply across the host/wasm
+  boundary.
 
   Per-LLVM-major patches under patches/ apply by file glob
   (`emscripten-clang{N}-*.patch`); adding a new major needs no
@@ -20,10 +20,10 @@ description: |
   cell-level field.
 
   Consumer cmake contract:
-    -DLLVM_DIR=$LLVM/llvm-project/build/lib/cmake/llvm
-    -DClang_DIR=$LLVM/llvm-project/build/lib/cmake/clang
+    -DLLVM_DIR=$LLVM/install/build/lib/cmake/llvm
+    -DClang_DIR=$LLVM/install/build/lib/cmake/clang
     -DCMAKE_TOOLCHAIN_FILE=$EMSDK/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake
-    -DLLVM_NATIVE_TOOL_DIR=$LLVM/llvm-project/native_build/bin
+    -DLLVM_NATIVE_TOOL_DIR=$LLVM/install/native_build/bin
 
 # Only fields read by build_manifest.py live here. The cmake invocation,
 # patch glob, and emsdk version pin are authoritative in build.py.

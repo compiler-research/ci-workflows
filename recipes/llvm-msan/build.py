@@ -110,8 +110,8 @@ def _build_msan_runtime_into(src_dir: Path, build_dir: Path,
     bootstrap clang has the runtime *before* stage 1 needs to link
     libc++.
     """
-    # bootstrap_bin is `<extract>/llvm-project/bin`. The bootstrap
-    # clang searches `<extract>/llvm-project/lib/clang/<N>/lib/<triple>/`
+    # bootstrap_bin is `<extract>/install/bin`. The bootstrap
+    # clang searches `<extract>/install/lib/clang/<N>/lib/<triple>/`
     # for runtime archives, so install directly into the resource-dir
     # (with PER_TARGET_RUNTIME_DIR on, files land at
     # `<prefix>/lib/<triple>/libclang_rt.*`). Probe the bootstrap's
@@ -212,7 +212,7 @@ def _emit_toolchain_file(install_prefix: Path) -> None:
     CMAKE_TOOLCHAIN_FILE generically, so consumer matrix rows stay a
     one-line `flavor: msan`. ${CMAKE_CURRENT_LIST_DIR}/.. resolves the
     install root, so the same file works at OUT_DIR (recipe build) and
-    $GITHUB_WORKSPACE/llvm-project (extracted cell).
+    $GITHUB_WORKSPACE/install (extracted cell).
     """
     etc_dir = install_prefix / "etc"
     etc_dir.mkdir(parents=True, exist_ok=True)
@@ -284,7 +284,7 @@ def main() -> int:
         return 1
 
     src_dir = work_dir / "llvm-project"
-    install_prefix = out_dir / "llvm-project"
+    install_prefix = out_dir / "install"
     libcxx_install = work_dir / "libcxx_msan"
 
     os.chdir(work_dir)

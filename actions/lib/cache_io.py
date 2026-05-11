@@ -73,7 +73,7 @@ def cache_probe(base: str, key: str) -> bool:
 def cache_download(base: str, key: str, out_dir: str) -> None:
     """Fetch the asset for `key` and extract into `out_dir`.
 
-    The recipe's tarball root (e.g. ``llvm-project/``) lands directly
+    The recipe's tarball root (e.g. ``install/``) lands directly
     under `out_dir`.
     """
     base = _strip_trailing_slash(base)
@@ -157,11 +157,11 @@ def cache_upload(base: str, key: str, asset: str,
 
 
 def cache_pack(in_dir: str, key: str, out_dir: Optional[str] = None,
-               *, src_name: str = "llvm-project",
+               *, src_name: str = "install",
                key_suffix: str = "") -> None:
     """Tar+zstd ``in_dir/<src_name>`` to ``out_dir/<key><key_suffix>.tar.zst``.
 
-    Defaults match the install tree (src_name="llvm-project",
+    Defaults match the install tree (src_name="install",
     key_suffix=""). For a sibling ccache snapshot pass src_name=".ccache",
     key_suffix=".ccache".
 

@@ -67,7 +67,7 @@ outputs:
     description: 'Computed cache key'
     value: ${{ steps.compute-key.outputs.key }}
   src-commit:
-    description: 'llvm-project HEAD sha (only set on inline build path)'
+    description: 'Source HEAD sha (only set on inline build path)'
     value: ${{ env.SRC_COMMIT }}
 
 runs:
@@ -163,23 +163,23 @@ runs:
         cd __ci_workflows__
         mkdir -p _llvm_dl
         python3 actions/lib/cache_io.py download "$BASE" "$KEY" _llvm_dl
-        # Recipe's tarball root is `llvm-project/`; surface at $GITHUB_WORKSPACE.
-        # `rm -rf ../llvm-project` first so the step is idempotent: a
+        # Recipe's tarball root is `install/`; surface at $GITHUB_WORKSPACE.
+        # `rm -rf ../install` first so the step is idempotent: a
         # re-run in the same workspace (act with reused containers, or
         # any flow that calls setup-recipe twice) would otherwise trip
-        # `mv: cannot overwrite '../llvm-project': Directory not empty`
+        # `mv: cannot overwrite '../install': Directory not empty`
         # on the existing tree from the prior run. Mirrors the pattern
         # in the cache-miss "Build inline" branch below.
-        if [[ -d _llvm_dl/llvm-project ]]; then
-          rm -rf ../llvm-project
-          mv _llvm_dl/llvm-project ../
+        if [[ -d _llvm_dl/install ]]; then
+          rm -rf ../install
+          mv _llvm_dl/install ../
         else
           # Defensive: some recipes may tar a different root in future.
           mv _llvm_dl/* ../ 2>/dev/null || true
         fi
         rm -rf _llvm_dl
         cd ..
-        extracted=$(python3 -c "import os, sys; sz = sum(p.stat().st_size for p in __import__('pathlib').Path('llvm-project').rglob('*') if p.is_file()); print(f'{sz/1048576:.0f} MiB')" 2>/dev/null || echo '?')
+        extracted=$(python3 -c "import os, sys; sz = sum(p.stat().st_size for p in __import__('pathlib').Path('install').rglob('*') if p.is_file()); print(f'{sz/1048576:.0f} MiB')" 2>/dev/null || echo '?')
 
         # Provenance notices: every operator looking at this run can
         # see at a glance what was loaded plus a clickable URL to the
@@ -202,16 +202,16 @@ runs:
         # Dispatch by recipe build script: prefer build.py (Python,
         # native on every OS) over build.sh (bash, requires git-bash
         # on Windows). Recipes migrate one at a time; both forms
-        # produce $OUT_DIR/llvm-project as a relocatable install tree.
+        # produce $OUT_DIR/install as a relocatable install tree.
         recipe_dir=__ci_workflows__/recipes/${{ inputs.recipe }}
         if [[ -f "$recipe_dir/build.py" ]]; then
           python3 "$recipe_dir/build.py"
         else
           bash "$recipe_dir/build.sh"
         fi
-        if [[ -d "$OUT_DIR/llvm-project" ]]; then
-          rm -rf "$GITHUB_WORKSPACE/llvm-project"
-          mv "$OUT_DIR/llvm-project" "$GITHUB_WORKSPACE/llvm-project"
+        if [[ -d "$OUT_DIR/install" ]]; then
+          rm -rf "$GITHUB_WORKSPACE/install"
+          mv "$OUT_DIR/install" "$GITHUB_WORKSPACE/install"
         fi
 
     - name: Fail on miss when build-on-miss=false
@@ -240,5 +240,5 @@ runs:
       env:
         HIT: ${{ steps.probe.outputs.hit }}
       run: |
-        echo "path=${{ github.workspace }}/llvm-project" >> "$GITHUB_OUTPUT"
+        echo "path=${{ github.workspace }}/install" >> "$GITHUB_OUTPUT"
         echo "cache-hit=${HIT}" >> "$GITHUB_OUTPUT"

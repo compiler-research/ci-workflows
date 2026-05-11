@@ -127,7 +127,7 @@ def main() -> int:
         compiler_rt_flags = []
 
     cmake_args = (
-        llvm_build.base_cmake_args(str(out_dir / "llvm-project"))
+        llvm_build.base_cmake_args(str(out_dir / "install"))
         + [f"-DLLVM_ENABLE_PROJECTS={projects}"]
         + compiler_rt_flags
         + llvm_build.cmake_extra()
@@ -169,7 +169,7 @@ def main() -> int:
     # clang at $LLVM/bin/llvm-jitlink-executor.
     src_jitlink = build_dir / "bin" / "llvm-jitlink-executor"
     if src_jitlink.is_file():
-        dst = out_dir / "llvm-project" / "bin" / "llvm-jitlink-executor"
+        dst = out_dir / "install" / "bin" / "llvm-jitlink-executor"
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(src_jitlink, dst)
         dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
