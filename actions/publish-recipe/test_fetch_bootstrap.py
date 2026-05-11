@@ -168,7 +168,7 @@ class MainTests(unittest.TestCase):
 
             # Simulate cache_download materialising the expected layout.
             def _materialise(base, key, out_dir):
-                bin_dir = Path(out_dir) / "llvm-project" / "bin"
+                bin_dir = Path(out_dir) / "install" / "bin"
                 bin_dir.mkdir(parents=True)
                 (bin_dir / "clang").write_text("#!/bin/false\n")
                 (bin_dir / "clang").chmod(0o755)
@@ -183,7 +183,7 @@ class MainTests(unittest.TestCase):
             # expected path needs the same resolution to compare on
             # macOS where /var symlinks to /private/var.
             expected_bin = (
-                download_dir.resolve() / "llvm-project" / "bin"
+                download_dir.resolve() / "install" / "bin"
             )
             self.assertEqual(out.strip(), str(expected_bin))
             # Verify compute_key.py was called with the bootstrap
@@ -218,7 +218,7 @@ class MainTests(unittest.TestCase):
             _write_recipe_yaml(recipe_dir, with_bootstrap=True)
 
             def _materialise(base, key, out_dir):
-                bin_dir = Path(out_dir) / "llvm-project" / "bin"
+                bin_dir = Path(out_dir) / "install" / "bin"
                 bin_dir.mkdir(parents=True)
                 (bin_dir / "clang").write_text("#!/bin/false\n")
                 (bin_dir / "clang").chmod(0o755)
@@ -231,7 +231,7 @@ class MainTests(unittest.TestCase):
             self.assertEqual(rc, 0, msg=err)
             expected_bin = (
                 (recipe_dir / "_bootstrap").resolve()
-                / "llvm-project" / "bin"
+                / "install" / "bin"
             )
             self.assertEqual(out.strip(), str(expected_bin))
 

@@ -123,7 +123,7 @@ def cmd_pack(args: argparse.Namespace) -> int:
     cache_dir = _cache_dir()
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pack the directory as if it were named llvm-project (matches what
+    # Pack the directory as if it were named install (matches what
     # build.sh would produce). Use tarfile directly with arcname so we
     # don't need to materialise a symlink (which doesn't work cleanly
     # on Windows for non-admins).
@@ -135,7 +135,7 @@ def cmd_pack(args: argparse.Namespace) -> int:
         )
         try:
             with tarfile.open(fileobj=zstd.stdin, mode="w|") as tar:
-                tar.add(src, arcname="llvm-project")
+                tar.add(src, arcname="install")
         finally:
             assert zstd.stdin is not None
             zstd.stdin.close()

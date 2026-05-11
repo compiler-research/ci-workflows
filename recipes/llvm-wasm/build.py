@@ -228,8 +228,8 @@ def main() -> int:
 
     trim_source_tree(repo)
 
-    # Move the trimmed tree to OUT_DIR/llvm-project for the publish step.
-    dst = out_dir / "llvm-project"
+    # Move the trimmed tree to OUT_DIR/install for the publish step.
+    dst = out_dir / "install"
     if dst.exists():
         shutil.rmtree(dst)
     shutil.move(str(repo), str(dst))

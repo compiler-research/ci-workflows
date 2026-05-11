@@ -83,7 +83,7 @@ def main() -> int:
     # - compiler-rt is enabled solely for orc_rt_<platform>, which the
     #   OOP-JIT path needs; everything else under compiler-rt is OFF.
     cmake_args = (
-        llvm_build.base_cmake_args(str(out_dir / "llvm-project"))
+        llvm_build.base_cmake_args(str(out_dir / "install"))
         + [
             '-DLLVM_ENABLE_PROJECTS=clang;compiler-rt',
             '-DLLVM_USE_SANITIZER=Address;Undefined',
@@ -133,7 +133,7 @@ def main() -> int:
     # consumers find it next to clang at $LLVM/bin/llvm-jitlink-executor.
     src_jitlink = build_dir / "bin" / "llvm-jitlink-executor"
     if src_jitlink.is_file():
-        dst = out_dir / "llvm-project" / "bin" / "llvm-jitlink-executor"
+        dst = out_dir / "install" / "bin" / "llvm-jitlink-executor"
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(src_jitlink, dst)
         dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)

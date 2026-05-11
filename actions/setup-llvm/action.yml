@@ -23,7 +23,7 @@ description: |
 
     'cling'   Recipe `llvm-root` plus a cling-on-top build.
 
-  All paths land at $GITHUB_WORKSPACE/llvm-project. The `source`
+  All paths land at $GITHUB_WORKSPACE/install. The `source`
   output reports which path won.
 
   If the install ships <install>/etc/cmake-toolchain.cmake, this
@@ -102,7 +102,7 @@ outputs:
     description: '"recipe-cache" | "inline-build" | "package-manager"'
     value: ${{ steps.finalize.outputs.source }}
   prefix:
-    description: 'Install prefix (always $GITHUB_WORKSPACE/llvm-project).'
+    description: 'Install prefix (always $GITHUB_WORKSPACE/install).'
     value: ${{ steps.finalize.outputs.prefix }}
 
 runs:
@@ -216,8 +216,8 @@ runs:
         # invokes setup-llvm twice) leave a real directory or stale
         # symlink at this path, and `ln -s` over a non-symlink
         # directory fails on both GNU and BSD ln.
-        rm -rf "${GITHUB_WORKSPACE}/llvm-project"
-        ln -s "/usr/lib/llvm-${VERSION}" "${GITHUB_WORKSPACE}/llvm-project"
+        rm -rf "${GITHUB_WORKSPACE}/install"
+        ln -s "/usr/lib/llvm-${VERSION}" "${GITHUB_WORKSPACE}/install"
         echo "::notice::flavor=system: apt-llvm.org llvm-${VERSION} on ${codename}"
 
     - name: System install (Homebrew)
@@ -236,8 +236,8 @@ runs:
         # brew's llvm@N formula bundles compiler-rt as part of the
         # install, so no separate runtime probe needed (unlike
         # apt-llvm.org's split libclang-rt-N-dev package).
-        rm -rf "${GITHUB_WORKSPACE}/llvm-project"
-        ln -s "${prefix}" "${GITHUB_WORKSPACE}/llvm-project"
+        rm -rf "${GITHUB_WORKSPACE}/install"
+        ln -s "${prefix}" "${GITHUB_WORKSPACE}/install"
         echo "::notice::flavor=system: brew llvm@${VERSION} at ${prefix}"
 
     # Recipe path (everything except flavor=system): delegate to
@@ -282,7 +282,7 @@ runs:
         else
           ncpus=$(nproc)
         fi
-        LLVM_PREFIX="${GITHUB_WORKSPACE}/llvm-project"
+        LLVM_PREFIX="${GITHUB_WORKSPACE}/install"
         rm -rf cling
         if [[ -n "${CLING_REF}" ]]; then
           git clone --depth=1 -b "${CLING_REF}" "${CLING_REPO}" cling
@@ -313,7 +313,7 @@ runs:
       run: |
         $ErrorActionPreference = 'Stop'
         $ncpus = [Environment]::ProcessorCount
-        $LLVM_PREFIX = "$env:GITHUB_WORKSPACE\llvm-project"
+        $LLVM_PREFIX = "$env:GITHUB_WORKSPACE\install"
         if (Test-Path cling) { Remove-Item -Recurse -Force cling }
         if ($env:CLING_REF) {
           git clone --depth=1 -b $env:CLING_REF $env:CLING_REPO cling
@@ -347,7 +347,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        tc="${GITHUB_WORKSPACE}/llvm-project/etc/cmake-toolchain.cmake"
+        tc="${GITHUB_WORKSPACE}/install/etc/cmake-toolchain.cmake"
         if [[ -f "$tc" ]]; then
           echo "CMAKE_TOOLCHAIN_FILE=$tc" >> "$GITHUB_ENV"
           echo "::notice title=setup-llvm::recipe ships cmake-toolchain.cmake; CMAKE_TOOLCHAIN_FILE=$tc"
@@ -369,5 +369,5 @@ runs:
           src=inline-build
         fi
         echo "source=${src}"                            >> "$GITHUB_OUTPUT"
-        echo "prefix=${GITHUB_WORKSPACE}/llvm-project"  >> "$GITHUB_OUTPUT"
-        echo "::notice title=setup-llvm::flavor=${FLAVOR:-llvm-release} source=${src} prefix=${GITHUB_WORKSPACE}/llvm-project"
+        echo "prefix=${GITHUB_WORKSPACE}/install"  >> "$GITHUB_OUTPUT"
+        echo "::notice title=setup-llvm::flavor=${FLAVOR:-llvm-release} source=${src} prefix=${GITHUB_WORKSPACE}/install"

@@ -54,8 +54,8 @@ unattended runs stay clean.
 
 Pre-flight workspace clash check: bin/repro mounts the consumer's
 working tree into the act container. If a top-level dir matching a
-known offender (`build/`, `llvm-project/`) already exists, the
-workflow's `mkdir build` / setup-recipe's `mv ../llvm-project` will
+known offender (`build/`, `install/`) already exists, the
+workflow's `mkdir build` / setup-recipe's `mv ../install` will
 trip under `set -e` before any actionable error appears. The
 pre-flight lists the colliding paths and refuses to proceed by
 default. Move them aside (`mv build build.local`) or pass
@@ -79,7 +79,7 @@ consumer working tree, however, accumulates whatever the workflow
 writes into $GITHUB_WORKSPACE -- act bind-mounts the working tree
 into the container, so `mkdir build`, setup-recipe's `mv ../llvm-
 project`, etc. land directly on the host. The workspace-clash
-pre-flight (above) catches the resulting `build/` / `llvm-project/`
+pre-flight (above) catches the resulting `build/` / `install/`
 on the next run; clean them up by hand if you want a pristine tree.
 
 Anything after `--` is passed verbatim to act.
@@ -947,7 +947,7 @@ DEVSHELL_RUNNER_WORKSPACE = "/home/runner/work/ci-workflows/ci-workflows"
 DEVSHELL_CCACHE_SUBDIR    = ".ccache"
 DEVSHELL_SRC_SUBDIR       = "_recipe_work/llvm-project"
 DEVSHELL_BUILD_SUBDIR     = "_recipe_work/llvm-project/build"
-DEVSHELL_INSTALL_SUBDIR   = "_recipe_out/llvm-project"
+DEVSHELL_INSTALL_SUBDIR   = "_recipe_out/install"
 
 DEVSHELL_CONFIG_SCRIPT = REPO_ROOT / "scripts" / "repro-config"
 
@@ -1058,10 +1058,10 @@ def _devshell_fetch(base: str, key: str, work: Path,
     ccache_root = work
     manifest = work / "manifest.json"
 
-    # Install tree: archive's top-level dir is `llvm-project/`, so
+    # Install tree: archive's top-level dir is `install/`, so
     # extracting to `<work>/_recipe_out/` lands the install at
-    # `<work>/_recipe_out/llvm-project/`.
-    install_root = install_parent / "llvm-project"
+    # `<work>/_recipe_out/install/`.
+    install_root = install_parent / "install"
     if refetch or not install_root.is_dir():
         if install_parent.is_dir():
             shutil.rmtree(install_parent)
@@ -1406,7 +1406,10 @@ def _confirm(prompt: str, default: bool = True) -> bool:
 # we don't care about. Add names here when a new clash bites someone.
 _LIKELY_CLASH_DIRS = (
     "build",
-    "llvm-project",
+    "install",       # setup-recipe's extract target.
+    "llvm-project",  # consumer workflows (CppInterOp main.yml et al.)
+                     # clone llvm-project at workspace root; independent
+                     # clash, not redundant with `install` above.
 )
 
 

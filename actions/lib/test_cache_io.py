@@ -100,10 +100,10 @@ def _have_zstd() -> bool:
 @unittest.skipUnless(_have_zstd(), "zstd not available")
 class CachePackRoundTripTests(unittest.TestCase):
     def _make_install_tree(self, root: Path) -> None:
-        (root / "llvm-project" / "lib").mkdir(parents=True)
-        (root / "llvm-project" / "lib" / "libfoo.a").write_bytes(b"binary")
-        (root / "llvm-project" / "include").mkdir()
-        (root / "llvm-project" / "include" / "foo.h").write_text("hdr\n")
+        (root / "install" / "lib").mkdir(parents=True)
+        (root / "install" / "lib" / "libfoo.a").write_bytes(b"binary")
+        (root / "install" / "include").mkdir()
+        (root / "install" / "include" / "foo.h").write_text("hdr\n")
 
     def test_pack_extract_diff(self):
         with tempfile.TemporaryDirectory() as d:
@@ -124,11 +124,11 @@ class CachePackRoundTripTests(unittest.TestCase):
             cache_io.cache_download(f"file://{out_dir}", "k", str(extract))
 
             self.assertEqual(
-                (extract / "llvm-project" / "include" / "foo.h").read_text(),
+                (extract / "install" / "include" / "foo.h").read_text(),
                 "hdr\n",
             )
             self.assertEqual(
-                (extract / "llvm-project" / "lib" / "libfoo.a").read_bytes(),
+                (extract / "install" / "lib" / "libfoo.a").read_bytes(),
                 b"binary",
             )
 
