@@ -1,0 +1,26 @@
+recipe: cpython-debug
+description: |
+  CPython built with --with-pydebug + --with-trace-refs +
+  --with-assertions. Enables sys.gettotalrefcount(), per-object
+  death-row introspection (sys.getobjects()), and the PYMEM_DEBUG
+  allocator's poison-pattern sentinels. Use to catch refcount /
+  lifetime / GIL bugs that the optimised CPython hides at runtime
+  -- for example, the GIL-acquire fix in CPyCppyy commit 2e4b14c
+  ("acquire GIL when invoking a Python callback from C++") would
+  have aborted with `Fatal Python error: PyEval_SaveThread: NULL
+  tstate` against a debug interpreter, at the source line of the
+  unprotected call, instead of segfaulting on a release build deep
+  in JITted code.
+
+  Debug ABI is incompatible with release ABI: a C extension built
+  against this libpython needs this libpython at runtime, and vice
+  versa. Consumers pick exactly one CPython flavour per venv; do
+  not mix.
+
+# Only fields read by build_manifest.py / publish-recipe live here.
+# CPython's autotools pipeline (the configure flags, the make
+# install command) is authoritative in build.py; duplicating it
+# here as decorative metadata would silently drift.
+source:
+  repo: https://github.com/python/cpython
+  branch_template: v{version}
