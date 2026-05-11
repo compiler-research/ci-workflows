@@ -1,0 +1,86 @@
+name: keep-cache-warm
+
+# GHA cache has two eviction policies: a 10 GB per-repo pool with
+# LRU, and a 7-day inactivity TTL per entry. Recipes whose content
+# hash hasn't shifted and whose cell hasn't been consumed in a week
+# silently lose their ccache snapshot to the TTL.
+#
+# This workflow visits every cell's ccache key on a 5-day cadence,
+# refreshing access time. `lookup-only: true` skips the tarball
+# download; the API query alone is what bumps last-accessed.
+#
+# Does not address the 10 GB LRU -- that needs ccache to move off
+# the GHA pool onto Releases (sibling .ccache.tar.zst asset already
+# scaffolded in actions/lib/cache_io.py). TTL-only stopgap.
+
+on:
+  schedule:
+    # Every 5 days at 04:00 UTC. 5-day cadence under the 7-day TTL
+    # leaves 2 days for cron jitter / runner backlog before any
+    # cell ages out.
+    - cron: '0 4 */5 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  enumerate-keys:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.compute.outputs.matrix }}
+      empty: ${{ steps.compute.outputs.empty }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: compute
+        run: |
+          set -euo pipefail
+          # One matrix entry per cell. Key formula matches publish-recipe's
+          # restore key (`ccache-` prepended to compute-key.py's output)
+          # so a touch here refreshes exactly the entry publish-recipe
+          # writes.
+          entries=()
+          while IFS= read -r cell; do
+            [ -z "$cell" ] && continue
+            recipe=$(echo "$cell" | jq -r .recipe)
+            version=$(echo "$cell" | jq -r .version)
+            os=$(echo "$cell"     | jq -r .os)
+            arch=$(echo "$cell"   | jq -r .arch)
+            content_key=$(python3 actions/setup-recipe/compute_key.py \
+                          "$recipe" "$version" "$os" "$arch" | sed 's/^key=//')
+            ccache_key="ccache-${content_key}"
+            entries+=("$(jq -nc \
+              --arg os "$os" --arg arch "$arch" --arg key "$ccache_key" \
+              '{os:$os, arch:$arch, key:$key}')")
+          done < <(yq -o=json -I=0 '.cells[]' cells.yaml)
+
+          if [ ${#entries[@]} -eq 0 ]; then
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "empty=true"              >> "$GITHUB_OUTPUT"
+            echo "::notice::no cells in cells.yaml; nothing to touch"
+          else
+            matrix=$(printf '%s\n' "${entries[@]}" | jq -s -c '{include: .}')
+            echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+            echo "empty=false"    >> "$GITHUB_OUTPUT"
+            echo "::notice::touching ${#entries[@]} ccache key(s)"
+          fi
+
+  touch:
+    needs: enumerate-keys
+    if: needs.enumerate-keys.outputs.empty != 'true'
+    strategy:
+      # One leg per cell so each runs on the OS that produced the key
+      # (GHA cache is scoped per-OS by runner image).
+      fail-fast: false
+      matrix: ${{ fromJson(needs.enumerate-keys.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Refresh ${{ matrix.key }}
+        # lookup-only: no tarball download; the cache API query alone
+        # bumps the entry's last-accessed timestamp.
+        uses: actions/cache/restore@v4
+        with:
+          path: .keep-cache-warm-noop
+          key: ${{ matrix.key }}
+          lookup-only: true
