@@ -39,6 +39,11 @@ cells:
   # llvm-wasm: Linux x86_64 first; macOS / Windows added once the
   # recipe's bash-via-subprocess emsdk activation is validated there.
   - { recipe: llvm-wasm,  version: '22',            os: ubuntu-24.04,    arch: x86_64 }
+  # cpython-debug: --with-pydebug + --with-trace-refs + --with-assertions.
+  # Linux x86_64 only -- macOS / Windows have stock CPython via the
+  # platform package manager; the CI cost of building debug Python on
+  # those isn't yet justified.
+  - { recipe: cpython-debug, version: '3.14.3',    os: ubuntu-24.04,    arch: x86_64 }
   # llvm-release: vanilla LLVM/Clang for the latest major across every
   # supported runner image. setup-llvm's default flavor pulls these
   # cells; consumers asking for older majors pick `flavor: system`,
