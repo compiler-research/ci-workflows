@@ -254,8 +254,14 @@ runs:
     # x os x arch x recipe-content), so a PR that touches recipe.yaml /
     # build.{sh,py} / patches / actions/lib gets its own entry; a PR
     # that doesn't simply hits main's. No timestamp-suffixed pile-up.
+    #
+    # always(): a mid-build failure or job cancellation still persists
+    # whatever ccache had written, so the next attempt isn't a cold
+    # rebuild. ccache writes are rename-into-cache and atomic, so the
+    # partial cache is safe to reuse. Runner-death (OOM, network drop)
+    # is still lost; the post-step doesn't run there.
     - name: Save ccache
-      if: steps.skip.outputs.exists != 'true' && steps.ccache.outputs.cache-hit != 'true'
+      if: always() && steps.skip.outputs.exists != 'true' && steps.ccache.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
       with:
         path: ${{ github.workspace }}/.ccache
