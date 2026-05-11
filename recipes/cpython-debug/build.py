@@ -80,7 +80,7 @@ def main() -> int:
     ncpus = os.environ["NCPUS"]
 
     src_dir = work_dir / "cpython"
-    install_prefix = out_dir / "cpython"
+    install_prefix = out_dir / "install"
 
     os.chdir(work_dir)
     llvm_build.clone_shallow(CPYTHON_REPO, f"v{version}", src_dir)

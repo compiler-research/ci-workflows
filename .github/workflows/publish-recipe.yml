@@ -89,10 +89,15 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     outputs:
-      # Matrix `include:` JSON. Empty when every cell is already
-      # published — the publish-on-push job skips itself in that case.
-      matrix: ${{ steps.compute.outputs.matrix }}
-      empty: ${{ steps.compute.outputs.empty }}
+      # Two matrices. Bootstrap cells = recipes without a `bootstrap:`
+      # field in recipe.yaml (build standalone). Dependent cells =
+      # recipes that declare a bootstrap; they must wait for their
+      # provider's cell to be in cache. Empty flag short-circuits the
+      # paired publish-on-push-* job when nothing needs building.
+      bootstrap_matrix: ${{ steps.compute.outputs.bootstrap_matrix }}
+      dependent_matrix: ${{ steps.compute.outputs.dependent_matrix }}
+      bootstrap_empty:  ${{ steps.compute.outputs.bootstrap_empty }}
+      dependent_empty:  ${{ steps.compute.outputs.dependent_empty }}
     steps:
       - uses: actions/checkout@v4
       - id: compute
@@ -100,7 +105,8 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          todo=()
+          bootstraps=()
+          dependents=()
           # `yq -o=json -I=0 '.cells[]'` emits one compact JSON object per
           # cell, one per line — safe to read with `while IFS= read -r`.
           while IFS= read -r cell; do
@@ -114,33 +120,79 @@ jobs:
             url="https://github.com/${REPO}/releases/download/cache/${key}.tar.zst"
             if curl -fsLI "$url" >/dev/null 2>&1; then
               echo "::notice::cache hit, skipping: ${key}"
+              continue
+            fi
+            echo "::notice::needs build: ${key}"
+            # Cells whose recipe declares `bootstrap:` depend on the
+            # bootstrap provider's cell being in cache (fetch_bootstrap
+            # probes Releases). Split here so bootstrap cells get warmed
+            # before any dependent cell tries to fetch them.
+            if yq -e '.bootstrap' "recipes/$recipe/recipe.yaml" >/dev/null 2>&1; then
+              dependents+=("$cell")
             else
-              echo "::notice::needs build: ${key}"
-              todo+=("$cell")
+              bootstraps+=("$cell")
             fi
           done < <(yq -o=json -I=0 '.cells[]' cells.yaml)
 
-          if [ ${#todo[@]} -eq 0 ]; then
-            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
-            echo "empty=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::all cells already cached; no per-cell jobs to spawn"
+          if [ ${#bootstraps[@]} -eq 0 ]; then
+            echo "bootstrap_matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "bootstrap_empty=true"              >> "$GITHUB_OUTPUT"
           else
-            matrix=$(printf '%s\n' "${todo[@]}" | jq -s -c '{include: .}')
-            echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-            echo "empty=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::${#todo[@]} cell(s) to (re)build"
+            m=$(printf '%s\n' "${bootstraps[@]}" | jq -s -c '{include: .}')
+            echo "bootstrap_matrix=${m}"  >> "$GITHUB_OUTPUT"
+            echo "bootstrap_empty=false"  >> "$GITHUB_OUTPUT"
+          fi
+          if [ ${#dependents[@]} -eq 0 ]; then
+            echo "dependent_matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "dependent_empty=true"              >> "$GITHUB_OUTPUT"
+          else
+            m=$(printf '%s\n' "${dependents[@]}" | jq -s -c '{include: .}')
+            echo "dependent_matrix=${m}"  >> "$GITHUB_OUTPUT"
+            echo "dependent_empty=false"  >> "$GITHUB_OUTPUT"
           fi
 
-  publish-on-push:
+          tot=$((${#bootstraps[@]} + ${#dependents[@]}))
+          if [ "$tot" -eq 0 ]; then
+            echo "::notice::all cells already cached; no per-cell jobs to spawn"
+          else
+            echo "::notice::${#bootstraps[@]} bootstrap + ${#dependents[@]} dependent cell(s) to (re)build"
+          fi
+
+  publish-on-push-bootstrap:
     needs: read-cells
-    if: github.event_name == 'push' && needs.read-cells.outputs.empty != 'true'
+    if: github.event_name == 'push' && needs.read-cells.outputs.bootstrap_empty != 'true'
     # No templated `name:`. Same reason as publish-dispatch: on the
     # pull_request trigger this job is skipped, and a `${{ matrix.* }}`
     # template in `name:` would render unresolved on the Skipped row.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.read-cells.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.read-cells.outputs.bootstrap_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/install-build-deps
+      - uses: ./actions/publish-recipe
+        with:
+          recipe: ${{ matrix.recipe }}
+          version: ${{ matrix.version }}
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
+
+  publish-on-push-dependent:
+    # Wait for the bootstrap phase even when it has nothing to do
+    # (`success() || skipped()`) -- dependents may still need to run.
+    # If a bootstrap leg failed, don't start dependents that would
+    # immediately fetch_bootstrap-miss against an unpublished provider.
+    needs: [read-cells, publish-on-push-bootstrap]
+    if: |
+      github.event_name == 'push' &&
+      needs.read-cells.outputs.dependent_empty != 'true' &&
+      (needs.publish-on-push-bootstrap.result == 'success' ||
+       needs.publish-on-push-bootstrap.result == 'skipped')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.read-cells.outputs.dependent_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/install-build-deps
