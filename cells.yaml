@@ -36,9 +36,15 @@ cells:
   # MSan-instrumented libc++ stage build cleanly (libcxxabi-on-Mach-O
   # uses Apple's libunwind), and Windows lacks MSan support upstream.
   - { recipe: llvm-msan,  version: '22',            os: ubuntu-24.04,    arch: x86_64 }
-  # llvm-wasm: Linux x86_64 first; macOS / Windows added once the
-  # recipe's bash-via-subprocess emsdk activation is validated there.
+  # llvm-wasm: cells cover CppInterOp's Unix emscripten rows.
+  # build.py's emsdk install/activate goes through `subprocess.run`
+  # against the extensionless `emsdk` script, which only resolves
+  # under bash; the per-major patch glob is OS-agnostic. The Windows
+  # row in CppInterOp's matrix still inline-builds via build-on-miss
+  # until the recipe grows `emsdk.bat`/`.ps1` plumbing.
   - { recipe: llvm-wasm,  version: '22',            os: ubuntu-24.04,    arch: x86_64 }
+  - { recipe: llvm-wasm,  version: '22',            os: ubuntu-24.04-arm, arch: arm64  }
+  - { recipe: llvm-wasm,  version: '22',            os: macos-26,        arch: arm64  }
   # cpython-debug: --with-pydebug + --with-trace-refs + --with-assertions.
   # Linux x86_64 only -- macOS / Windows have stock CPython via the
   # platform package manager; the CI cost of building debug Python on
