@@ -28,6 +28,7 @@ on:
         options:
           - llvm-asan
           - llvm-msan
+          - cpython-asan
           - cpython-debug
       version:
         type: string
