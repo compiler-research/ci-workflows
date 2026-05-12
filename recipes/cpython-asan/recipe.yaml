@@ -1,0 +1,22 @@
+recipe: cpython-asan
+description: |
+  CPython built with --with-address-sanitizer +
+  --with-undefined-behavior-sanitizer. Catches use-after-free /
+  heap-overflow / misaligned access at the Python↔C boundary --
+  the C++-only asan rows do not exercise PyObject lifetime,
+  refcount/proxy logic in `_cppyy.so`, or the wrapper-call paths
+  cppyy generates from Python type info.
+
+  Downstream consumers build their native extensions with
+  -fsanitize=address,undefined and load them into this
+  interpreter. The two asan runtimes unify only when the
+  downstream compiler family matches the one this cell was built
+  with (system clang on the standard runner image); mixing
+  gcc-asan with clang-asan trips the init-order check at load
+  time. Sanitised ABI is also incompatible with release ABI:
+  consumers pick exactly one CPython flavour per venv.
+
+# Only fields read by build_manifest.py / publish-recipe live here.
+source:
+  repo: https://github.com/python/cpython
+  branch_template: v{version}

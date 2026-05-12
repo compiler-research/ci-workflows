@@ -1,0 +1,167 @@
+name: 'Setup CPython'
+description: |
+  Resolves a sanitised CPython by `flavor`. Each flavor maps to a
+  cpython-* recipe; the install lands at $GITHUB_WORKSPACE/install
+  (same layout setup-llvm uses, so a matrix row can stack both
+  actions without colliding on prefix). Flavor table:
+
+    'asan'    Recipe cpython-asan. Address+Undefined sanitised.
+    'debug'   Recipe cpython-debug. Py_DEBUG / trace-refs.
+
+  The two are mutually exclusive at venv level (sanitised and
+  debug ABIs are not interchangeable, and an extension built
+  against one libpython will not load into the other). Consumers
+  pick exactly one per matrix row.
+
+  Side effects on $GITHUB_PATH / $GITHUB_ENV:
+    PATH                gets <prefix>/bin prepended so `python<M.N>`
+                        resolves without per-step plumbing.
+    LD_LIBRARY_PATH     <prefix>/lib so --enable-shared finds
+                        libpython3.<N>.so.
+    Python3_ROOT_DIR    <prefix> so `find_package(Python3)` resolves
+                        without consumer hint.
+    PYTHON_EXECUTABLE   <prefix>/bin/python<M.N>; convention used by
+                        autotools / scikit-build / setuptools.
+    ASAN_OPTIONS=detect_leaks=0  (asan flavor only) — Python's
+                        intentional interning at shutdown would
+                        otherwise exit 23 before consumer assertions
+                        get a chance to run.
+
+inputs:
+  version:
+    required: true
+    description: |
+      CPython version, e.g. "3.14.3". Must match a cell in
+      cells.yaml for the chosen flavor.
+  os:
+    required: true
+    description: |
+      Runner-image slug for the cache key (e.g. "ubuntu-24.04").
+      Must match what publish-recipe used.
+  arch:
+    required: false
+    default: ''
+    description: |
+      Architecture slug; empty derives from the `os` slug using the
+      same mapping setup-llvm applies (macos-N-intel → x86_64,
+      macos-N → arm64, *-arm → arm64, else x86_64).
+  flavor:
+    required: true
+    description: |
+      Selects the CPython source. One of: 'asan' (cpython-asan
+      recipe), 'debug' (cpython-debug recipe). No default — the
+      sanitised builds have visibly different ABIs and a silent
+      fall-through would mask a matrix typo.
+  build-on-miss:
+    required: false
+    default: 'false'
+    description: |
+      Forwarded to setup-recipe. Default 'false' — fail fast with
+      a publish-recipe hint when the cell is unwarmed; rebuilding
+      CPython inline on every PR defeats the cache.
+  ref:
+    required: false
+    default: 'main'
+    description: 'ci-workflows ref for setup-recipe to read recipes/ from.'
+  cache-base:
+    required: false
+    default: ''
+    description: |
+      Forwarded to setup-recipe. Empty uses the upstream Releases
+      cache; set to file:///abs/path or https://lab.local/recipes/
+      to point at a private backend.
+
+outputs:
+  source:
+    description: '"recipe-cache" | "inline-build"'
+    value: ${{ steps.finalize.outputs.source }}
+  prefix:
+    description: 'Install prefix (always $GITHUB_WORKSPACE/install).'
+    value: ${{ steps.finalize.outputs.prefix }}
+  python:
+    description: 'Path to the python<M.N> executable inside the install.'
+    value: ${{ steps.finalize.outputs.python }}
+  python-version:
+    description: 'Major.minor of the installed Python, e.g. "3.14".'
+    value: ${{ steps.finalize.outputs.python-version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve flavor → recipe
+      id: resolve
+      shell: bash
+      env:
+        FLAVOR: ${{ inputs.flavor }}
+        ARCH_IN: ${{ inputs.arch }}
+        OS: ${{ inputs.os }}
+      run: |
+        set -euo pipefail
+        case "${FLAVOR}" in
+          asan)  recipe=cpython-asan  ;;
+          debug) recipe=cpython-debug ;;
+          *) echo "::error::unknown flavor '${FLAVOR}' (expected: 'asan', 'debug')" >&2
+             exit 1 ;;
+        esac
+        # Arch derivation mirrors setup-llvm exactly so the two
+        # actions are interchangeable from a matrix's point of view.
+        if [[ -n "${ARCH_IN}" ]]; then
+          arch="${ARCH_IN}"
+        else
+          case "${OS}" in
+            macos-*-intel) arch=x86_64 ;;
+            macos-*)       arch=arm64  ;;
+            *-arm)         arch=arm64  ;;
+            *)             arch=x86_64 ;;
+          esac
+        fi
+        echo "recipe=$recipe" >> "$GITHUB_OUTPUT"
+        echo "arch=$arch"     >> "$GITHUB_OUTPUT"
+
+    - name: Recipe (cache or inline build)
+      id: recipe
+      uses: compiler-research/ci-workflows/actions/setup-recipe@main
+      with:
+        recipe:        ${{ steps.resolve.outputs.recipe }}
+        version:       ${{ inputs.version }}
+        os:            ${{ inputs.os }}
+        arch:          ${{ steps.resolve.outputs.arch }}
+        build-on-miss: ${{ inputs.build-on-miss }}
+        ref:           ${{ inputs.ref }}
+        cache-base:    ${{ inputs.cache-base }}
+
+    - name: Finalize outputs + env
+      id: finalize
+      shell: bash
+      env:
+        FLAVOR: ${{ inputs.flavor }}
+        VERSION: ${{ inputs.version }}
+        RECIPE_HIT: ${{ steps.recipe.outputs.cache-hit }}
+      run: |
+        set -euo pipefail
+        prefix="${GITHUB_WORKSPACE}/install"
+        major_minor="$(echo "${VERSION}" | awk -F. '{print $1"."$2}')"
+        python="${prefix}/bin/python${major_minor}"
+        # Fail loudly if the recipe's install layout drifted; a
+        # missing launcher is a contract break, not a soft warning.
+        if [[ ! -x "$python" ]]; then
+          echo "::error::expected $python after recipe install" >&2
+          exit 1
+        fi
+        if [[ "${RECIPE_HIT}" == "true" ]]; then
+          src=recipe-cache
+        else
+          src=inline-build
+        fi
+        echo "${prefix}/bin"                 >> "$GITHUB_PATH"
+        echo "LD_LIBRARY_PATH=${prefix}/lib" >> "$GITHUB_ENV"
+        echo "Python3_ROOT_DIR=${prefix}"    >> "$GITHUB_ENV"
+        echo "PYTHON_EXECUTABLE=${python}"   >> "$GITHUB_ENV"
+        if [[ "${FLAVOR}" == "asan" ]]; then
+          echo "ASAN_OPTIONS=detect_leaks=0" >> "$GITHUB_ENV"
+        fi
+        echo "source=${src}"                 >> "$GITHUB_OUTPUT"
+        echo "prefix=${prefix}"              >> "$GITHUB_OUTPUT"
+        echo "python=${python}"              >> "$GITHUB_OUTPUT"
+        echo "python-version=${major_minor}" >> "$GITHUB_OUTPUT"
+        echo "::notice title=setup-cpython::flavor=${FLAVOR} source=${src} python=${python}"
