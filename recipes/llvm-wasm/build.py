@@ -2,11 +2,24 @@
 """Builds an LLVM/Clang install tree cross-compiled for wasm32 via emsdk.
 
 Recipe-specific bits live here (emsdk install/activate, source clone,
-patch application, native-tblgen bootstrap, emcmake/emmake, source-tree
-trim). The shared install-tree publish flow's helpers (env validation,
-SRC_COMMIT recording) come from actions/lib/llvm_build.py; the wasm
-artifact is the trimmed source+build tree, not a cmake --install tree,
-so the LLVM_DISTRIBUTION_COMPONENTS / smoke() path doesn't apply.
+patch application, native-tblgen bootstrap, emcmake/emmake, two
+cmake --install passes). Shared scaffolding (env validation,
+SRC_COMMIT recording, LLVM_DISTRIBUTION_COMPONENTS plumbing) comes
+from actions/lib/llvm_build.py.
+
+Layout shipped under OUT_DIR/install/:
+  native_build/ -- host install tree: tblgen binaries, transitive
+                   LLVM libs (LLVMSupport, LLVMTableGen, ...), cmake
+                   configs. Bootstraps the consumer's host
+                   cppinterop-tblgen via find_package(LLVM).
+  build/        -- wasm install tree: clang*/LLVM* libs built for
+                   wasm32-unknown-emscripten, cmake configs, headers.
+                   Consumer uses for find_package(LLVM/Clang) under
+                   emcmake.
+
+Both trees use cmake --install with relocatable cmake configs
+(LLVMTargets.cmake derives prefix from ${CMAKE_CURRENT_LIST_DIR}),
+so the asset extracts to any consumer workspace path correctly.
 
 Inputs (env): see actions/lib/llvm_build.py docstring.
   RECIPE_VERSION         major LLVM version (release/{version}.x).
@@ -22,7 +35,6 @@ from __future__ import annotations
 import glob
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -51,13 +63,21 @@ COMMON_FLAGS: list[str] = [
     "-DLLVM_BUILD_TOOLS=OFF",
     "-DCLANG_BUILD_TOOLS=OFF",
     "-DCLANG_ENABLE_STATIC_ANALYZER=OFF",
-    "-DCLANG_ENABLE_ARCMT=OFF",
+    # CLANG_ENABLE_ARCMT was deprecated in clang 22 (ARCMigrate removed);
+    # CLANG_ENABLE_OBJC_REWRITER is the supported successor.
+    "-DCLANG_ENABLE_OBJC_REWRITER=OFF",
     "-DCLANG_ENABLE_BOOTSTRAP=OFF",
     # emscripten libc lacks wait4; redirect to the syscall wrapper.
     "-DCMAKE_CXX_FLAGS=-Dwait4=__syscall_wait4",
     "-DCMAKE_C_FLAGS_RELEASE=-Oz -g0 -DNDEBUG",
     "-DCMAKE_CXX_FLAGS_RELEASE=-Oz -g0 -DNDEBUG",
     "-DLLVM_ENABLE_LTO=Full",
+    # cmake's default RPATH model relinks at install time. Wasm32 isn't
+    # ELF, so Ninja refuses to emit the relink rule and the generate step
+    # errors out on every executable/library install rule (llvm-tblgen,
+    # libclang, ...) even when LLVM_BUILD_TOOLS=OFF skips the actual build.
+    # No RPATH is consumed on wasm anyway; bake it at link time and skip.
+    "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
 ]
 
 # Targets to build for the wasm cell. Matches CppInterOp's
@@ -120,33 +140,59 @@ def run_in_emsdk(cmd: list[str], emsdk_dir: Path, cwd: Path) -> None:
     )
 
 
-def trim_source_tree(repo: Path) -> None:
-    """Drop everything from llvm-project/ except build/ + native_build/
-    + the trimmed llvm/ and clang/ subtrees (include + cmake only).
+def _walk_built_libs(build_dir: Path) -> list[str]:
+    """Return clang*/LLVM* component names for every .a in build_dir/lib/."""
+    out: list[str] = []
+    lib = build_dir / "lib"
+    if not lib.is_dir():
+        return out
+    for f in sorted(lib.iterdir()):
+        name = f.name
+        if not name.endswith(".a"):
+            continue
+        base = name[3:] if name.startswith("lib") else name
+        base = base[:-2]
+        # libclang.a's cmake target is `libclang` (lib prefix is part of
+        # the target name). Stripping it collapses to bare `clang`, which
+        # cmake then resolves to the clang-driver executable component
+        # that CLANG_BUILD_TOOLS=OFF skips -- install-clang doesn't exist
+        # and the DIST step errors with "doesn't have an install target".
+        if base == "clang":
+            base = "libclang"
+        # lld* covers liblldCommon.a / liblldWasm.a / liblldELF.a; LLVM 22
+        # added them as transitive deps of clangInterpreter, so omitting
+        # them from DIST trips ClangTargets export with "requires target
+        # lldWasm which is not in any export set".
+        if (base.startswith("clang") or base.startswith("LLVM")
+                or base.startswith("lld") or base == "libclang"):
+            out.append(base)
+    return out
 
-    Source-tree `lib/` dirs hold .cpp that's already linked into
-    build/lib/*.a; nothing on the consumer include path references them.
+
+def _native_dist_components(build_dir: Path) -> list[str]:
+    """Host-stage DIST: tblgens + cmake-exports + llvm-headers + every
+    built LLVM*/clang* lib. Drops `clangInterpreter` and `clang` (not
+    built on the host bootstrap) and `llvm-config` (the consumer's
+    find_package path doesn't need it).
     """
-    keep_top = {"build", "llvm", "clang", "native_build"}
-    for entry in repo.iterdir():
-        if entry.name in keep_top:
-            continue
-        if entry.is_dir():
-            shutil.rmtree(entry, ignore_errors=True)
-        else:
-            entry.unlink(missing_ok=True)
-    keep_sub = {"include", "cmake"}
-    for d in ("llvm", "clang"):
-        sub = repo / d
-        if not sub.is_dir():
-            continue
-        for entry in sub.iterdir():
-            if entry.name in keep_sub:
-                continue
-            if entry.is_dir():
-                shutil.rmtree(entry, ignore_errors=True)
-            else:
-                entry.unlink(missing_ok=True)
+    return [
+        "llvm-tblgen", "clang-tblgen",
+        "cmake-exports", "llvm-headers",
+    ] + _walk_built_libs(build_dir)
+
+
+def _wasm_dist_components(build_dir: Path) -> list[str]:
+    """Wasm-stage DIST: clang headers + cmake-exports + libs we built.
+    LLVM_BUILD_TOOLS=OFF / CLANG_BUILD_TOOLS=OFF skip host binaries
+    (llvm-tblgen, clang-tblgen, llvm-config, clang) so they're absent
+    from the dist set -- including them would fail
+    `ninja install-X` at file-not-found.
+    """
+    return [
+        "clang-headers", "clang-cmake-exports", "clang-resource-headers",
+        "clangInterpreter",
+        "cmake-exports", "llvm-headers",
+    ] + _walk_built_libs(build_dir)
 
 
 def main() -> int:
@@ -172,6 +218,10 @@ def main() -> int:
     repo = work_dir / "llvm-project"
     apply_patches(repo, version)
 
+    install_root = out_dir / "install"
+    native_install = install_root / "native_build"
+    wasm_install = install_root / "build"
+
     # Native tblgen bootstrap. emcmake's wasm clang can't build host
     # binaries; LLVM_NATIVE_TOOL_DIR points at this directory.
     native_build = repo / "native_build"
@@ -181,6 +231,7 @@ def main() -> int:
          "-DLLVM_ENABLE_PROJECTS=clang",
          "-DLLVM_TARGETS_TO_BUILD=host",
          "-DCMAKE_BUILD_TYPE=Release",
+         f"-DCMAKE_INSTALL_PREFIX={native_install}",
          "-G", "Ninja",
          "../llvm"],
         check=True, cwd=native_build,
@@ -191,11 +242,29 @@ def main() -> int:
          "--parallel", ncpus],
         check=True, cwd=native_build,
     )
+    # Install host tree with a tailored DIST: skip the consumer-tier
+    # components (clang, clangInterpreter) the bootstrap doesn't need.
+    # `cwd` switch is required: run_install_distribution operates on `.`.
+    os.chdir(native_build)
+    llvm_build.run_install_distribution(
+        ";".join(_native_dist_components(native_build))
+    )
+    os.chdir(work_dir)
 
     build = repo / "build"
     build.mkdir(exist_ok=True)
+    # LLVM_TABLEGEN / CLANG_TABLEGEN are explicit binary paths; setting
+    # them bypasses the nested `build/NATIVE/` sub-cmake that
+    # LLVM_NATIVE_TOOL_DIR alone doesn't always suppress. The nested
+    # configure was failing on its own RPATH-at-install rules (mirrors
+    # the issue CMAKE_BUILD_WITH_INSTALL_RPATH=ON fixes for the outer
+    # build). CROSS_TOOLCHAIN_FLAGS_NATIVE forwards the same RPATH flag
+    # as a defensive measure if any other nested configure still fires.
     cmake_args = list(COMMON_FLAGS) + [
-        f"-DLLVM_NATIVE_TOOL_DIR={native_build / 'bin'}",
+        f"-DCMAKE_INSTALL_PREFIX={wasm_install}",
+        f"-DLLVM_TABLEGEN={native_install / 'bin' / 'llvm-tblgen'}",
+        f"-DCLANG_TABLEGEN={native_install / 'bin' / 'clang-tblgen'}",
+        "-DCROSS_TOOLCHAIN_FLAGS_NATIVE=-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
         "../llvm",
     ]
     llvm_build.record_cmake_args(["emcmake", "cmake", *cmake_args])
@@ -226,13 +295,11 @@ def main() -> int:
         check=True, cwd=build,
     )
 
-    trim_source_tree(repo)
-
-    # Move the trimmed tree to OUT_DIR/install for the publish step.
-    dst = out_dir / "install"
-    if dst.exists():
-        shutil.rmtree(dst)
-    shutil.move(str(repo), str(dst))
+    # Install wasm tree. install rules are pure file/cmake-config
+    # operations -- no emcc invocation needed beyond what WASM_TARGETS
+    # already built, so plain ninja (not emmake) is sufficient.
+    os.chdir(build)
+    llvm_build.run_install_distribution(";".join(_wasm_dist_components(build)))
 
     print(f"build.py: done. SRC_COMMIT={src_commit}", flush=True)
     return 0

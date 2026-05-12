@@ -7,11 +7,10 @@ description: |
   Two stages: (1) host llvm-tblgen + clang-tblgen under
   install/native_build/ -- the wasm clang cannot build host binaries,
   LLVM_NATIVE_TOOL_DIR points at this; (2) emcmake/emmake cross-build
-  under install/build/. Source-tree layout is preserved (not a cmake
-  install): consumers point at install/build/lib/cmake/ for
-  find_package and at install/{llvm,clang}/include for headers;
-  LLVM_DISTRIBUTION_COMPONENTS does not apply across the host/wasm
-  boundary.
+  under install/build/. Both stages run `cmake --install` via
+  LLVM_DISTRIBUTION_COMPONENTS so the shipped tree has relocatable
+  cmake configs (LLVMTargets.cmake uses ${CMAKE_CURRENT_LIST_DIR})
+  -- consumers extracting to any path get a working find_package(LLVM).
 
   Per-LLVM-major patches under patches/ apply by file glob
   (`emscripten-clang{N}-*.patch`); adding a new major needs no
