@@ -191,6 +191,12 @@ def _wasm_dist_components(build_dir: Path) -> list[str]:
     return [
         "clang-headers", "clang-cmake-exports", "clang-resource-headers",
         "clangInterpreter",
+        # lld-cmake-exports installs lib/cmake/lld/LLDConfig.cmake; without
+        # it, consumers passing `-DLLD_DIR=$LLVM_BUILD_DIR/lib/cmake/lld`
+        # hit `Could not find a package configuration file provided by "LLD"`.
+        # lld-headers ships include/lld/ for `#include "lld/..."` from the
+        # consumer side.
+        "lld-cmake-exports", "lld-headers",
         "cmake-exports", "llvm-headers",
     ] + _walk_built_libs(build_dir)
 
