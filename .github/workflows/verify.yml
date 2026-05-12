@@ -273,6 +273,8 @@ jobs:
         env:
           SOURCE: ${{ steps.first.outputs.source }}
           PREFIX: ${{ steps.first.outputs.prefix }}
+          LLVM_DIR_OUT: ${{ steps.first.outputs.llvm-dir }}
+          CLANG_DIR_OUT: ${{ steps.first.outputs.clang-dir }}
         run: |
           set -euo pipefail
           if [[ "$SOURCE" != "package-manager" ]]; then
@@ -288,6 +290,16 @@ jobs:
             ls -la "$PREFIX/lib/cmake/llvm/" || true
             exit 1
           }
+          # llvm-dir / clang-dir outputs match the documented formula.
+          [[ "$LLVM_DIR_OUT" == "$PREFIX/lib/cmake/llvm" ]] || {
+            echo "::error::llvm-dir output mismatch: $LLVM_DIR_OUT"; exit 1; }
+          [[ "$CLANG_DIR_OUT" == "$PREFIX/lib/cmake/clang" ]] || {
+            echo "::error::clang-dir output mismatch: $CLANG_DIR_OUT"; exit 1; }
+          # Env-var exports propagate to subsequent steps via $GITHUB_ENV.
+          [[ "$LLVM_DIR" == "$PREFIX/lib/cmake/llvm" ]] || {
+            echo "::error::LLVM_DIR env mismatch: $LLVM_DIR"; exit 1; }
+          [[ "$Clang_DIR" == "$PREFIX/lib/cmake/clang" ]] || {
+            echo "::error::Clang_DIR env mismatch: $Clang_DIR"; exit 1; }
           echo "::notice::flavor=system smoke OK: source=$SOURCE prefix=$PREFIX"
       - name: Idempotency (re-invoke against existing symlink)
         id: second
@@ -308,4 +320,3 @@ jobs:
             exit 1
           fi
           echo "::notice::flavor=system idempotency OK"
-

@@ -24,7 +24,10 @@ description: |
     'cling'   Recipe `llvm-root` plus a cling-on-top build.
 
   All paths land at $GITHUB_WORKSPACE/install. The `source`
-  output reports which path won.
+  output reports which path won; `prefix`, `llvm-dir`, `clang-dir`
+  outputs name the install layout. LLVM_DIR and Clang_DIR are also
+  exported via $GITHUB_ENV so consumer cmake steps can reference
+  them directly without pinning a step id.
 
   If the install ships <install>/etc/cmake-toolchain.cmake, this
   action exports CMAKE_TOOLCHAIN_FILE pointing at it -- consumers
@@ -104,6 +107,12 @@ outputs:
   prefix:
     description: 'Install prefix (always $GITHUB_WORKSPACE/install).'
     value: ${{ steps.finalize.outputs.prefix }}
+  llvm-dir:
+    description: 'LLVMConfig.cmake directory ($prefix/lib/cmake/llvm).'
+    value: ${{ steps.finalize.outputs.llvm-dir }}
+  clang-dir:
+    description: 'ClangConfig.cmake directory ($prefix/lib/cmake/clang).'
+    value: ${{ steps.finalize.outputs.clang-dir }}
 
 runs:
   using: composite
@@ -368,6 +377,13 @@ runs:
         else
           src=inline-build
         fi
-        echo "source=${src}"                            >> "$GITHUB_OUTPUT"
-        echo "prefix=${GITHUB_WORKSPACE}/install"  >> "$GITHUB_OUTPUT"
-        echo "::notice title=setup-llvm::flavor=${FLAVOR:-llvm-release} source=${src} prefix=${GITHUB_WORKSPACE}/install"
+        prefix="${GITHUB_WORKSPACE}/install"
+        llvm_dir="${prefix}/lib/cmake/llvm"
+        clang_dir="${prefix}/lib/cmake/clang"
+        echo "source=${src}"        >> "$GITHUB_OUTPUT"
+        echo "prefix=${prefix}"     >> "$GITHUB_OUTPUT"
+        echo "llvm-dir=${llvm_dir}" >> "$GITHUB_OUTPUT"
+        echo "clang-dir=${clang_dir}" >> "$GITHUB_OUTPUT"
+        echo "LLVM_DIR=${llvm_dir}"   >> "$GITHUB_ENV"
+        echo "Clang_DIR=${clang_dir}" >> "$GITHUB_ENV"
+        echo "::notice title=setup-llvm::flavor=${FLAVOR:-llvm-release} source=${src} prefix=${prefix}"
