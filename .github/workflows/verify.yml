@@ -238,17 +238,15 @@ jobs:
           test -f extract/install/lib/cmake/llvm/LLVMConfig.cmake
           echo "::notice::publish-dryrun OK on ${{ matrix.os }}"
 
-  # setup-llvm flavor=system smoke. Exercises the apt-llvm.org path
-  # with an older LLVM major (20) that's been stable on apt-llvm.org
-  # for noble for a long time, so the install should reliably succeed.
-  # Asserts:
-  #   - source output reports package-manager
-  #   - prefix is a symlink (not a real directory) — catches a
-  #     regression where the install lands at a real path
-  #   - LLVMConfig.cmake is reachable through it
-  # The second invocation step is a regression test for the
-  # symlink-over-directory bug: `ln` without `rm -rf` first fails on
-  # the second call when the first left a real symlink at the path.
+  # setup-llvm flavor=system smoke. Matrix covers both install paths:
+  #   - version 20 → not in noble archive → falls through to apt-llvm.org
+  #   - version 14 → in noble archive → exercises the direct-apt branch
+  # Asserts source output reports package-manager, prefix is a symlink
+  # (regression test for "install lands at a real path"), and
+  # LLVMConfig.cmake is reachable. The second invocation step is a
+  # regression test for the symlink-over-directory bug: `ln` without
+  # `rm -rf` first fails on the second call when the first left a real
+  # symlink at the path.
   #
   # Default-flavor smoke (recipe-cache path) is NOT included here:
   # setup-llvm's internal `uses: compiler-research/...@main` would
@@ -258,13 +256,17 @@ jobs:
   # the recipe path indirectly.
   setup-llvm-system-smoke:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['20', '14']
     steps:
       - uses: actions/checkout@v4
-      - name: flavor=system smoke (apt-llvm.org llvm-20)
+      - name: flavor=system smoke (llvm-${{ matrix.version }})
         id: first
         uses: ./actions/setup-llvm
         with:
-          version: '20'
+          version: ${{ matrix.version }}
           os: ubuntu-24.04
           arch: x86_64
           flavor: system
@@ -305,7 +307,7 @@ jobs:
         id: second
         uses: ./actions/setup-llvm
         with:
-          version: '20'
+          version: ${{ matrix.version }}
           os: ubuntu-24.04
           arch: x86_64
           flavor: system
