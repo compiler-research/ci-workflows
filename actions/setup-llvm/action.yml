@@ -179,10 +179,12 @@ runs:
         echo "recipe-version=${FLAVOR_VERSION:-$VERSION}"       >> "$GITHUB_OUTPUT"
         echo "arch=$arch"                                       >> "$GITHUB_OUTPUT"
 
-    # System path (Linux): apt-llvm.org. No fallback — if the major
-    # isn't available, the action fails so the consumer knows their
-    # matrix row needs a different flavor or a different version.
-    - name: System install (apt-llvm.org)
+    # System path (Linux): try the ubuntu archive first (covers old
+    # versions that live there: jammy ships llvm-11..14, noble starts
+    # at 17 in the archive), fall back to apt-llvm.org for majors the
+    # archive doesn't carry. Mirrors the install ladder consumers
+    # had inline before this action existed.
+    - name: System install (apt)
       if: inputs.flavor == 'system' && runner.os == 'Linux'
       shell: bash
       env:
@@ -194,11 +196,19 @@ runs:
           echo "::error::no UBUNTU_CODENAME in /etc/os-release; flavor=system requires an Ubuntu host" >&2
           exit 1
         fi
-        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
-          | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
-        echo "deb http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-${VERSION} main" \
-          | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
         sudo apt-get update -qq
+        # Try the ubuntu archive directly. `apt-cache show` is a
+        # release-data lookup (no install side effects, no sudo
+        # password prompt under set -e), so we can probe whether the
+        # archive has llvm-N-dev before deciding to add apt-llvm.org.
+        if ! apt-cache show "llvm-${VERSION}-dev" >/dev/null 2>&1; then
+          echo "::notice::llvm-${VERSION}-dev not in ${codename} archive; adding apt-llvm.org"
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-${VERSION} main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+          sudo apt-get update -qq
+        fi
         sudo apt-get install -y \
           llvm-${VERSION}-dev libclang-${VERSION}-dev clang-${VERSION} \
           libpolly-${VERSION}-dev libzstd-dev
@@ -227,7 +237,7 @@ runs:
         # directory fails on both GNU and BSD ln.
         rm -rf "${GITHUB_WORKSPACE}/install"
         ln -s "/usr/lib/llvm-${VERSION}" "${GITHUB_WORKSPACE}/install"
-        echo "::notice::flavor=system: apt-llvm.org llvm-${VERSION} on ${codename}"
+        echo "::notice::flavor=system: llvm-${VERSION} on ${codename}"
 
     - name: System install (Homebrew)
       if: inputs.flavor == 'system' && runner.os == 'macOS'
