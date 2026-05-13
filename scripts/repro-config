@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# bin/repro --devshell stages this inside the container and runs it.
-# Paths come from the env (DEVSHELL_SRC, DEVSHELL_BUILD, LLVM_PREFIX);
-# ccache knobs come from DEVSHELL_PRODUCER_COMPILER_CHECK + the
-# CCACHE_* vars bin/repro reads from the recipe's manifest. Idempotent:
-# tools install once, cmake configure no-ops when CMakeCache.txt exists.
+# bin/repro --devshell installs this at /usr/local/bin/devshell-repro-config
+# and runs it as root inside the container. Paths come from the env
+# (DEVSHELL_SRC, DEVSHELL_BUILD, LLVM_PREFIX); ccache knobs come from
+# DEVSHELL_PRODUCER_COMPILER_CHECK + the CCACHE_* vars bin/repro
+# reads from the recipe's manifest. Idempotent: tools install once,
+# cmake configure no-ops when CMakeCache.txt exists.
 
 set -e
 
@@ -13,8 +14,10 @@ if ! command -v ccache >/dev/null 2>&1; then
   # exactly: same compiler (clang) and same set of build deps the
   # publish-recipe pipeline used.
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    cmake ninja-build zstd ccache rsync clang libedit-dev git
+    cmake ninja-build zstd ccache rsync clang libedit-dev git sudo
 fi
+
+bash /usr/local/bin/devshell-init
 
 # Detect & install whatever libstdc++-N-dev the producer used. Read
 # CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES out of the manifest's

@@ -108,7 +108,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -153,16 +153,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "the docker exec command to re-enter it later.")
     p.add_argument("--devshell", action="store_true",
                    help="provision the recipe install + sibling ccache + "
-                        "matching LLVM source (per the manifest's "
-                        "SRC_COMMIT) into ~/.cache/ci-workflows/devshell/"
-                        "<cell>/ and drop into a container shell with "
-                        "CCACHE_DIR + CMAKE_*_COMPILER_LAUNCHER preset. "
-                        "Does NOT run the workflow -- this is the "
-                        "dev-bootstrap mode for editing LLVM source and "
-                        "rebuilding incrementally with ccache hits.")
+                        "matching LLVM source into a per-cell named "
+                        "docker volume and drop into a hermetic container "
+                        "shell (non-root, host UID/GID, $PWD bound at "
+                        "/patches). No host paths leak in except $PWD "
+                        "and (opt-in) --devshell-host-cache. Does NOT run "
+                        "the workflow.")
     p.add_argument("--devshell-refetch", action="store_true",
                    help="with --devshell: re-download install/ccache/"
-                        "manifest even if the local copy already exists.")
+                        "manifest even if the volume is already "
+                        "populated.")
     p.add_argument("--devshell-script", metavar="PATH",
                    help="with --devshell: instead of dropping into an "
                         "interactive shell, run this script (host path) "
@@ -172,8 +172,29 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "the default when this flag is omitted.")
     p.add_argument("--devshell-rm", action="store_true",
                    help="with --devshell: remove the persistent container "
-                        "and exit (does NOT delete ~/.cache/ci-workflows/"
-                        "devshell/<cell>/).")
+                        "and exit. Named volumes are kept (use "
+                        "`docker volume rm devshell-<cell>` to reclaim).")
+    p.add_argument("--devshell-host-cache", nargs="?",
+                   const="__default__", default=None, metavar="DIR",
+                   help="with --devshell: bind a single host directory "
+                        "at /cache for persistence and AI tooling. "
+                        "Bare flag uses ~/.cache/ci-workflows/"
+                        "devshell-cache/. Expected layout: "
+                        "cells/<cell-id>/{src,build,ccache}, "
+                        "ai/{skills,settings.json,memory/<repo>/<encoded>}.")
+    p.add_argument("--devshell-patches-out", metavar="DIR",
+                   help="with --devshell: host directory bound at "
+                        "/patches inside the container (rw). Defaults "
+                        "to the current working directory. AI writes "
+                        "patches here; you `git am` them on the host.")
+    p.add_argument("--devshell-image", metavar="IMAGE",
+                   help="with --devshell: container image (digest "
+                        "preferred). Defaults to the cell's OS-matched "
+                        "catthehacker tag.")
+    p.add_argument("--devshell-as-root", action="store_true",
+                   help="with --devshell: run as root inside the "
+                        "container. Escape hatch; files written to "
+                        "/patches will be root-owned on the host.")
 
     advanced = p.add_argument_group(
         "advanced",
@@ -928,28 +949,36 @@ def remove_container(cid: str) -> None:
 # --- devshell mode -------------------------------------------------------
 #
 # `bin/repro --devshell <cell>` provisions the cell's recipe install +
-# sibling ccache + matching LLVM source under a persistent host dir, then
-# drops into a container shell with CCACHE_DIR + CMAKE_*_COMPILER_LAUNCHER
-# preset. Devs editing LLVM source for cppyy/cppinterop debugging can
-# rebuild incrementally with ~all unmodified objects served from the
-# recipe's pre-warmed ccache.
+# sibling ccache + matching LLVM source into a per-cell named docker
+# volume, then drops into a hermetic container shell. The host sees
+# only $PWD (bound at /patches for the git-am handoff) and, if
+# --devshell-host-cache is given, a single cache directory (bound at
+# /cache) that carries persistent cell state and AI tooling.
 #
 # Distinct from the act-driven repro path: no workflow runs, no
-# nektos/act involvement, no GHA cache emulation. The container is a
-# bare runner image with the workdir bind-mounted.
+# nektos/act involvement, no GHA cache emulation.
 
-DEVSHELL_HOME = Path.home() / ".cache" / "ci-workflows" / "devshell"
-
-# Fallback bind-mount path for pre-#51 manifests that don't carry
-# build_env.ccache.base_dir. _devshell_workspace prefers the manifest
-# value when present.
+# Default location for --devshell-host-cache (bare flag). Layout:
+#   cells/<cell-id>/{src,build,ccache}
+#   ai/{skills,settings.json,memory/<repo>/<encoded-path>/}
+DEVSHELL_HOST_CACHE_DEFAULT = (
+    Path.home() / ".cache" / "ci-workflows" / "devshell-cache"
+)
+# Pre-#51 manifests that don't carry build_env.ccache.base_dir fall
+# back to this in-container workspace path. _devshell_workspace prefers
+# the manifest value when present so ccache keys match the producer.
 DEVSHELL_RUNNER_WORKSPACE = "/home/runner/work/ci-workflows/ci-workflows"
 DEVSHELL_CCACHE_SUBDIR    = ".ccache"
 DEVSHELL_SRC_SUBDIR       = "_recipe_work/llvm-project"
 DEVSHELL_BUILD_SUBDIR     = "_recipe_work/llvm-project/build"
 DEVSHELL_INSTALL_SUBDIR   = "_recipe_out/install"
 
+DEVSHELL_PATCHES_MOUNT = "/patches"
+DEVSHELL_CACHE_MOUNT   = "/cache"
+DEVSHELL_DEV_HOME      = "/home/dev"
+
 DEVSHELL_CONFIG_SCRIPT = REPO_ROOT / "scripts" / "repro-config"
+DEVSHELL_INIT_SCRIPT   = REPO_ROOT / "scripts" / "devshell-init"
 
 
 def _devshell_cell(args: argparse.Namespace) -> Dict[str, str]:
@@ -1159,6 +1188,10 @@ def _devshell_container_name(cell_id: str) -> str:
     return f"devshell-{cell_id}"
 
 
+def _devshell_volume_name(cell_id: str) -> str:
+    return f"devshell-{cell_id}"
+
+
 def _devshell_container_running(name: str) -> bool:
     r = subprocess.run(
         ["docker", "container", "inspect", "-f", "{{.State.Running}}", name],
@@ -1175,21 +1208,132 @@ def _devshell_container_exists(name: str) -> bool:
     return r.returncode == 0
 
 
-def _devshell_ensure_container(name: str, image: str, work: Path,
-                               manifest: Dict) -> None:
-    """Idempotently start a long-lived container named `name` with
-    `work` bind-mounted at the manifest's recorded workspace path and
-    the dev-env vars exported. Tool installation + build-dir configure
-    happens via scripts/repro-config -- see _devshell_run_config().
+def _devshell_volume_exists(name: str) -> bool:
+    r = subprocess.run(
+        ["docker", "volume", "inspect", name],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
+def _devshell_volume_has_manifest(volume: str, image: str, ws: str) -> bool:
+    """True iff a populated volume already carries the producer
+    manifest -- the gate for skipping the host-side fetch on re-entry.
+    """
+    r = subprocess.run(
+        ["docker", "run", "--rm", "-v", f"{volume}:{ws}",
+         image, "test", "-f", f"{ws}/manifest.json"],
+        capture_output=True,
+    )
+    return r.returncode == 0
+
+
+def _devshell_host_uid_gid() -> Tuple[int, int]:
+    """Host UID/GID for --user injection. Falls back to (1000, 1000)
+    on platforms without os.getuid (Windows): files in /patches would
+    still land owned by the host docker user in that case.
+    """
+    try:
+        return os.getuid(), os.getgid()
+    except AttributeError:
+        return 1000, 1000
+
+
+def _devshell_resolve_host_cache(args: argparse.Namespace) -> Optional[Path]:
+    """Map --devshell-host-cache (None/bare/explicit) to an absolute Path,
+    or None for the fully ephemeral default.
+    """
+    v = args.devshell_host_cache
+    if v is None:
+        return None
+    if v == "__default__":
+        return DEVSHELL_HOST_CACHE_DEFAULT
+    return Path(v).expanduser().resolve()
+
+
+def _devshell_resolve_patches_out(args: argparse.Namespace) -> Path:
+    """Resolve the host-side patches drop. Defaults to $PWD.
+
+    Refuses obviously-wrong choices ($HOME, root '/') so a stray
+    invocation can't accidentally pollute the host home dir with
+    container-written files.
+    """
+    raw = args.devshell_patches_out or os.getcwd()
+    p = Path(raw).expanduser().resolve()
+    if not p.is_dir():
+        sys.exit(f"error: --devshell-patches-out: {p} is not a directory")
+    home = Path.home().resolve()
+    if p == home:
+        sys.exit(f"error: --devshell-patches-out resolves to $HOME ({p}); "
+                 f"pick a project subdir or pass --devshell-patches-out "
+                 f"<dir> explicitly")
+    if str(p) in ("/", ""):
+        sys.exit(f"error: --devshell-patches-out resolves to '{p}'; refuse")
+    return p
+
+
+def _devshell_ai_repo_key(patches_out: PurePath) -> Tuple[str, str]:
+    """Repo basename + path-encoded host path for the AI memory key.
+
+    Matches claude's project-key encoding (`/` -> `-`); `as_posix()`
+    normalises Windows `\\` and the colon-replace keeps drive
+    letters from breaking the on-disk host-cache dir (`:` is illegal
+    in NTFS filenames).
+    """
+    repo = patches_out.name or "root"
+    encoded = patches_out.as_posix().replace(":", "-").replace("/", "-")
+    return repo, encoded
+
+
+def _devshell_ensure_volume(name: str) -> None:
+    if not _devshell_volume_exists(name):
+        subprocess.run(["docker", "volume", "create", name],
+                       check=True, stdout=subprocess.DEVNULL)
+
+
+def _devshell_seed_volume(volume: str, image: str, ws: str,
+                          src: Path) -> None:
+    """Copy `src`/. into the named volume at `ws`.
+
+    One-shot container, not host `tar` piped through stdin, so the
+    volume's owner+perms match what the long-lived devshell container
+    will see -- a host `cp` would tag everything with the host UID
+    and trip dev-user reads later.
+    """
+    subprocess.run(
+        ["docker", "run", "--rm",
+         "-v", f"{volume}:{ws}",
+         "-v", f"{src}:/seed:ro",
+         image,
+         "bash", "-c",
+         f"mkdir -p {ws} && cp -a /seed/. {ws}/"],
+        check=True, stdout=subprocess.DEVNULL,
+    )
+
+
+def _devshell_ensure_container(args: argparse.Namespace, name: str,
+                               image: str, ws: str, manifest: Dict,
+                               *, volume_name: Optional[str],
+                               work_host_bind: Optional[Path],
+                               host_cache: Optional[Path],
+                               patches_out: Path) -> None:
+    """Idempotently start the devshell container.
+
+    `volume_name` and `work_host_bind` are mutually exclusive: the
+    workspace at `ws` is backed either by a named docker volume
+    (hermetic default) or a host bind (--devshell-host-cache mode).
+    `host_cache`, when given, is additionally bound at /cache.
+    `patches_out` is always bound at /patches.
     """
     if _devshell_container_exists(name):
         if not _devshell_container_running(name):
             subprocess.run(["docker", "start", name], check=True,
                            stdout=subprocess.DEVNULL)
         return
-    ws = _devshell_workspace(manifest)
     cfg = _devshell_ccache_cfg(manifest)
     no_hash_dir = "true" if cfg.get("hash_dir") == "false" else "false"
+    uid, gid = _devshell_host_uid_gid()
+    repo, encoded = _devshell_ai_repo_key(patches_out)
     env_args: list[str] = [
         "-e", "CC=clang",
         "-e", "CXX=clang++",
@@ -1203,18 +1347,41 @@ def _devshell_ensure_container(name: str, image: str, work: Path,
         "-e", f"DEVSHELL_BUILD={ws}/{DEVSHELL_BUILD_SUBDIR}",
         "-e", f"DEVSHELL_MANIFEST={ws}/manifest.json",
         "-e", f"CCACHE_LOGFILE={ws}/{DEVSHELL_CCACHE_SUBDIR}/ccache.log",
+        "-e", f"HOME={DEVSHELL_DEV_HOME}",
+        "-e", f"DEVSHELL_DEV_HOME={DEVSHELL_DEV_HOME}",
+        "-e", f"DEVSHELL_DEV_UID={uid}",
+        "-e", f"DEVSHELL_DEV_GID={gid}",
+        "-e", f"DEVSHELL_PATCHES_MOUNT={DEVSHELL_PATCHES_MOUNT}",
+        "-e", f"DEVSHELL_AI_REPO={repo}",
+        "-e", f"DEVSHELL_AI_REPO_ENCODED={encoded}",
     ]
+    if host_cache is not None:
+        env_args += ["-e", f"DEVSHELL_CACHE_MOUNT={DEVSHELL_CACHE_MOUNT}"]
     cc = cfg.get("compiler_check", "")
     if cc and cc != "unknown":
         # Producer's ccache.compiler_check verbatim. repro-config
         # applies it on the consumer side and warns on $CC --version
         # divergence.
         env_args += ["-e", f"DEVSHELL_PRODUCER_COMPILER_CHECK={cc}"]
+
+    mount_args: list[str] = []
+    if volume_name is not None:
+        mount_args += ["-v", f"{volume_name}:{ws}"]
+    else:
+        assert work_host_bind is not None
+        mount_args += ["-v", f"{work_host_bind}:{ws}"]
+    mount_args += ["-v", f"{REPO_ROOT}:/ci-workflows:ro"]
+    mount_args += ["-v", f"{patches_out}:{DEVSHELL_PATCHES_MOUNT}"]
+    if host_cache is not None:
+        mount_args += ["-v", f"{host_cache}:{DEVSHELL_CACHE_MOUNT}"]
+
+    # Start as root: repro-config needs apt-install + chown. `--user`
+    # is deferred to the interactive `docker exec` so the AI runs as
+    # `dev`.
     subprocess.run(
         ["docker", "run", "-d",
          "--name", name,
-         "-v", f"{work}:{ws}",
-         "-v", f"{REPO_ROOT}:/ci-workflows:ro",
+         *mount_args,
          "-w", ws,
          *env_args,
          image, "sleep", "infinity"],
@@ -1222,41 +1389,62 @@ def _devshell_ensure_container(name: str, image: str, work: Path,
     )
 
 
-def _devshell_run_config(name: str, work: Path, manifest: Dict) -> None:
-    """Stage scripts/repro-config into /work and run it inside the
-    container. Idempotent on re-runs (script is no-op when build dir
-    already configured + tools already installed). Emits the hint
-    block for the dev to copy-paste.
+def _devshell_run_config(name: str, ws: str) -> None:
+    """Copy scripts/repro-config into the container and run it as root.
+
+    `docker cp` (not bind) keeps the script out of the workspace
+    volume -- the volume's contents should be exactly what the recipe
+    produced, plus user edits, nothing else. Idempotent on re-runs.
     """
-    if not DEVSHELL_CONFIG_SCRIPT.is_file():
-        sys.exit(f"error: {DEVSHELL_CONFIG_SCRIPT} not found "
-                 f"-- ci-workflows checkout incomplete?")
-    staged = work / "repro-config"
-    shutil.copy(DEVSHELL_CONFIG_SCRIPT, staged)
-    os.chmod(staged, 0o755)
-    ws = _devshell_workspace(manifest)
+    for src in (DEVSHELL_CONFIG_SCRIPT, DEVSHELL_INIT_SCRIPT):
+        if not src.is_file():
+            sys.exit(f"error: {src} not found "
+                     f"-- ci-workflows checkout incomplete?")
     subprocess.run(
-        ["docker", "exec", "-w", ws, name,
-         "bash", f"{ws}/repro-config"],
+        ["docker", "cp", str(DEVSHELL_CONFIG_SCRIPT),
+         f"{name}:/usr/local/bin/devshell-repro-config"],
+        check=True, stdout=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["docker", "cp", str(DEVSHELL_INIT_SCRIPT),
+         f"{name}:/usr/local/bin/devshell-init"],
+        check=True, stdout=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["docker", "exec", "-u", "0", "-w", ws, name,
+         "bash", "/usr/local/bin/devshell-repro-config"],
         check=True,
     )
+    # Self-check the hermetic-init outputs; failures here mean the
+    # dev user / mounts / AI symlinks are not in the state bin/repro
+    # promised. Cheap (~50ms) so we run every session.
+    r = subprocess.run(
+        ["docker", "exec", "-u", "0", name,
+         "bash", "/usr/local/bin/devshell-init", "--verify"],
+    )
+    if r.returncode != 0:
+        sys.exit(f"error: devshell-init --verify reported "
+                 f"{r.returncode} failure(s); container {name} is "
+                 f"not in the expected state")
 
 
 def cmd_devshell(args: argparse.Namespace) -> int:
     """Provision install + ccache + LLVM source for the cell, then
-    drop into a container shell. See module-level comment.
+    drop into the hermetic devshell container. See module-level
+    comment.
     """
     sys.path.insert(0, str(REPO_ROOT / "actions" / "lib"))
     import cache_io  # noqa: E402
 
     coord = _devshell_cell(args)
-    image = _devshell_image(coord["os"])
+    image = args.devshell_image or _devshell_image(coord["os"])
     key = _devshell_compute_key(coord)
     base = cache_io.resolve_cache_base()
 
     cell_id = "-".join(coord[k] for k in ("recipe", "version", "os", "arch"))
     name = _devshell_container_name(cell_id)
-    work = DEVSHELL_HOME / cell_id
+    volume = _devshell_volume_name(cell_id)
+    host_cache = _devshell_resolve_host_cache(args)
 
     if args.devshell_rm:
         if _devshell_container_exists(name):
@@ -1265,57 +1453,109 @@ def cmd_devshell(args: argparse.Namespace) -> int:
                            check=True, stdout=subprocess.DEVNULL)
         else:
             _log(f"repro: no container named {name}; nothing to remove")
-        _log(f"repro: workdir at {work} preserved")
+        if _devshell_volume_exists(volume):
+            _log(f"repro: volume {volume} preserved (docker volume rm "
+                 f"{volume} to reclaim)")
+        if host_cache is not None:
+            _log(f"repro: host cache {host_cache} preserved")
         return 0
 
-    work.mkdir(parents=True, exist_ok=True)
+    patches_out = _devshell_resolve_patches_out(args)
 
-    manifest = _devshell_fetch(base, key, work, args.devshell_refetch)
-    src_dir = _devshell_source(work, manifest)
+    using_host_cache = host_cache is not None
+    if using_host_cache:
+        host_cache.mkdir(parents=True, exist_ok=True)
+        (host_cache / "ai").mkdir(exist_ok=True)
+        stage = host_cache / "cells" / cell_id
+        stage.mkdir(parents=True, exist_ok=True)
+        manifest = _devshell_fetch(base, key, stage, args.devshell_refetch)
+        _devshell_source(stage, manifest)
+        ws = _devshell_workspace(manifest)
+        work_host_bind: Optional[Path] = stage
+        volume_for_container: Optional[str] = None
+    else:
+        # Default mode: workspace is a named docker volume. Stage the
+        # fetch in a host tempdir, then seed the volume via a one-shot
+        # container. The manifest must land on disk before container
+        # creation (it carries the workspace path that drives the
+        # bind target).
+        _devshell_ensure_volume(volume)
+        ws_probe_dir = Path(tempfile.mkdtemp(prefix="devshell-stage-"))
+        try:
+            manifest = _devshell_fetch(base, key, ws_probe_dir,
+                                       args.devshell_refetch)
+            ws = _devshell_workspace(manifest)
+            already_populated = (
+                not args.devshell_refetch
+                and _devshell_volume_has_manifest(volume, image, ws)
+            )
+            if already_populated:
+                _log(f"repro: volume {volume} already populated; "
+                     f"skipping host fetch")
+            else:
+                _devshell_source(ws_probe_dir, manifest)
+                _devshell_seed_volume(volume, image, ws, ws_probe_dir)
+        finally:
+            shutil.rmtree(ws_probe_dir, ignore_errors=True)
+        work_host_bind = None
+        volume_for_container = volume
 
     fresh = not _devshell_container_exists(name)
-    _devshell_ensure_container(name, image, work, manifest)
-    _devshell_run_config(name, work, manifest)
+    _devshell_ensure_container(
+        args, name, image, ws, manifest,
+        volume_name=volume_for_container,
+        work_host_bind=work_host_bind,
+        host_cache=host_cache,
+        patches_out=patches_out,
+    )
+    _devshell_run_config(name, ws)
 
-    ws = _devshell_workspace(manifest)
     _log("")
     _log(f"repro: --devshell ready ({cell_id})")
-    _log(f"  {ws}/{DEVSHELL_INSTALL_SUBDIR}")
-    _log(f"      <- {key}.tar.zst (install tree)")
-    _log(f"  {ws}/{DEVSHELL_CCACHE_SUBDIR}")
-    _log(f"      <- {key}.ccache.tar.zst (warm ccache, paths match recipe build)")
-    _log(f"  {ws}/{DEVSHELL_SRC_SUBDIR}")
-    _log(f"      <- {manifest['source']['repo']} @ "
-         f"{manifest['source']['commit'][:12]}")
-    _log(f"  container              {name} ({'fresh' if fresh else 'reused'})")
+    _log(f"  workspace ({ws}):")
+    if using_host_cache:
+        _log(f"      host bind: {work_host_bind}")
+    else:
+        _log(f"      volume:    {volume}")
+    _log(f"  patches drop ({DEVSHELL_PATCHES_MOUNT}):")
+    _log(f"      host bind: {patches_out}")
+    if host_cache is not None:
+        _log(f"  host cache ({DEVSHELL_CACHE_MOUNT}):")
+        _log(f"      host bind: {host_cache}")
+    _log(f"  container       {name} ({'fresh' if fresh else 'reused'})")
+    _log(f"  user            {'root' if args.devshell_as_root else 'dev (host UID/GID)'}")
     _log("")
     _log(f"repro: re-enter later with `bin/repro --devshell <cell>` "
-         f"or `docker exec -it {name} bash`")
-    _log(f"repro: tear down with `bin/repro --devshell --devshell-rm <cell>`")
+         f"or `docker exec -it -u dev -w {ws} {name} bash`")
+    _log(f"repro: tear down with `bin/repro --devshell --devshell-rm <cell>` "
+         f"(volume kept)")
     _log("")
 
+    exec_user = ["-u", "0"] if args.devshell_as_root else ["-u", "dev"]
+
     if args.devshell_script:
-        # Batch mode: stage the host script into the bind-mounted workdir
-        # so the container can exec it without a second mount, run it,
-        # exit with its rc. No interactive shell.
+        # /tmp keeps the script out of the workspace volume -- the
+        # volume should hold recipe output + user edits only.
         script_host = Path(args.devshell_script).resolve()
         if not script_host.is_file():
             sys.exit(f"error: --devshell-script: {script_host} not a file")
-        staged = work / ".devshell-script.sh"
-        shutil.copy(script_host, staged)
-        os.chmod(staged, 0o755)
+        subprocess.run(
+            ["docker", "cp", str(script_host),
+             f"{name}:/tmp/devshell-script.sh"],
+            check=True, stdout=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["docker", "exec", "-u", "0", name,
+             "chmod", "755", "/tmp/devshell-script.sh"],
+            check=True, stdout=subprocess.DEVNULL,
+        )
         _log(f"repro: running --devshell-script ({script_host.name})...")
         return subprocess.run(
-            ["docker", "exec", "-w", ws, name,
-             "bash", f"{ws}/.devshell-script.sh"]).returncode
+            ["docker", "exec", *exec_user, "-w", ws, name,
+             "bash", "/tmp/devshell-script.sh"]).returncode
 
-    # scripts/repro-config printed its own next-step hints above;
-    # don't duplicate. The quickstart-once marker is no longer
-    # needed.
-
-    return _run_interactive(["docker", "exec", "-it", name, "bash"])
-
-
+    return _run_interactive(
+        ["docker", "exec", "-it", *exec_user, "-w", ws, name, "bash"])
 
 
 def _container_tree_dirty(cid: str, workspace: str) -> bool:

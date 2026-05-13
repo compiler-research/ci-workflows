@@ -401,28 +401,106 @@ Either form works:
 The cell is validated against `cells.yaml`; a typo fails fast
 rather than 404'ing on Releases.
 
-### Workdir layout
+### Storage model — hermetic by default
 
-```
-~/.cache/ci-workflows/devshell/<cell>/
-  _recipe_out/llvm-project/        install tree (LLVM_PREFIX)
-  .ccache/                         producer's sibling ccache
-  _recipe_work/llvm-project/       shallow llvm-project @ SRC_COMMIT
-  manifest.json                    producer manifest
+The host sees only two paths from the running container:
+
+1. **`$PWD` bound at `/patches` (rw).** Always on. AI inside writes
+   `git format-patch -o /patches …`; you `git am` from `$PWD` on
+   the host with your own identity. Refuses to launch if `$PWD ==
+   $HOME` or resolves to `/`.
+2. **`<host-cache>` bound at `/cache` (rw).** Opt-in via
+   `--devshell-host-cache [DIR]`. Carries persistent per-cell state
+   AND the user's AI tooling. Layout:
+
+   ```
+   <host-cache>/                            default: ~/.cache/ci-workflows/devshell-cache/
+     cells/<cell-id>/                       per-cell working data
+       _recipe_out/install/                 install tree (LLVM_PREFIX)
+       .ccache/                             producer's sibling ccache
+       _recipe_work/llvm-project/           shallow llvm-project @ SRC_COMMIT
+       manifest.json                        producer manifest
+     ai/
+       skills/                              user-curated skills (consumed inside via ~/.claude/skills symlink)
+       settings.json                        user-curated settings (~/.claude/settings.json symlink)
+       memory/<repo>/<encoded-host-path>/   per-project AI memory (~/.claude/projects/-patches/memory symlink)
+   ```
+
+Everything else — sources, build dir, ccache when host-cache is off,
+shell history, container HOME — lives in a per-cell named docker
+volume `devshell-<cell-id>` or inside the container's writable
+layer. The volume survives `bin/repro --devshell --devshell-rm`;
+reclaim with `docker volume rm devshell-<cell-id>`.
+
+Inside the container the workspace is bind-mounted at the recipe's
+runner workspace path (read from `manifest.build_env.ccache.base_dir`),
+so ccache's recorded paths match the producer.
+
+### Trust model
+
+- No git identity is injected. The container has no `user.name`,
+  `user.email`, ssh keys, or gpg keys. `git clone/fetch` works over
+  public HTTPS; `git commit/push` will not (the AI must hand patches
+  to the host).
+- Default user is `dev` with host UID/GID. Files written to
+  `/patches` come out owned by the host user, so `git am` works
+  cleanly. `--devshell-as-root` is an escape hatch.
+
+### Recommended setup (copy-paste)
+
+The fastest path to a persistent, AI-enabled devshell. One-time
+host setup, then a per-session loop. Replace `<cell>` with your
+matrix-row name or `recipe/version/os/arch` coord, and
+`/path/to/project` with whichever working copy you're patching.
+
+```bash
+# --- one-time host setup ------------------------------------------------
+# Seed the host cache with your existing AI tooling. The container
+# symlinks ~/.claude/{skills,settings.json,projects/-patches/memory}
+# into this tree, so anything you put here is what the AI sees.
+HOST_CACHE=~/.cache/ci-workflows/devshell-cache
+mkdir -p "$HOST_CACHE/ai/skills" "$HOST_CACHE/ai/memory"
+cp -r ~/.claude/skills/.       "$HOST_CACHE/ai/skills/"   2>/dev/null || true
+cp    ~/.claude/settings.json  "$HOST_CACHE/ai/settings.json" 2>/dev/null || true
+
+# --- per-session loop ---------------------------------------------------
+cd /path/to/project                          # $PWD becomes /patches inside
+bin/repro --devshell --devshell-host-cache <cell>
+#   ... inside the container, run your AI of choice, iterate, then:
+#       cd $DEVSHELL_SRC && git format-patch -o /patches <range>
+#   ... exit when done.
+git am /path/to/project/*.patch              # apply with your host identity
+git push                                     # ...and ship as usual.
+
+# --- teardown (optional) ------------------------------------------------
+bin/repro --devshell --devshell-rm <cell>    # container only; volume kept
+# docker volume rm devshell-<cell-id>        # reclaim the volume too
 ```
 
-The container (`devshell-<cell>`) bind-mounts this directory at the
-recipe's runner workspace path (read from
-`manifest.build_env.ccache.base_dir`), so ccache's recorded paths
-match. Re-invoking `bin/repro <cell> --devshell` re-uses the
-container; `--devshell-rm` deletes it but keeps the workdir.
+What this gets you:
+
+- `cells/<cell-id>/` in the host cache persists src/build/ccache
+  across sessions and across `--devshell-rm` cycles. Subsequent
+  `bin/repro --devshell` re-enters in seconds, not minutes.
+- `ai/memory/<repo>/<encoded-path>/` accumulates your AI's per-project
+  knowledge on the host. It survives image rebuilds, machine moves,
+  and `docker volume rm`. Treat it as part of your dotfiles.
+- `ai/skills/` and `ai/settings.json` are the AI's personality. Curate
+  them on the host; the container picks them up via symlink and stays
+  hermetic.
+- `/patches` is the only rw bind besides `/cache`. The AI literally
+  cannot touch anything else on the host.
 
 ### Knobs
 
 | flag | effect |
 |------|--------|
-| `--devshell-rm` | remove the container; workdir is kept |
-| `--devshell-refetch` | re-download install/ccache/manifest |
+| `--devshell-rm` | remove the container; named volume + host cache are kept |
+| `--devshell-refetch` | re-download install/ccache/manifest into the volume / cache |
+| `--devshell-host-cache [DIR]` | bind a single host dir at `/cache`. Bare flag uses `~/.cache/ci-workflows/devshell-cache/`. Required for persistent AI state across sessions. |
+| `--devshell-patches-out DIR` | override the `/patches` bind. Defaults to `$PWD`. |
+| `--devshell-image IMAGE` | override the container image (prefer a digest pin). |
+| `--devshell-as-root` | run the interactive shell as root. Files in `/patches` will be root-owned on the host. |
 | `--devshell-script PATH` | run host PATH inside the container, exit with its rc (batch mode) |
 
 ### What `scripts/repro-config` does on entry
