@@ -21,31 +21,35 @@ name: publish-recipe
 #                       minutes rather than the half-hour cold cost.
 on:
   workflow_dispatch:
+    # Reissue any single cell declared in cells.yaml. Inputs are free-form
+    # strings (not hardcoded choices that drift from cells.yaml); the
+    # dispatch-validate job rejects anything that isn't a declared cell, so
+    # "supported" == "in cells.yaml" -- every matrix entry, every OS/arch.
     inputs:
       recipe:
-        type: choice
+        description: 'Recipe as in cells.yaml (e.g. llvm-release, llvm-asan, llvm-root, llvm-wasm).'
+        type: string
         required: true
-        options:
-          - llvm-asan
-          - llvm-msan
-          - cpython-asan
-          - cpython-debug
       version:
+        description: "Version/flavor as in cells.yaml (e.g. '22', 'ROOT-llvm20', 'cling-llvm20')."
         type: string
         required: true
         default: '22'
       os:
-        type: choice
+        description: 'Runner OS as in cells.yaml (e.g. ubuntu-24.04, windows-2025, macos-26, ubuntu-24.04-arm).'
+        type: string
         required: true
-        options:
-          - ubuntu-24.04
         default: ubuntu-24.04
       arch:
-        type: choice
+        description: 'Arch as in cells.yaml (x86_64 or arm64).'
+        type: string
         required: true
-        options:
-          - x86_64
         default: x86_64
+      force:
+        description: 'Rebuild and overwrite even if the cell is already published (otherwise a present asset is left untouched).'
+        type: boolean
+        required: false
+        default: false
   push:
     branches: [main]
     paths: &trigger_paths
@@ -68,8 +72,41 @@ permissions:
   contents: write   # release upload
 
 jobs:
+  # Validate the requested cell on a cheap Linux runner before allocating
+  # the (possibly Windows/macOS/arm) target runner. "Supported" means the
+  # exact {recipe, version, os, arch} tuple is declared in cells.yaml.
+  dispatch-validate:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject cells not declared in cells.yaml
+        env:
+          RECIPE: ${{ inputs.recipe }}
+          VERSION: ${{ inputs.version }}
+          OS: ${{ inputs.os }}
+          ARCH: ${{ inputs.arch }}
+        run: |
+          set -euo pipefail
+          match=$(yq -o=json -I=0 '.cells[]' cells.yaml \
+            | jq -rc --arg r "$RECIPE" --arg v "$VERSION" \
+                     --arg o "$OS" --arg a "$ARCH" \
+                'select(.recipe==$r and (.version|tostring)==$v
+                        and .os==$o and .arch==$a)')
+          if [ -z "$match" ]; then
+            echo "::error::{recipe=$RECIPE version=$VERSION os=$OS arch=$ARCH} is not a cell in cells.yaml"
+            {
+              echo "Supported cells (recipe version os arch):"
+              yq -o=json -I=0 '.cells[]' cells.yaml \
+                | jq -r '"  \(.recipe) \(.version) \(.os) \(.arch)"'
+            } >&2
+            exit 1
+          fi
+          echo "::notice::reissuing supported cell: $RECIPE $VERSION $OS $ARCH"
+
   publish-dispatch:
     if: github.event_name == 'workflow_dispatch'
+    needs: dispatch-validate
     # No templated `name:`. When the gate is false (push / pull_request),
     # GitHub still enumerates the job and renders any `${{ inputs.* }}`
     # in `name:` literally, producing a phantom Skipped row that reads
@@ -85,6 +122,7 @@ jobs:
           version: ${{ inputs.version }}
           os: ${{ inputs.os }}
           arch: ${{ inputs.arch }}
+          force: ${{ inputs.force }}
 
   read-cells:
     if: github.event_name == 'push'
