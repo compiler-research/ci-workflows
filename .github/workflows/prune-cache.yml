@@ -9,11 +9,16 @@ name: prune-cache
 #   1. Compute expected_keys = { compute-key for each cell in cells.yaml }.
 #   2. List existing assets on the rolling Release.
 #   3. orphans = existing − expected.
-#   4. Drop orphans whose age > caps.grace_days (so in-flight PRs that
-#      reference an old key aren't broken mid-run by the prune). On a
-#      manual run with force=true, grace is treated as zero and every
-#      orphan drops immediately.
-#   5. Tally remaining storage; warn over caps.soft_gb, fail over
+#   4. Protect orphans that are the *last usable asset of a live cell*:
+#      a cell still in cells.yaml whose current-key asset has not been
+#      (re)published yet. This protection is unconditional — even
+#      force=true honours it — because dropping such an orphan would
+#      leave the cell with zero artifacts and break every consumer.
+#   5. Drop the remaining orphans whose age > caps.grace_days (so
+#      in-flight PRs that reference an old key aren't broken mid-run by
+#      the prune). On a manual run with force=true, grace is treated as
+#      zero and every unprotected orphan drops immediately.
+#   6. Tally remaining storage; warn over caps.soft_gb, fail over
 #      caps.hard_gb.
 #
 # What grace_days protects: when a recipe build.sh is edited, the
@@ -22,8 +27,16 @@ name: prune-cache
 # edit and tested a day after still references the old key and pulls
 # the old asset. Holding orphans for `grace_days` (default 7) lets
 # those in-flight PRs finish before the asset disappears. The `force`
-# input bypasses this — only use it when intentionally evicting keys
-# even at the cost of breaking in-flight builds.
+# input bypasses grace — but not the step-4 last-usable-asset
+# protection — so it only evicts orphans that are safe to lose.
+#
+# Why step 4 exists: grace_days is a *time* bet that the new-key asset
+# lands within the window. Per-cell publish is best-effort
+# (fail-fast: false) and the slowest/flakiest cells (e.g. Windows LLVM)
+# can miss it; the weekly watchdog would then evict the old asset while
+# the new one never arrived, taking the cell to zero. Step 4 converts
+# that outage into graceful degradation: the cell keeps serving its
+# previous artifact until the current key is published.
 on:
   workflow_run:
     workflows: [publish-recipe]
@@ -123,6 +136,22 @@ jobs:
           # (Windows cells skip the .ccache.tar.zst sibling).
           asset_names=/tmp/asset_names.txt
           jq -r .name /tmp/existing_assets.jsonl > "$asset_names"
+          # --- Last-usable-asset protection (step 4) -------------------------
+          # A cell's "tuple prefix" is its key minus the trailing -<hash>.
+          # recipe/version/os/arch may contain '-', but compute_key's hash
+          # never does, so ${key%-*} is exactly the cell tuple.
+          #   live_tuples      = tuple of every cell in cells.yaml.
+          #   satisfied_tuples = live cells whose current-key asset is already
+          #                      present (their orphans are true duplicates).
+          # An orphan of a live-but-unsatisfied tuple is the cell's only
+          # surviving artifact and must not be dropped.
+          while IFS= read -r k; do echo "${k%-*}"; done \
+            < /tmp/expected_keys.txt | sort -u > /tmp/live_tuples.txt
+          sed -E 's/\.(ccache\.tar\.zst|tar\.zst|manifest\.json)$//' \
+            "$asset_names" | sort -u > /tmp/existing_keys.txt
+          grep -Fxf /tmp/expected_keys.txt /tmp/existing_keys.txt 2>/dev/null \
+            | while IFS= read -r k; do echo "${k%-*}"; done \
+            | sort -u > /tmp/satisfied_tuples.txt || true
           delete_if_exists() {
             local n="$1"
             if grep -qxF "$n" "$asset_names"; then
@@ -149,6 +178,17 @@ jobs:
             [ -n "${seen[$key]:-}" ] && continue
             seen[$key]=1
             if grep -qxF "$key" /tmp/expected_keys.txt; then
+              kept=$((kept + 1))
+              continue
+            fi
+            # Protect the last usable asset of a live cell (unconditional,
+            # even under force): the cell is still declared but its
+            # current-key asset hasn't been published yet, so this orphan
+            # is all that stands between consumers and a hard failure.
+            tuple="${key%-*}"
+            if grep -qxF "$tuple" /tmp/live_tuples.txt \
+                && ! grep -qxF "$tuple" /tmp/satisfied_tuples.txt; then
+              echo "::warning::keeping sole surviving asset for live cell '$tuple' (current-key artifact not yet published): $key"
               kept=$((kept + 1))
               continue
             fi

@@ -37,6 +37,15 @@ inputs:
       without touching Releases. Combined with the ccache-action
       restore above, builds that have a warm coarse-keyed ccache
       complete in minutes.
+  force:
+    required: false
+    default: 'false'
+    description: |
+      'true' rebuilds and re-uploads even when the asset for this key is
+      already published, bypassing the cache-hit skip. Use to reissue a
+      cell whose artifact is stale or corrupt (the upload already
+      --clobbers). The push path leaves this 'false' so steady-state
+      warming stays a no-op.
 
 runs:
   using: composite
@@ -77,6 +86,7 @@ runs:
         KEY: ${{ steps.compute-key.outputs.key }}
         EXPLICIT_BASE: ${{ inputs.cache-base }}
         DEFAULT_GH_BASE: https://github.com/${{ github.repository }}/releases/download/cache/
+        FORCE: ${{ inputs.force }}
       run: |
         # The default for the *publish* path is this repo's own Releases,
         # not the upstream ci-workflows one. cache_io.resolve_cache_base
@@ -85,7 +95,10 @@ runs:
         # URL when neither inputs nor env supply one.
         base="${EXPLICIT_BASE:-${RECIPE_CACHE_BASE:-$DEFAULT_GH_BASE}}"
         echo "base=$base" >> "$GITHUB_OUTPUT"
-        if python3 actions/lib/cache_io.py probe "$base" "$KEY"; then
+        if [ "$FORCE" = 'true' ]; then
+          echo "::notice::force=true; rebuilding key=${KEY} even if present"
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+        elif python3 actions/lib/cache_io.py probe "$base" "$KEY"; then
           echo "::notice::cache hit; skipping build for key=${KEY}"
           echo "exists=true" >> "$GITHUB_OUTPUT"
         else
