@@ -5,9 +5,8 @@ name: keep-cache-warm
 # hash hasn't shifted and whose cell hasn't been consumed in a week
 # silently lose their ccache snapshot to the TTL.
 #
-# This workflow visits every cell's ccache key on a 5-day cadence,
-# refreshing access time. `lookup-only: true` skips the tarball
-# download; the API query alone is what bumps last-accessed.
+# This workflow restores every cell's ccache entry on a 5-day cadence to
+# refresh its last-accessed time and outrun the TTL.
 #
 # Does not address the 10 GB LRU -- that needs ccache to move off
 # the GHA pool onto Releases (sibling .ccache.tar.zst asset already
@@ -77,10 +76,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Refresh ${{ matrix.key }}
-        # lookup-only: no tarball download; the cache API query alone
-        # bumps the entry's last-accessed timestamp.
+        # path must equal publish-recipe's save path: GHA keys an entry by
+        # (key, version) where version is hashed from `path`, so a wrong
+        # path refreshes an entry that was never written. A real restore
+        # (not lookup-only) ensures the access counts toward the TTL.
         uses: actions/cache/restore@v4
         with:
-          path: .keep-cache-warm-noop
+          path: ${{ github.workspace }}/.ccache
           key: ${{ matrix.key }}
-          lookup-only: true
