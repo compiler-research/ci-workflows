@@ -211,7 +211,15 @@ runs:
         fi
         sudo apt-get install -y \
           llvm-${VERSION}-dev libclang-${VERSION}-dev clang-${VERSION} \
-          libpolly-${VERSION}-dev libzstd-dev
+          libzstd-dev
+        # libpolly-N-dev: missing from some (codename, major) combos
+        # (e.g. jammy/llvm-13); apt-llvm.org carries it. Probe-and-skip
+        # so old-jammy rows don't fail on a Polly-less archive.
+        if apt-cache show "libpolly-${VERSION}-dev" >/dev/null 2>&1; then
+          sudo apt-get install -y "libpolly-${VERSION}-dev"
+        else
+          echo "::notice::libpolly-${VERSION}-dev not packaged for ${codename}; skipping (harmless unless the consumer links Polly)"
+        fi
         # libclang-rt-N-dev: ships compiler-rt's orc_rt + jitlink-executor
         # for the OOP-JIT runtime that LLVM >= 22 callers expect (matches
         # recipe llvm-release's compiler-rt branch). Hard-fail when
