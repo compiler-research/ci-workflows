@@ -129,6 +129,7 @@ def main() -> int:
     cmake_args = (
         llvm_build.base_cmake_args(str(out_dir / "install"))
         + [f"-DLLVM_ENABLE_PROJECTS={projects}"]
+        + llvm_build.dylib_flags()
         + compiler_rt_flags
         + llvm_build.cmake_extra()
         + ["../llvm"]

@@ -104,6 +104,20 @@ def record_src_commit(repo_path: Path) -> str:
     return sha
 
 
+def dylib_flags() -> List[str]:
+    """Ship libLLVM-N + libclang-cpp-N alongside the static archives so
+    plugins resolve the full symbol surface at load time. Returns [] on
+    Windows -- LLVM_LINK_LLVM_DYLIB is force-OFF there and setting
+    CLANG_LINK_CLANG_DYLIB=ON then trips clang's consistency check."""
+    if sys.platform == "win32":
+        return []
+    return [
+        "-DLLVM_BUILD_LLVM_DYLIB=ON",
+        "-DLLVM_LINK_LLVM_DYLIB=ON",
+        "-DCLANG_LINK_CLANG_DYLIB=ON",
+    ]
+
+
 def cmake_extra() -> List[str]:
     """Return cmake -D flags derived from CC/CXX/launcher env vars."""
     flags: List[str] = []
@@ -197,6 +211,20 @@ def install_distribution(extras: Optional[Sequence[str]] = None) -> None:
             base = base[:-2] if base.endswith(".a") else base[:-4]
             if base.startswith("clang") or base.startswith("LLVM"):
                 dist.append(base)
+    # Pick up umbrella dylibs when the recipe set LLVM_BUILD_LLVM_DYLIB /
+    # CLANG_LINK_CLANG_DYLIB. Their install components are the bare
+    # names 'LLVM' / 'clang-cpp'. Without them, every clangX/LLVMX export
+    # rule above references the aggregate target and cmake errors with
+    # "target LLVM is not in any export set". Read the cache rather than
+    # globbing lib/ -- dylib filenames vary across LLVM majors and
+    # platforms; the cmake variable is the source of truth.
+    cache = Path("CMakeCache.txt")
+    if cache.is_file():
+        text = cache.read_text()
+        if "LLVM_BUILD_LLVM_DYLIB:BOOL=ON" in text:
+            dist.append("LLVM")
+        if "CLANG_LINK_CLANG_DYLIB:BOOL=ON" in text:
+            dist.append("clang-cpp")
     if extras:
         dist.extend(extras)
     run_install_distribution(";".join(dist))
