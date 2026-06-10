@@ -29,6 +29,50 @@ sys.path.insert(0, str(SCRIPT_DIR / ".." / ".." / "actions" / "lib"))
 import llvm_build  # noqa: E402
 
 
+def _build_sanitizer_runtimes_into(src_dir: Path, build_dir: Path,
+                                   clang_bin: Path, ncpus: str) -> None:
+    """Build compiler-rt sanitizer runtimes with `clang_bin` and install
+    them next to that clang in its resource-dir."""
+    resource_dirs = sorted(
+        (clang_bin.parent / "lib" / "clang").glob("[0-9]*"),
+        key=lambda p: int(p.name),
+    )
+    if not resource_dirs:
+        print("build.py: recipe clang has no lib/clang/<N>/ "
+              "resource-dir; aborting", file=sys.stderr)
+        sys.exit(1)
+    install_prefix = resource_dirs[-1]
+
+    build_dir.mkdir(exist_ok=True)
+    subprocess.run(
+        ["cmake", "-G", "Ninja",
+         "-S", str(src_dir / "runtimes"),
+         "-B", str(build_dir),
+         f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
+         "-DCMAKE_BUILD_TYPE=Release",
+         f"-DCMAKE_C_COMPILER={clang_bin}/clang",
+         f"-DCMAKE_CXX_COMPILER={clang_bin}/clang++",
+         "-DLLVM_ENABLE_RUNTIMES=compiler-rt",
+         # Place runtimes at <prefix>/lib/<triple>/ where clang looks.
+         "-DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=ON",
+         "-DCOMPILER_RT_BUILD_BUILTINS=OFF",
+         "-DCOMPILER_RT_BUILD_LIBFUZZER=OFF",
+         "-DCOMPILER_RT_BUILD_PROFILE=OFF",
+         "-DCOMPILER_RT_BUILD_MEMPROF=OFF",
+         "-DCOMPILER_RT_BUILD_SANITIZERS=ON",
+         "-DCOMPILER_RT_BUILD_XRAY=OFF",
+         "-DCOMPILER_RT_BUILD_GWP_ASAN=OFF",
+         "-DCOMPILER_RT_BUILD_CTX_PROFILE=OFF"],
+        check=True,
+    )
+    # Headers ship sanitizer/*_interface.h that consumers #include.
+    subprocess.run(
+        ["ninja", "-C", str(build_dir), "-j", ncpus,
+         "install-compiler-rt", "install-compiler-rt-headers"],
+        check=True,
+    )
+
+
 def _oop_targets(build_dir: Path) -> list[str]:
     """Discover orc_rt_<platform> ninja targets in the configured build.
 
@@ -137,6 +181,18 @@ def main() -> int:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(src_jitlink, dst)
         dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    # Sanitizer runtimes weren't built above (SANITIZERS=OFF for
+    # the main stage); ship them now so consumers can link
+    # -fsanitize=address|undefined against this clang.
+    print("build.py: grafting compiler-rt sanitizer runtimes into "
+          "install tree", flush=True)
+    _build_sanitizer_runtimes_into(
+        src_dir=work_dir / "llvm-project",
+        build_dir=work_dir / "llvm-project" / "build_compiler_rt_install",
+        clang_bin=out_dir / "install" / "bin",
+        ncpus=ncpus,
+    )
 
     llvm_build.smoke()
 
