@@ -76,6 +76,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Refresh ${{ matrix.key }}
+        id: restore
         # path must equal publish-recipe's save path: GHA keys an entry by
         # (key, version) where version is hashed from `path`, so a wrong
         # path refreshes an entry that was never written. A real restore
@@ -84,3 +85,21 @@ jobs:
         with:
           path: ${{ github.workspace }}/.ccache
           key: ${{ matrix.key }}
+
+      # actions/cache/restore@v4 emits cache-hit=false silently on a
+      # miss; without this step the workflow stayed green even when no
+      # entries were actually touched. Failing the leg surfaces the
+      # dark cells on the cron run's history.
+      - name: Surface cache miss
+        shell: bash
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+          KEY: ${{ matrix.key }}
+        run: |
+          if [[ "$HIT" == "true" ]]; then
+            echo "::notice::refreshed $KEY"
+          else
+            echo "::error::no cache entry for $KEY (matched='$MATCHED'); the cell needs a fresh publish-recipe save"
+            exit 1
+          fi
