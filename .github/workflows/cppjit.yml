@@ -1,0 +1,128 @@
+name: CppJIT build and test (reusable)
+
+# Reusable (per matrix entry) single-cell workflow: builds CppJIT against a chosen CppInterOp
+# ref and runs its test suite. Callers own the matrix and fan out (one call per row):
+#   - cppjit's own ci.yml: the full supported matrix.
+#   - cppjit's nightly.yml: full matrix + sweeps + valgrind.
+#   - CppInterOp: 1-2 cells, passing its PR SHA as cppinterop-ref to
+#     verify the change doesn't break CppJIT downstream.
+
+on:
+  workflow_call:
+    inputs:
+      cppjit-repo:
+        type: string
+        default: compiler-research/cppjit
+        description: 'owner/repo of CppJIT to check out.'
+      cppjit-ref:
+        type: string
+        default: master
+        description: 'CppJIT git ref to check out.'
+      cppinterop-ref:
+        type: string
+        description: |
+          CppInterOp ref to build against (passed to ExternalProject).
+          Callers supply their own pinned commit/tag
+      os:
+        type: string
+        required: true
+        description: 'Runner image, e.g. ubuntu-24.04 | ubuntu-24.04-arm | macos-26 | macos-26-intel.'
+      llvm-version:
+        type: string
+        required: true
+        description: 'LLVM major: "20" | "21" | "22".'
+      llvm-flavor:
+        type: string
+        default: system
+        description: "setup-llvm flavor: 'system' (apt/brew, LLVM 20/21), '' (recipe cache, LLVM 22), or 'cling'."
+      llvm-flavor-version:
+        type: string
+        default: ''
+        description: "setup-llvm flavor-version (e.g. 'cling-llvm20' for flavor:cling); empty otherwise."
+      cling:
+        type: boolean
+        default: false
+        description: 'Build CppInterOp with Cling (CPPJIT_USE_CLING=ON, llvm-flavor: cling)'
+      python-version:
+        type: string
+        required: true
+        description: 'Python version for actions/setup-python.'
+      cxx-standard:
+        type: string
+        default: '20'
+        description: 'Runtime C++ standard ("17"/"20").'
+      valgrind:
+        type: boolean
+        default: false
+        description: 'Run the valgrind pass (Linux only).'
+      run-sweeps:
+        type: boolean
+        default: false
+        description: 'Run the xfail-crash and xfail->skipif sweeps.'
+      ci-workflows-ref:
+        type: string
+        default: main
+        description: 'ci-workflows ref setup-llvm reads recipes/ from (recipe flavors only).'
+    outputs:
+      result-summary:
+        description: 'Last line of the pytest summary for this cell.'
+        value: ${{ jobs.build-test.outputs.summary }}
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ${{ inputs.os }}
+    name: ${{ inputs.os }}-llvm${{ inputs.llvm-version }}-py${{ inputs.python-version }}-cxx${{ inputs.cxx-standard }}${{ inputs.valgrind && '-vg' || '' }}
+    outputs:
+      summary: ${{ steps.summary.outputs.line }}
+    steps:
+      - name: Checkout CppJIT
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.cppjit-repo }}
+          ref: ${{ inputs.cppjit-ref }}
+
+      - name: Setup Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Setup LLVM ${{ inputs.llvm-version }}
+        uses: compiler-research/ci-workflows/actions/setup-llvm@main
+        with:
+          version: ${{ inputs.llvm-version }}
+          os: ${{ inputs.os }}
+          flavor: ${{ inputs.llvm-flavor }}
+          flavor-version: ${{ inputs.llvm-flavor-version }}
+          ref: ${{ inputs.ci-workflows-ref }}
+
+      - name: Build and test
+        uses: compiler-research/ci-workflows/actions/build-and-test-cppjit@main
+        with:
+          cppinterop-ref: ${{ inputs.cppinterop-ref }}
+          cxx-standard: ${{ inputs.cxx-standard }}
+          llvm-version: ${{ inputs.llvm-version }}
+          valgrind: ${{ inputs.valgrind }}
+          run-sweeps: ${{ inputs.run-sweeps }}
+          cling: ${{ inputs.cling }}
+
+      - name: Capture summary
+        id: summary
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          line="$(cat "${GITHUB_WORKSPACE}/pytest-summary.txt" 2>/dev/null || echo 'no summary (build or setup failed)')"
+          # Always (re)write the file so a build-failed cell still uploads an artifact and shows in the report
+          printf '%s\n' "${line}" > "${GITHUB_WORKSPACE}/pytest-summary.txt"
+          echo "line=${line}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ inputs.os }}-llvm${{ inputs.llvm-version }}-py${{ inputs.python-version }}-cxx${{ inputs.cxx-standard }}${{ inputs.valgrind && '-vg' || '' }}
+          path: ${{ github.workspace }}/pytest-summary.txt
+          if-no-files-found: warn

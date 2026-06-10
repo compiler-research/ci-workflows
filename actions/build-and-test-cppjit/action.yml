@@ -1,0 +1,153 @@
+name: 'Build and test CppJIT'
+description: |
+  Builds CppJIT against a chosen CppInterOp ref and runs its test suite.
+  Expects setup-llvm to have exported LLVM_DIR, CppJIT checked out at
+  $GITHUB_WORKSPACE, and the target Python on PATH. Every cell parameter
+  is an explicit input (matrix context doesn't reach composite steps under
+  nektos/act).
+inputs:
+  cppinterop-ref:
+    required: false
+    description: |
+      CppInterOp ref to build CppJIT against. Unset (default) uses CppJIT's own
+      pinned CPPINTEROP_GIT_TAG which defines the current version/tag that CppJIT is based on
+  cxx-standard:
+    required: false
+    default: '20'
+    description: 'Runtime C++ standard ("17"/"20") (passed to CPPINTEROP_EXTRA_INTERPRETER_ARGS)'
+  cling:
+    required: false
+    default: 'false'
+    description: 'Build CppInterOp with Cling (CPPJIT_USE_CLING=ON, llvm-flavor: cling)'
+  llvm-version:
+    required: false
+    default: ''
+    description: 'LLVM major; selects the clangN valgrind suppression.'
+  valgrind:
+    required: false
+    default: 'false'
+    description: 'Run the valgrind pass ("true"/"false"), linux only.'
+  run-sweeps:
+    required: false
+    default: 'false'
+    description: 'Also run the disabled xfail crash/skipif tests'
+
+runs:
+  using: composite
+  steps:
+    - name: Install build and test dependencies
+      shell: bash
+      env:
+        VALGRIND: ${{ inputs.valgrind }}
+      run: |
+        set -euo pipefail
+        if [[ "${RUNNER_OS}" == "Linux" ]]; then
+          sudo apt-get update -qq
+          sudo apt-get install -y libboost-dev libeigen3-dev
+          if [[ "${VALGRIND}" == "true" ]]; then
+            sudo apt-get install -y valgrind libc6-dbg
+          fi
+        elif [[ "${RUNNER_OS}" == "macOS" ]]; then
+          brew install boost eigen gnu-sed
+        fi
+        python -m pip install --upgrade pip
+        # Test/CI deps come from the cppjit/requirements.txt
+        python -m pip install -r "${GITHUB_WORKSPACE}/requirements.txt"
+
+    - name: Build and install CppJIT
+      shell: bash
+      env:
+        CPPINTEROP_REF: ${{ inputs.cppinterop-ref }}
+        CLING: ${{ inputs.cling }}
+      run: |
+        set -euo pipefail
+        if [[ "${RUNNER_OS}" == "macOS" ]]; then
+          export CMAKE_BUILD_PARALLEL_LEVEL="$(sysctl -n hw.ncpu)"
+        else
+          export CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)"
+        fi
+        # Set CPPJIT_USE_CLING=ON for Cling (Cling_DIR auto-derives from LLVM_DIR,
+        # setup-llvm flavor:cling installs cling at the sibling cmake path).
+        # cppinterop-ref: overrides CPPINTEROP_GIT_TAG when explicitly specified (e.g for nightlies
+        # or testing a development branch), otherwise default to CppJIT's own pinned version 
+        EXTRA_ARGS=()
+        [[ "${CLING}" == "true" ]] && EXTRA_ARGS+=(--config-settings=cmake.define.CPPJIT_USE_CLING=ON)
+        [[ -n "${CPPINTEROP_REF}" ]] && EXTRA_ARGS+=(--config-settings=cmake.define.CPPINTEROP_GIT_TAG="${CPPINTEROP_REF}")
+        python -m pip install . -v \
+          --config-settings=cmake.define.LLVM_DIR="${LLVM_DIR}" \
+          ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+
+    - name: Smoke import
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Neutral dir so the in-tree python/cppjit can't shadow the install.
+        cd "${RUNNER_TEMP}"
+        python -c "import cppjit.cppyy; print('cppjit import OK')"
+
+    - name: Run test suite
+      shell: bash
+      env:
+        CXX_STD: ${{ inputs.cxx-standard }}
+        VALGRIND: ${{ inputs.valgrind }}
+        RUN_SWEEPS: ${{ inputs.run-sweeps }}
+        LLVM_VERSION: ${{ inputs.llvm-version }}
+      run: |
+        set -uo pipefail
+        cd test
+        make -j4 PYTHON=python || { echo "::error::dictionary build (make) failed"; exit 1; }
+        export CPPINTEROP_EXTRA_INTERPRETER_ARGS="-std=c++${CXX_STD}"
+
+        SED=sed
+        [[ "${RUNNER_OS}" == "macOS" ]] && SED=gsed
+
+        RETCODE=0
+
+        echo "::group::Full test suite"
+        # -p no:cacheprovider prevents writing .pytest_cache into the upstream-identical tree
+        set -o pipefail
+        python -m pytest -ra --tb=short -p no:cacheprovider --durations=25 \
+          | tee complete_testrun.log 2>&1 || RETCODE=$?
+        set +o pipefail
+        tail -n1 complete_testrun.log > "${GITHUB_WORKSPACE}/pytest-summary.txt" || true
+        echo "::endgroup::"
+
+        if [[ "${RUN_SWEEPS}" == "true" ]]; then
+          # A crash here = an xfail that stopped crashing and should drop its marker.
+          echo "::group::xfail-crash sweep"
+          find . -name "*.py" -exec "${SED}" -i '/run=False/!s/^ *@mark.xfail\(.*\)/#&/' {} \;
+          python -m pytest -n 1 -m "xfail" --runxfail -ra --max-worker-restart 512 | tee test_crashed.log 2>&1 || true
+          git checkout .
+          echo "::endgroup::"
+
+          echo "::group::xfail->skipif sweep"
+          find . -name "*.py" -exec "${SED}" -i -E 's/(^ *)@mark.xfail\(run=(.*)/\1@mark.skipif(condition=not \2/g' {} \;
+          python -m pytest --runxfail -ra | tee test_xfailed.log 2>&1 || true
+          git checkout .
+          echo "::endgroup::"
+        fi
+
+        if [[ "${VALGRIND}" == "true" && "${RUNNER_OS}" == "Linux" ]]; then
+          echo "::group::valgrind"
+          if [[ "${RUNNER_ARCH}" == "ARM64" ]]; then
+            PERVER="../etc/clang${LLVM_VERSION}-valgrind_arm.supp"
+          else
+            PERVER="../etc/clang${LLVM_VERSION}-valgrind.supp"
+          fi
+          # Stack all suppression files (valgrind aborts on a missing file).
+          SUPP_ARGS=()
+          for _supp in "../etc/valgrind-cppyy-cling.supp" \
+                       "../etc/cppinterop-clang${LLVM_VERSION}-valgrind.supp" \
+                       "${PERVER}"; do
+            [[ -f "${_supp}" ]] && SUPP_ARGS+=(--suppressions="${_supp}") || echo "::notice::no ${_supp}"
+          done
+          export IS_VALGRIND=true
+          valgrind --show-error-list=yes --error-exitcode=1 --track-origins=yes \
+            --gen-suppressions=all ${SUPP_ARGS[@]+"${SUPP_ARGS[@]}"} \
+            python -m pytest -m "not xfail" -ra --ignore=test_leakcheck.py || RETCODE=$?
+          unset IS_VALGRIND
+          echo "::endgroup::"
+        fi
+
+        echo "Summary: $(cat "${GITHUB_WORKSPACE}/pytest-summary.txt" 2>/dev/null || echo 'no summary')"
+        exit "${RETCODE}"
