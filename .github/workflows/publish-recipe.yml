@@ -256,41 +256,60 @@ jobs:
   # publish-recipe's own skip step still no-ops when the PR's
   # content hash matches what's already on main, which is the
   # cheap path for "PR didn't change the recipe".
+  #
+  # Bootstrap/dependent split mirrors read-cells on push: a PR that
+  # shifts a bootstrap recipe's content hash needs its dependents
+  # to read the just-built cell from the bootstrap leg's artifact,
+  # because Releases doesn't have the new-keyed cell yet.
   validate-pr-cells:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     outputs:
-      matrix: ${{ steps.compute.outputs.matrix }}
-      empty: ${{ steps.compute.outputs.empty }}
+      bootstrap_matrix: ${{ steps.compute.outputs.bootstrap_matrix }}
+      dependent_matrix: ${{ steps.compute.outputs.dependent_matrix }}
+      bootstrap_empty:  ${{ steps.compute.outputs.bootstrap_empty }}
+      dependent_empty:  ${{ steps.compute.outputs.dependent_empty }}
     steps:
       - uses: actions/checkout@v4
       - id: compute
         run: |
           set -euo pipefail
-          # yq emits one JSON object per cell; jq wraps the array as
-          # {include: [...]} for the matrix consumer below.
-          # `{include: .cells}` directly in yq isn't portable across
-          # mikefarah/yq versions -- the `{...}` constructor with a
-          # bare key changes shape between v4 minors.
-          matrix=$(yq -o=json -I=0 '.cells[]' cells.yaml | jq -s -c '{include: .}')
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-          n=$(yq '.cells | length' cells.yaml)
-          if [ "$n" = "0" ]; then
-            echo "empty=true"  >> "$GITHUB_OUTPUT"
+          bootstraps=()
+          dependents=()
+          while IFS= read -r cell; do
+            [ -z "$cell" ] && continue
+            recipe=$(echo "$cell" | jq -r .recipe)
+            if yq -e '.bootstrap' "recipes/$recipe/recipe.yaml" >/dev/null 2>&1; then
+              dependents+=("$cell")
+            else
+              bootstraps+=("$cell")
+            fi
+          done < <(yq -o=json -I=0 '.cells[]' cells.yaml)
+
+          if [ ${#bootstraps[@]} -eq 0 ]; then
+            echo "bootstrap_matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "bootstrap_empty=true"              >> "$GITHUB_OUTPUT"
           else
-            echo "empty=false" >> "$GITHUB_OUTPUT"
+            m=$(printf '%s\n' "${bootstraps[@]}" | jq -s -c '{include: .}')
+            echo "bootstrap_matrix=${m}"  >> "$GITHUB_OUTPUT"
+            echo "bootstrap_empty=false"  >> "$GITHUB_OUTPUT"
+          fi
+          if [ ${#dependents[@]} -eq 0 ]; then
+            echo "dependent_matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "dependent_empty=true"              >> "$GITHUB_OUTPUT"
+          else
+            m=$(printf '%s\n' "${dependents[@]}" | jq -s -c '{include: .}')
+            echo "dependent_matrix=${m}"  >> "$GITHUB_OUTPUT"
+            echo "dependent_empty=false"  >> "$GITHUB_OUTPUT"
           fi
 
-  validate-on-pr:
+  validate-on-pr-bootstrap:
     needs: validate-pr-cells
-    if: github.event_name == 'pull_request' && needs.validate-pr-cells.outputs.empty != 'true'
-    # No templated `name:`. Same reason as publish-on-push: on the push
-    # trigger this job is skipped, and a `${{ matrix.* }}` template in
-    # `name:` would render unresolved on the Skipped row.
+    if: github.event_name == 'pull_request' && needs.validate-pr-cells.outputs.bootstrap_empty != 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.validate-pr-cells.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.validate-pr-cells.outputs.bootstrap_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/install-build-deps
@@ -301,3 +320,70 @@ jobs:
           os: ${{ matrix.os }}
           arch: ${{ matrix.arch }}
           dry-run: 'true'
+      # Stage <key>.tar.zst into the artifact dir. If publish-recipe
+      # built fresh (PR shifted the bootstrap), pack the install tree;
+      # if it took the skip-if-exists path (PR didn't shift it), the
+      # cell is already on Releases -- fetch it so dependents still
+      # find it via the same file:// path.
+      - name: Stage bootstrap asset
+        if: needs.validate-pr-cells.outputs.dependent_empty != 'true'
+        shell: bash
+        env:
+          RECIPE: ${{ matrix.recipe }}
+          VERSION: ${{ matrix.version }}
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          key=$(python3 actions/setup-recipe/compute_key.py \
+                  "$RECIPE" "$VERSION" "$OS" "$ARCH" | sed 's/^key=//')
+          mkdir -p _pr_bootstrap_cache
+          if [[ -d "$GITHUB_WORKSPACE/_recipe_out/install" ]]; then
+            python3 actions/lib/cache_io.py pack \
+              "$GITHUB_WORKSPACE/_recipe_out" "$key" \
+              "$GITHUB_WORKSPACE/_pr_bootstrap_cache"
+          else
+            curl -fL -o "_pr_bootstrap_cache/${key}.tar.zst" \
+              "https://github.com/${REPO}/releases/download/cache/${key}.tar.zst"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: needs.validate-pr-cells.outputs.dependent_empty != 'true'
+        with:
+          # One artifact per cell; dependents flatten them into one dir.
+          name: pr-bootstrap-${{ matrix.recipe }}-${{ matrix.version }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: _pr_bootstrap_cache/
+
+  validate-on-pr-dependent:
+    # Also run when the bootstrap leg was skipped (PR didn't touch
+    # any bootstrap recipe) -- Releases satisfies fetch_bootstrap then.
+    needs: [validate-pr-cells, validate-on-pr-bootstrap]
+    if: |
+      github.event_name == 'pull_request' &&
+      needs.validate-pr-cells.outputs.dependent_empty != 'true' &&
+      (needs.validate-on-pr-bootstrap.result == 'success' ||
+       needs.validate-on-pr-bootstrap.result == 'skipped')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.validate-pr-cells.outputs.dependent_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/install-build-deps
+      # Flatten every pr-bootstrap-* into one dir; fetch_bootstrap
+      # looks up by <key>.tar.zst.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pr-bootstrap-*
+          path: _pr_bootstrap_cache/
+          merge-multiple: true
+      - uses: ./actions/publish-recipe
+        with:
+          recipe: ${{ matrix.recipe }}
+          version: ${{ matrix.version }}
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
+          dry-run: 'true'
+        env:
+          # Point fetch_bootstrap at the staged artifacts.
+          RECIPE_CACHE_BASE: file://${{ github.workspace }}/_pr_bootstrap_cache

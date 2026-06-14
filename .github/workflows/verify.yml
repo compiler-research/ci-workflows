@@ -190,11 +190,12 @@ jobs:
   # End-to-end dry-run of the real publish-recipe action against the
   # llvm-dry-run fixture recipe with cache-base: file:///... so no
   # actual upload happens. Covers exactly the steps publish-recipe.yml's
-  # validate-on-pr skips under `dry-run: true`: manifest write, cache_pack
-  # (tar/zstd portability across BSD/GNU tar, zstd flag drift),
-  # cache_upload's file:// branch, and the asset+manifest landing on
-  # disk. validate-on-pr covers the build path; this covers the upload
-  # path; together they cover the full publish pipeline at PR time.
+  # validate-on-pr-* skips under `dry-run: true`: manifest write,
+  # cache_pack (tar/zstd portability across BSD/GNU tar, zstd flag
+  # drift), cache_upload's file:// branch, and the asset+manifest
+  # landing on disk. validate-on-pr-* covers the build path; this
+  # covers the upload path; together they cover the full publish
+  # pipeline at PR time.
   #
   # Doesn't catch: llvm_build::smoke (find_package post-publish);
   # cache_upload's gh release branch (no upload to GitHub here);
@@ -251,7 +252,7 @@ jobs:
   # Default-flavor smoke (recipe-cache path) is NOT included here:
   # setup-llvm's internal `uses: compiler-research/...@main` would
   # resolve to upstream main, which doesn't see this PR's
-  # llvm-release recipe. publish-recipe.yml's validate-on-pr already
+  # llvm-release recipe. publish-recipe.yml's validate-on-pr-* already
   # builds + caches the recipe end-to-end at PR time, which covers
   # the recipe path indirectly.
   setup-llvm-system-smoke:
