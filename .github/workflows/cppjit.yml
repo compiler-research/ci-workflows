@@ -39,10 +39,6 @@ on:
         type: string
         default: ''
         description: "setup-llvm flavor-version (e.g. 'cling-llvm20' for flavor:cling); empty otherwise."
-      cling:
-        type: boolean
-        default: false
-        description: 'Build CppInterOp with Cling (CPPJIT_USE_CLING=ON, llvm-flavor: cling)'
       python-version:
         type: string
         required: true
@@ -55,7 +51,7 @@ on:
         type: boolean
         default: false
         description: 'Run the valgrind pass (Linux only).'
-      run-sweeps:
+      run-xfail-crashing-tests:
         type: boolean
         default: false
         description: 'Run the xfail-crash and xfail->skipif sweeps.'
@@ -74,7 +70,7 @@ permissions:
 jobs:
   build-test:
     runs-on: ${{ inputs.os }}
-    name: ${{ inputs.os }}-llvm${{ inputs.llvm-version }}-py${{ inputs.python-version }}-cxx${{ inputs.cxx-standard }}${{ inputs.valgrind && '-vg' || '' }}
+    name: Build & Test
     outputs:
       summary: ${{ steps.summary.outputs.line }}
     steps:
@@ -105,8 +101,8 @@ jobs:
           cxx-standard: ${{ inputs.cxx-standard }}
           llvm-version: ${{ inputs.llvm-version }}
           valgrind: ${{ inputs.valgrind }}
-          run-sweeps: ${{ inputs.run-sweeps }}
-          cling: ${{ inputs.cling }}
+          run-xfail-crashing-tests: ${{ inputs.run-xfail-crashing-tests }}
+          cling: ${{ inputs.llvm-flavor == 'cling' }}
 
       - name: Capture summary
         id: summary
@@ -123,6 +119,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: result-${{ inputs.os }}-llvm${{ inputs.llvm-version }}-py${{ inputs.python-version }}-cxx${{ inputs.cxx-standard }}${{ inputs.valgrind && '-vg' || '' }}
+          name: result-${{ inputs.os }}-llvm${{ inputs.llvm-version }}-py${{ inputs.python-version }}-cxx${{ inputs.cxx-standard }}${{ inputs.valgrind && '-vg' || '' }}${{ inputs.llvm-flavor == 'cling' && '-cling' || '' }}
           path: ${{ github.workspace }}/pytest-summary.txt
           if-no-files-found: warn
