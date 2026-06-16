@@ -382,6 +382,7 @@ def main() -> int:
             "-DCOMPILER_RT_BUILD_GWP_ASAN=OFF",
             "-DCOMPILER_RT_BUILD_CTX_PROFILE=OFF",
         ]
+        + llvm_build.dylib_flags()
         + llvm_build.cmake_extra()
         + ["../llvm"]
     )
