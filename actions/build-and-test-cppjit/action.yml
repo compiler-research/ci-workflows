@@ -27,7 +27,7 @@ inputs:
     required: false
     default: 'false'
     description: 'Run the valgrind pass ("true"/"false"), linux only.'
-  run-sweeps:
+  run-xfail-crashing-tests:
     required: false
     default: 'false'
     description: 'Also run the disabled xfail crash/skipif tests'
@@ -90,7 +90,7 @@ runs:
       env:
         CXX_STD: ${{ inputs.cxx-standard }}
         VALGRIND: ${{ inputs.valgrind }}
-        RUN_SWEEPS: ${{ inputs.run-sweeps }}
+        RUN_XFAIL_CRASHING_TESTS: ${{ inputs.run-xfail-crashing-tests }}
         LLVM_VERSION: ${{ inputs.llvm-version }}
       run: |
         set -uo pipefail
@@ -112,7 +112,7 @@ runs:
         tail -n1 complete_testrun.log > "${GITHUB_WORKSPACE}/pytest-summary.txt" || true
         echo "::endgroup::"
 
-        if [[ "${RUN_SWEEPS}" == "true" ]]; then
+        if [[ "${RUN_XFAIL_CRASHING_TESTS}" == "true" ]]; then
           # A crash here = an xfail that stopped crashing and should drop its marker.
           echo "::group::xfail-crash sweep"
           find . -name "*.py" -exec "${SED}" -i '/run=False/!s/^ *@mark.xfail\(.*\)/#&/' {} \;
