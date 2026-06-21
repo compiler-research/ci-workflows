@@ -183,6 +183,27 @@ def main() -> int:
         shutil.copy(src_jitlink, dst)
         dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
+    # Lit test utilities. Consumers' lit suites call $LLVM/bin/FileCheck (and
+    # a few RUN lines use count/not), but these aren't distribution components
+    # and base_cmake_args sets no LLVM_INSTALL_UTILS, so install-distribution
+    # skips them. Build and hand-copy them next to clang, like
+    # llvm-jitlink-executor above.
+    lit_utils = ("FileCheck", "count", "not")
+    subprocess.run(["ninja", "-j", ncpus, *lit_utils], cwd=build_dir,
+                   check=True)
+    for tool in lit_utils:
+        src_tool = build_dir / "bin" / tool
+        if src_tool.is_file():
+            dst = out_dir / "install" / "bin" / tool
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(src_tool, dst)
+            dst.chmod(dst.stat().st_mode |
+                      stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        else:
+            print(f"build.py: lit utility {tool} missing at {src_tool}; "
+                  "consumer lit suites that call it will fail",
+                  file=sys.stderr)
+
     # Sanitizer runtimes weren't built above (SANITIZERS=OFF for
     # the main stage); ship them now so consumers can link
     # -fsanitize=address|undefined against this clang.
