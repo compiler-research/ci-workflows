@@ -35,21 +35,14 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Install build and test dependencies
+    - name: Install Python test dependencies
       shell: bash
-      env:
-        VALGRIND: ${{ inputs.valgrind }}
       run: |
         set -euo pipefail
-        if [[ "${RUNNER_OS}" == "Linux" ]]; then
-          sudo apt-get update -qq
-          sudo apt-get install -y libboost-dev libeigen3-dev
-          if [[ "${VALGRIND}" == "true" ]]; then
-            sudo apt-get install -y valgrind libc6-dbg
-          fi
-        elif [[ "${RUNNER_OS}" == "macOS" ]]; then
-          brew install boost eigen gnu-sed
-        fi
+        # System build deps (cmake/ninja/compiler, libedit for the cling
+        # flavor, boost/eigen for the cppyy tests, valgrind for the vg cell)
+        # are installed by the caller BEFORE setup-llvm — see cppjit.yml's
+        # "Install dependencies" step
         python -m pip install --upgrade pip
         # Test/CI deps come from the cppjit/requirements.txt
         python -m pip install -r "${GITHUB_WORKSPACE}/requirements.txt"
