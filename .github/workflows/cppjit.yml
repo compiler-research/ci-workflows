@@ -85,6 +85,24 @@ jobs:
         with:
           python-version: ${{ inputs.python-version }}
 
+      - name: Install dependencies
+        shell: bash
+        env:
+          VALGRIND: ${{ inputs.valgrind }}
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends \
+              cmake ninja-build g++ git \
+              libedit-dev libeigen3-dev libboost-dev
+            if [[ "${VALGRIND}" == "true" ]]; then
+              sudo apt-get install -y valgrind libc6-dbg
+            fi
+          elif [[ "${RUNNER_OS}" == "macOS" ]]; then
+            brew install ninja eigen boost gnu-sed
+          fi
+
       - name: Setup LLVM ${{ inputs.llvm-version }}
         uses: compiler-research/ci-workflows/actions/setup-llvm@main
         with:
