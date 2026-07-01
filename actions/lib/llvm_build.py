@@ -51,19 +51,24 @@ def setup_env() -> None:
 
 
 def base_cmake_args(install_prefix: str,
-                    targets: str = "host;NVPTX") -> List[str]:
+                    targets: str = "host;NVPTX",
+                    build_type: str = "Release") -> List[str]:
     """Cmake flags every LLVM-family recipe shares.
 
     Recipes append their flavor-specific flags (LLVM_USE_SANITIZER for
     asan, LLVM_EXTERNAL_PROJECTS=cling for root, etc.) and feed the
     combined list to cmake. Centralising the shared subset means a flag
     bump happens in one place, not three.
+
+    `build_type` is CMAKE_BUILD_TYPE; it defaults to Release (assertions
+    are on regardless — every recipe wants them). The llvm-debug recipe
+    passes Debug for an unoptimised, -g toolchain.
     """
     return [
         "cmake", "-G", "Ninja",
         f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
         f"-DLLVM_TARGETS_TO_BUILD={targets}",
-        "-DCMAKE_BUILD_TYPE=Release",
+        f"-DCMAKE_BUILD_TYPE={build_type}",
         "-DLLVM_ENABLE_ASSERTIONS=ON",
         "-DCLANG_ENABLE_STATIC_ANALYZER=OFF",
         "-DCLANG_ENABLE_ARCMT=OFF",

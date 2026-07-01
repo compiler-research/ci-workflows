@@ -1,0 +1,23 @@
+recipe: llvm-debug
+description: |
+  Clang/LLVM built from release/{version}.x with CMAKE_BUILD_TYPE=Debug
+  (-O0 -g) and assertions on. Distinct from llvm-release, which is
+  Release + asserts: this ships an unoptimised, fully-debuggable
+  toolchain for downstream `debug_build` CI rows (clad's, today) that
+  want to run against an assertions-and-debug-info LLVM without paying
+  the build cost inline on every run.
+
+  The install carries the LLVM test utilities FileCheck and `not`
+  alongside clang / llvm-config / clang-repl, so a consumer's lit suite
+  finds them under the recipe install prefix the same way it would find
+  them in a from-source LLVM build tree.
+
+  A Debug LLVM is large and slow to build; that is exactly why it lives
+  as its own recipe/cell (built and cached once) rather than a
+  llvm-release flag or an inline per-run build.
+
+# Only fields read by build_manifest.py live here; the cmake invocation
+# and the installed-tool list are authoritative in build.py.
+source:
+  repo: https://github.com/llvm/llvm-project
+  branch_template: release/{version}.x

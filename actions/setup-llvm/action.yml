@@ -23,6 +23,11 @@ description: |
 
     'cling'   Recipe `llvm-root` plus a cling-on-top build.
 
+    'debug'   Recipe `llvm-debug`. Debug (-O0 -g) LLVM/Clang with
+              assertions, carrying the FileCheck/`not` test tools in the
+              install. For downstream debug_build rows that want an
+              unoptimised, debuggable assertions LLVM.
+
   All paths land at $GITHUB_WORKSPACE/install. The `source`
   output reports which path won; `prefix`, `llvm-dir`, `clang-dir`
   outputs name the install layout. LLVM_DIR and Clang_DIR are also
@@ -62,7 +67,7 @@ inputs:
       Selects the LLVM source. One of: '' (llvm-release recipe),
       'system' (package manager), 'asan' (llvm-asan recipe), 'msan'
       (llvm-msan recipe, Linux x86_64 only), 'cling' (llvm-root
-      recipe + cling-on-top).
+      recipe + cling-on-top), 'debug' (llvm-debug recipe, Debug + asserts).
   flavor-version:
     required: false
     default: ''
@@ -146,6 +151,7 @@ runs:
             fi
             ;;
           cling)   recipe=llvm-root    ;;
+          debug)   recipe=llvm-debug   ;;
           system)
             recipe=''
             # Windows: chocolatey doesn't carry pinned LLVM majors with
@@ -156,7 +162,7 @@ runs:
               exit 1
             fi
             ;;
-          *) echo "::error::unknown flavor '${FLAVOR}' (expected: '', 'system', 'asan', 'msan', 'cling')" >&2
+          *) echo "::error::unknown flavor '${FLAVOR}' (expected: '', 'system', 'asan', 'msan', 'cling', 'debug')" >&2
              exit 1 ;;
         esac
         # Derive arch from the os slug when the consumer didn't pass
