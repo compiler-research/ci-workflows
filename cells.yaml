@@ -32,6 +32,11 @@ caps:
 
 cells:
   - { recipe: llvm-asan, version: '22',            os: ubuntu-24.04,    arch: x86_64 }
+  # llvm-debug: Debug (-O0 -g) + asserts LLVM/Clang, carrying FileCheck
+  # and `not` in the install. Serves downstream debug_build rows (clad's
+  # ubu24-clang20-runtime22-debug) that previously built LLVM inline on
+  # every run. Tracks the latest supported LLVM major, like llvm-release.
+  - { recipe: llvm-debug, version: '22',           os: ubuntu-24.04,    arch: x86_64 }
   # llvm-msan: Linux only -- macOS toolchain doesn't ship the
   # MSan-instrumented libc++ stage build cleanly (libcxxabi-on-Mach-O
   # uses Apple's libunwind), and Windows lacks MSan support upstream.
