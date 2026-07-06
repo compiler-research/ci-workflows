@@ -9,6 +9,7 @@ actions/lib/llvm_build.py.
 
 Inputs (env): see actions/lib/llvm_build.py docstring.
   RECIPE_VERSION         major LLVM version (release/{version}.x).
+  RECIPE_ARCH            optional cell arch slug for cross compilation
 
 Outputs (env, written to GITHUB_ENV when present):
   SRC_COMMIT             sha of llvm-project HEAD that was built
@@ -93,7 +94,11 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    need_oop = major >= 22
+    # 32-bit Windows cells skip the OOP-JIT runtime: orc_rt's COFF
+    # support is x86_64-only
+    win32 = sys.platform == "win32" and \
+        os.environ.get("RECIPE_ARCH") == "x86"
+    need_oop = major >= 22 and not win32
 
     os.chdir(work_dir)
     llvm_build.clone_shallow(

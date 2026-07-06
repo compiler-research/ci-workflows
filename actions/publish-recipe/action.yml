@@ -19,7 +19,7 @@ inputs:
     description: 'OS slug for the cache key (e.g. "ubuntu-24.04", "macos-26"). Must match what setup-recipe consumers will pass.'
   arch:
     required: true
-    description: 'Arch slug for the cache key (e.g. "x86_64", "arm64").'
+    description: 'Arch slug for the cache key (e.g. "x86_64", "arm64", "x86" for 32-bit Windows).'
   cache-base:
     required: false
     default: ''
@@ -217,11 +217,30 @@ runs:
           echo "::notice::bootstrap compiler at $bin"
         fi
 
+    # MSVC env: sets cl.exe on PATH plus INCLUDE/LIB/LIBPATH. Pinned
+    # to a tagged release (not @v1) so a future ilammy/msvc-dev-cmd
+    # behavior change can't silently break our publish runs.
+
+    # x86 maps to amd64_x86 -- 64-bit-hosted cross tools targeting
+    # 32-bit -- because the 32-bit-hosted toolchain caps cl/link at a
+    # 4 GB address space, which LLVM links exceed. The action's default
+    # is x64, which on a windows-11-arm runner cross-compiles to x64 --
+    # the resulting .lib files land at lib/<name>.lib but carry x64
+    # machine type, so consumers on the same arm64 runner image fail
+    # to link with LNK4272 ("library machine type 'x64' conflicts with
+    # target machine type 'ARM64'").
+    - name: Set up MSVC developer environment (Windows)
+      if: steps.skip.outputs.exists != 'true' && runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1.13.0
+      with:
+        arch: ${{ steps.slugs.outputs.arch == 'x86' && 'amd64_x86' || (runner.arch == 'ARM64' && 'arm64' || 'x64') }}
+
     - name: Build recipe
       if: steps.skip.outputs.exists != 'true'
       shell: bash
       env:
         RECIPE_VERSION: ${{ inputs.version }}
+        RECIPE_ARCH: ${{ steps.slugs.outputs.arch }}
         WORK_DIR: ${{ github.workspace }}/_recipe_work
         OUT_DIR: ${{ github.workspace }}/_recipe_out
         CMAKE_C_COMPILER_LAUNCHER: ccache

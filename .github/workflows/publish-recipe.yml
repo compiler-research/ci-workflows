@@ -41,7 +41,7 @@ on:
         required: true
         default: ubuntu-24.04
       arch:
-        description: 'Arch as in cells.yaml (x86_64 or arm64).'
+        description: 'Arch as in cells.yaml (x86_64, arm64, or x86 for 32-bit Windows).'
         type: string
         required: true
         default: x86_64

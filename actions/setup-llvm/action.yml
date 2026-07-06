@@ -53,13 +53,15 @@ inputs:
     required: false
     default: ''
     description: |
-      Architecture slug for the cache key (e.g. "x86_64", "arm64").
-      Empty (default) derives from the `os` slug — adequate for every
-      runner image GHA ships today (ubuntu-24.04-arm → arm64,
-      macos-26 → arm64 by Apple-Silicon convention, macos-26-intel →
-      x86_64, windows-11-arm → arm64, everything else → x86_64).
-      Override only for unusual hosts where the os slug doesn't carry
-      the architecture.
+      Architecture slug for the cache key (e.g. "x86_64", "arm64",
+      "x86" for 32-bit Windows). Empty (default) derives from the `os`
+      slug — adequate for every runner image GHA ships today
+      (ubuntu-24.04-arm → arm64, macos-26 → arm64 by Apple-Silicon
+      convention, macos-26-intel → x86_64, windows-11-arm → arm64,
+      everything else → x86_64). Override for unusual hosts where the
+      os slug doesn't carry the architecture, or to consume a cell
+      whose target differs from the runner (e.g. "x86" on a
+      windows-2025 job that builds for 32-bit architectures).
   flavor:
     required: false
     default: ''

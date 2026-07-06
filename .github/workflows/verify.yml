@@ -201,7 +201,7 @@ jobs:
   # cache_upload's gh release branch (no upload to GitHub here);
   # setup-recipe consumer side; prune-cache (separate workflow).
   #
-  # No Windows leg yet: install-build-deps's MSVC env wiring works,
+  # No Windows leg yet: publish-recipe's MSVC env wiring works,
   # but the dry-run recipe uses host targets; on Windows that means
   # cl + LLVMDemangle. Added in a follow-up.
   publish-dryrun:
