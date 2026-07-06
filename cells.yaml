@@ -71,6 +71,12 @@ cells:
   - { recipe: llvm-release, version: '22',         os: macos-26,         arch: arm64  }
   - { recipe: llvm-release, version: '22',         os: macos-26-intel,   arch: x86_64 }
   - { recipe: llvm-release, version: '22',         os: windows-2025,     arch: x86_64 }
+  # arch x86 = 32-bit MSVC target built with the 64-bit-hosted cross
+  # tools (vcvars amd64_x86) and run under WOW64. Serves CppInterOp's
+  # win32 row: x64 and Itanium share one calling convention, so
+  # __thiscall/__cdecl mismatches (e.g. the VTableOverlay dtor-hook
+  # bug) only surface on a 32-bit MSVC build.
+  - { recipe: llvm-release, version: '22',         os: windows-2025,     arch: x86    }
   - { recipe: llvm-release, version: '22',         os: windows-11-arm,   arch: arm64  }
   # llvm-root: `version` doubles as a flavor selector and substitutes
   # into recipes/llvm-root/recipe.yaml's branch_template. Two flavors

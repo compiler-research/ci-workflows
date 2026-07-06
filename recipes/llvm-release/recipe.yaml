@@ -11,7 +11,9 @@ description: |
   For LLVM >= 22, build.py also enables compiler-rt with everything
   off except orc_rt + llvm-jitlink-executor — same shape as llvm-asan
   — so consumers that exercise the OOP-JIT runtime (CppInterOp's
-  clang-repl driver) get the bundled bits in the artifact.
+  clang-repl driver) get the bundled bits in the artifact. 32-bit
+  Windows cells (arch: x86) skip compiler-rt: orc_rt's COFF support
+  is x86_64-only and the OOP-JIT is disabled on Windows consumers.
 
 # Only fields read by build_manifest.py live here. The cmake invocation
 # and trim list are authoritative in build.py — having them duplicated
