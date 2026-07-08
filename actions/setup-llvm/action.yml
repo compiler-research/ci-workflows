@@ -95,6 +95,14 @@ inputs:
     description: |
       Cling git ref to clone. Empty (default) clones the default
       branch. Only consulted when flavor=cling.
+  cling-sanitizer:
+    required: false
+    default: ''
+    description: |
+      LLVM_USE_SANITIZER value for the cling-on-top build (e.g.
+      'Address'). The cached llvm-root cell stays uninstrumented;
+      sanitizing cling is enough to check its own code. Only
+      consulted when flavor=cling.
   ref:
     required: false
     default: 'main'
@@ -308,6 +316,7 @@ runs:
       env:
         CLING_REPO: ${{ inputs.cling-repo }}
         CLING_REF:  ${{ inputs.cling-ref }}
+        CLING_SANITIZER: ${{ inputs.cling-sanitizer }}
       run: |
         set -euo pipefail
         # ncpus: detect inside the action so we don't depend on a
@@ -335,7 +344,8 @@ runs:
             -DClang_DIR="$LLVM_PREFIX/lib/cmake/clang" \
             -DCMAKE_INSTALL_PREFIX="$LLVM_PREFIX" \
             -DCLING_INCLUDE_TESTS=ON \
-            -DLLVM_INCLUDE_TESTS=OFF
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_USE_SANITIZER="${CLING_SANITIZER}"
         cmake --build . --parallel "${ncpus}"
         cmake --install .
 
@@ -345,6 +355,7 @@ runs:
       env:
         CLING_REPO: ${{ inputs.cling-repo }}
         CLING_REF:  ${{ inputs.cling-ref }}
+        CLING_SANITIZER: ${{ inputs.cling-sanitizer }}
       run: |
         $ErrorActionPreference = 'Stop'
         $ncpus = [Environment]::ProcessorCount
@@ -370,7 +381,8 @@ runs:
           "-DClang_DIR=$LLVM_PREFIX\lib\cmake\clang" `
           "-DCMAKE_INSTALL_PREFIX=$LLVM_PREFIX" `
           -DCLING_INCLUDE_TESTS=ON `
-          -DLLVM_INCLUDE_TESTS=OFF
+          -DLLVM_INCLUDE_TESTS=OFF `
+          "-DLLVM_USE_SANITIZER=$env:CLING_SANITIZER"
         cmake --build . --config Release --parallel $ncpus
         cmake --install . --config Release
 
