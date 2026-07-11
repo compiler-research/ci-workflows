@@ -466,7 +466,8 @@ cp    ~/.claude/settings.json  "$HOST_CACHE/ai/settings.json" 2>/dev/null || tru
 # --- per-session loop ---------------------------------------------------
 cd /path/to/project                          # $PWD becomes /patches inside
 bin/repro --devshell --devshell-host-cache <cell>
-#   ... inside the container, run your AI of choice, iterate, then:
+#   ... inside, `claude` is already installed (repro-config puts it
+#       there on entry; log in once per container). Iterate, then:
 #       cd $DEVSHELL_SRC && git format-patch -o /patches <range>
 #   ... exit when done.
 git am /path/to/project/*.patch              # apply with your host identity
