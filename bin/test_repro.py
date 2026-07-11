@@ -16,9 +16,10 @@ import os
 import signal as _signal
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest import mock
 
 REPRO_PATH = Path(__file__).resolve().parent / "repro"
@@ -1456,6 +1457,160 @@ class DevshellImageTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             self.repro._devshell_image("macos-14")
         self.assertIn("Linux Ubuntu cells", str(cm.exception))
+
+
+class DevshellHermeticResolverTests(unittest.TestCase):
+    """Pin --devshell host-cache, patches-out, and AI-key resolution.
+
+    These are the load-bearing inputs to the hermetic model: a typo
+    here decides what bind-mounts the container gets, so the contract
+    is worth nailing.
+    """
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def _ns(self, **kw):
+        kw.setdefault("devshell_host_cache", None)
+        kw.setdefault("devshell_patches_out", None)
+        return argparse.Namespace(**kw)
+
+    def test_host_cache_none_returns_none(self):
+        self.assertIsNone(self.repro._devshell_resolve_host_cache(
+            self._ns(devshell_host_cache=None)))
+
+    def test_host_cache_bare_uses_default(self):
+        p = self.repro._devshell_resolve_host_cache(
+            self._ns(devshell_host_cache="__default__"))
+        self.assertEqual(p, self.repro.DEVSHELL_HOST_CACHE_DEFAULT)
+
+    def test_host_cache_explicit_dir_resolves_absolute(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self.repro._devshell_resolve_host_cache(
+                self._ns(devshell_host_cache=td))
+        self.assertTrue(p.is_absolute())
+
+    def test_patches_out_defaults_to_cwd(self):
+        # cwd must be restored BEFORE TemporaryDirectory cleanup:
+        # Windows refuses to delete a dir that's the cwd of any
+        # process, so a finally-block restore is too late.
+        old = os.getcwd()
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                os.chdir(td)
+                p = self.repro._devshell_resolve_patches_out(self._ns())
+                self.assertEqual(p, Path(td).resolve())
+            finally:
+                os.chdir(old)
+
+    def test_patches_out_refuses_home(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.repro._devshell_resolve_patches_out(self._ns(
+                devshell_patches_out=str(Path.home())))
+        self.assertIn("$HOME", str(cm.exception))
+
+    def test_patches_out_refuses_missing_dir(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.repro._devshell_resolve_patches_out(self._ns(
+                devshell_patches_out="/nonexistent-devshell-test-dir"))
+        self.assertIn("not a directory", str(cm.exception))
+
+    def test_ai_repo_key_encodes_path_with_dashes(self):
+        repo, encoded = self.repro._devshell_ai_repo_key(
+            Path("/Users/vv/workspace/sources/CppInterOp2"))
+        self.assertEqual(repo, "CppInterOp2")
+        self.assertEqual(encoded, "-Users-vv-workspace-sources-CppInterOp2")
+
+    def test_ai_repo_key_handles_windows_drive_and_separators(self):
+        # The host-cache dir lives on the host filesystem; ':' is
+        # NTFS-illegal in filenames, so the encoded key must not
+        # carry the drive letter's colon through.
+        repo, encoded = self.repro._devshell_ai_repo_key(
+            PureWindowsPath(r"C:\Users\vv\proj"))
+        self.assertEqual(repo, "proj")
+        self.assertNotIn(":", encoded)
+        self.assertNotIn("\\", encoded)
+        self.assertEqual(encoded, "C--Users-vv-proj")
+
+
+class DevshellEnsureContainerArgvTests(unittest.TestCase):
+    """Pin the `docker run` argv shape: which `-v` / `-e` flags
+    appear in volume mode vs host-cache mode. The hermetic contract
+    lives in this argv -- a missed bind or a leaked host path slips
+    in silently otherwise.
+    """
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def _args(self, **kw):
+        kw.setdefault("devshell_as_root", False)
+        return argparse.Namespace(**kw)
+
+    def _run_ensure(self, *, volume_name, work_host_bind, host_cache,
+                    patches_out):
+        manifest = {"build_env": {"ccache": {
+            "base_dir": "/home/runner/work/x/x", "hash_dir": "false",
+        }}}
+        with mock.patch.object(self.repro, "_devshell_container_exists",
+                               return_value=False), \
+             mock.patch.object(self.repro.subprocess, "run") as run, \
+             mock.patch.object(self.repro, "_devshell_host_uid_gid",
+                               return_value=(1000, 1000)):
+            self.repro._devshell_ensure_container(
+                self._args(), "devshell-x", "img:tag",
+                "/home/runner/work/x/x", manifest,
+                volume_name=volume_name,
+                work_host_bind=work_host_bind,
+                host_cache=host_cache,
+                patches_out=patches_out,
+            )
+        return run.call_args_list[-1][0][0]
+
+    def test_volume_mode_binds_volume_at_workspace(self):
+        patches = Path("/tmp/proj")
+        argv = self._run_ensure(
+            volume_name="devshell-x",
+            work_host_bind=None,
+            host_cache=None,
+            patches_out=patches,
+        )
+        self.assertIn("-v", argv)
+        self.assertIn("devshell-x:/home/runner/work/x/x", argv)
+        # Use Path-derived expected: on Windows the host side
+        # serialises with `\`, on Posix with `/`. Either is what
+        # docker would receive.
+        self.assertIn(f"{patches}:{self.repro.DEVSHELL_PATCHES_MOUNT}",
+                      argv)
+        self.assertFalse(any(":/cache" in a for a in argv))
+
+    def test_host_cache_mode_binds_workspace_and_cache(self):
+        bind = Path("/tmp/hc/cells/x")
+        cache = Path("/tmp/hc")
+        patches = Path("/tmp/proj")
+        argv = self._run_ensure(
+            volume_name=None,
+            work_host_bind=bind,
+            host_cache=cache,
+            patches_out=patches,
+        )
+        self.assertIn(f"{bind}:/home/runner/work/x/x", argv)
+        self.assertIn(f"{cache}:{self.repro.DEVSHELL_CACHE_MOUNT}", argv)
+        self.assertIn(f"{patches}:{self.repro.DEVSHELL_PATCHES_MOUNT}",
+                      argv)
+        self.assertFalse(any(a.startswith("devshell-x:") for a in argv))
+
+    def test_ai_envs_carry_repo_key_to_container(self):
+        argv = self._run_ensure(
+            volume_name="devshell-x",
+            work_host_bind=None,
+            host_cache=None,
+            patches_out=Path("/Users/v/work/CppInterOp2"),
+        )
+        self.assertIn("DEVSHELL_AI_REPO=CppInterOp2", argv)
+        self.assertIn(
+            "DEVSHELL_AI_REPO_ENCODED=-Users-v-work-CppInterOp2", argv)
+        self.assertIn(f"HOME={self.repro.DEVSHELL_DEV_HOME}", argv)
 
 
 if __name__ == "__main__":

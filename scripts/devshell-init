@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Hermetic devshell init. bin/repro --devshell installs this at
+# /usr/local/bin/devshell-init and scripts/repro-config sources it
+# as the first step inside the container. Idempotent: re-running
+# converges on the same state.
+#
+# Inputs (env, all set by bin/repro from the host):
+#   DEVSHELL_DEV_UID / DEVSHELL_DEV_GID  host UID/GID to assume inside
+#   DEVSHELL_DEV_HOME                    /home/dev by convention
+#   DEVSHELL_PATCHES_MOUNT               /patches (the $PWD bind)
+#   DEVSHELL_CACHE_MOUNT                 /cache (only set when bound)
+#   DEVSHELL_BUILD                       drives workspace chown target
+#   DEVSHELL_AI_REPO / *_ENCODED         host project key for memory dir
+
+set -e
+
+dev_uid="${DEVSHELL_DEV_UID:-1000}"
+dev_gid="${DEVSHELL_DEV_GID:-1000}"
+dev_home="${DEVSHELL_DEV_HOME:-/home/dev}"
+patches="${DEVSHELL_PATCHES_MOUNT:-/patches}"
+cache="${DEVSHELL_CACHE_MOUNT:-/cache}"
+
+# `devshell-init --verify` runs assertions about the post-init state
+# instead of re-running init. Catches regressions in this script
+# from inside the running container: bin/repro invokes it after the
+# main init and fails the session on non-zero rc.
+if [[ "${1:-}" == "--verify" ]]; then
+  errs=0
+  check() {
+    local desc="$1"; shift
+    if "$@" >/dev/null 2>&1; then return 0; fi
+    echo "devshell-init --verify: FAIL: $desc" >&2
+    errs=$((errs+1))
+  }
+  check "dev user exists with UID $dev_uid" \
+    bash -c "[[ \"\$(id -u dev 2>/dev/null)\" == $dev_uid ]]"
+  check "$patches owned by dev" \
+    bash -c "[[ \"\$(stat -c %U $patches)\" == dev ]]"
+  if [[ -d "$cache" ]]; then
+    repo="${DEVSHELL_AI_REPO:-default}"
+    encoded="${DEVSHELL_AI_REPO_ENCODED:--patches}"
+    check "$dev_home/.claude/skills resolves" \
+      test -e "$dev_home/.claude/skills"
+    if [[ -f "$cache/ai/settings.json" ]]; then
+      check "$dev_home/.claude/settings.json resolves" \
+        test -e "$dev_home/.claude/settings.json"
+    fi
+    check "memory dir under $repo/$encoded" \
+      test -d "$cache/ai/memory/$repo/$encoded"
+    # Three encoded cwd keys must all resolve; init lays them down
+    # in one loop so a regression would silently break some-but-
+    # not-all and leave the AI mute depending on launch dir.
+    ws_for_verify="${DEVSHELL_BUILD:+${DEVSHELL_BUILD%/_recipe_work*}}"
+    for cwd in "$patches" "$ws_for_verify" "$dev_home"; do
+      [[ -z "$cwd" ]] && continue
+      enc="${cwd//\//-}"
+      check "memory symlink at $enc resolves" \
+        test -e "$dev_home/.claude/projects/$enc/memory"
+    done
+  fi
+  exit "$errs"
+fi
+
+# catthehacker/ubuntu ships `runner` at UID/GID 1001; a host user at
+# the same UID would collide with `useradd -u`. Rename the existing
+# owner of the target UID/GID to `dev` instead of creating a new
+# account, so downstream `docker exec -u dev` still resolves.
+existing_group=$(getent group "$dev_gid" | cut -d: -f1 || true)
+if [[ -n "$existing_group" ]]; then
+  if [[ "$existing_group" != "dev" ]]; then
+    groupmod -n dev "$existing_group" 2>/dev/null || true
+  fi
+else
+  groupadd -g "$dev_gid" dev
+fi
+existing_user=$(getent passwd "$dev_uid" | cut -d: -f1 || true)
+if [[ -n "$existing_user" ]]; then
+  if [[ "$existing_user" != "dev" ]]; then
+    usermod -l dev -d "$dev_home" -m "$existing_user" 2>/dev/null \
+      || usermod -l dev "$existing_user"
+  fi
+else
+  useradd -u "$dev_uid" -g dev -d "$dev_home" -m -s /bin/bash dev
+fi
+
+# NOPASSWD sudo lets the AI apt-install build deps without any host
+# credential entering the container.
+if command -v sudo >/dev/null 2>&1 \
+   && [[ ! -f /etc/sudoers.d/devshell-dev ]]; then
+  echo "dev ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/devshell-dev
+  chmod 0440 /etc/sudoers.d/devshell-dev
+fi
+mkdir -p "$dev_home"
+chown "$dev_uid:$dev_gid" "$dev_home"
+
+if [[ -d "${DEVSHELL_PATCHES_MOUNT:-/patches}" ]]; then
+  chown "$dev_uid:$dev_gid" "${DEVSHELL_PATCHES_MOUNT}"
+fi
+
+# Top-level stat gates the recursive walk: after first-run the
+# workspace tree (multi-GB once built) is already dev-owned, and
+# re-entry skips this entirely.
+ws=""
+if [[ -n "${DEVSHELL_BUILD:-}" ]]; then
+  ws="${DEVSHELL_BUILD%/_recipe_work*}"
+  if [[ -d "$ws" ]]; then
+    cur_uid=$(stat -c %u "$ws" 2>/dev/null || echo "")
+    if [[ "$cur_uid" != "$dev_uid" ]]; then
+      chown -R "$dev_uid:$dev_gid" "$ws"
+    fi
+  fi
+fi
+
+# Host-cache bind, if any. Symlink claude's lookup paths into /cache
+# so the AI picks up host-curated state without any other host bind.
+# Memory is symlinked at every plausible session cwd (claude derives
+# its project key from `getcwd()` at startup): /patches, $ws, and
+# $HOME -- otherwise the link is silently inert when the user launches
+# from a different directory.
+if [[ -d "${DEVSHELL_CACHE_MOUNT:-/cache}" ]]; then
+  cache="${DEVSHELL_CACHE_MOUNT:-/cache}"
+  install -d -o "$dev_uid" -g "$dev_gid" \
+    "$cache/ai" "$cache/ai/skills" "$cache/ai/memory"
+  repo="${DEVSHELL_AI_REPO:-default}"
+  encoded="${DEVSHELL_AI_REPO_ENCODED:--patches}"
+  mem_dir="$cache/ai/memory/$repo/$encoded"
+  install -d -o "$dev_uid" -g "$dev_gid" "$mem_dir"
+
+  claude_root="$dev_home/.claude"
+  install -d -o "$dev_uid" -g "$dev_gid" \
+    "$claude_root" "$claude_root/projects"
+  ln -sfn "$cache/ai/skills" "$claude_root/skills"
+  if [[ -f "$cache/ai/settings.json" ]]; then
+    ln -sfn "$cache/ai/settings.json" "$claude_root/settings.json"
+  fi
+  for cwd in "${DEVSHELL_PATCHES_MOUNT:-/patches}" "$ws" "$dev_home"; do
+    [[ -z "$cwd" ]] && continue
+    enc="${cwd//\//-}"
+    install -d -o "$dev_uid" -g "$dev_gid" "$claude_root/projects/$enc"
+    ln -sfn "$mem_dir" "$claude_root/projects/$enc/memory"
+  done
+  chown -h "$dev_uid:$dev_gid" \
+    "$claude_root/skills" "$claude_root/settings.json" 2>/dev/null || true
+fi
+
+# Forkable AI-CLI installer. Default is a no-op stub; a downstream
+# fork's repro-config can replace `devshell_install_ai_cli` with a
+# real installer (pip, curl|sh, ...).
+devshell_install_ai_cli() {
+  echo "devshell: no AI CLI installed by default. Bake one into the" >&2
+  echo "          image or override devshell_install_ai_cli in this" >&2
+  echo "          fork's scripts/repro-config." >&2
+}
+if ! command -v claude >/dev/null 2>&1; then
+  devshell_install_ai_cli || true
+fi
