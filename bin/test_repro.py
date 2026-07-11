@@ -1497,6 +1497,57 @@ class DevshellCoordArgvTests(unittest.TestCase):
         self.assertTrue(glob.called)
 
 
+class DevshellHostCacheFlagTests(unittest.TestCase):
+    """Pin that no host-cache flag can absorb the cell.
+
+    --devshell-host-cache once took an optional DIR, and argparse binds
+    an optional's nargs="?" value greedily: the cell landed in the flag
+    and main() was left with no row name at all.
+    """
+
+    COORD = "llvm-release/22/ubuntu-24.04/x86_64"
+    # The resolver resolve()s the dir, and Windows anchors a rooted
+    # path to the current drive: `/hc` comes back as `D:\hc`.
+    HC = Path("/hc").resolve()
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def _cell_and_cache(self, argv):
+        seen = {}
+
+        def fake_devshell(a):
+            seen["name"] = self.repro._matrix_get(a.matrix or [], "name")
+            seen["cache"] = self.repro._devshell_resolve_host_cache(a)
+            return 0
+
+        with mock.patch.object(sys, "argv", ["bin/repro"] + argv), \
+             mock.patch.object(self.repro, "cmd_devshell",
+                               side_effect=fake_devshell), \
+             redirect_stderr(io.StringIO()):
+            self.assertEqual(self.repro.main(), 0)
+        return seen
+
+    def test_bare_flag_keeps_the_cell_and_takes_the_default_dir(self):
+        seen = self._cell_and_cache(
+            ["--devshell", "--devshell-host-cache", self.COORD])
+        self.assertEqual(seen["name"], self.COORD)
+        self.assertEqual(seen["cache"],
+                         self.repro.DEVSHELL_HOST_CACHE_DEFAULT)
+
+    def test_explicit_dir_flag_keeps_the_cell(self):
+        seen = self._cell_and_cache(
+            ["--devshell", "--devshell-host-cache-dir", "/hc", self.COORD])
+        self.assertEqual(seen["name"], self.COORD)
+        self.assertEqual(seen["cache"], self.HC)
+
+    def test_explicit_dir_wins_over_the_bare_flag(self):
+        seen = self._cell_and_cache(
+            ["--devshell", "--devshell-host-cache",
+             "--devshell-host-cache-dir", "/hc", self.COORD])
+        self.assertEqual(seen["cache"], self.HC)
+
+
 class DevshellImageTests(unittest.TestCase):
     """Pin --devshell's runner-image mapping: matches act's catthehacker
     defaults for supported Ubuntu cells, refuses other OSes."""
@@ -1530,23 +1581,26 @@ class DevshellHermeticResolverTests(unittest.TestCase):
         self.repro = _load_repro()
 
     def _ns(self, **kw):
-        kw.setdefault("devshell_host_cache", None)
+        kw.setdefault("devshell_host_cache", False)
+        kw.setdefault("devshell_host_cache_dir", None)
         kw.setdefault("devshell_patches_out", None)
         return argparse.Namespace(**kw)
 
-    def test_host_cache_none_returns_none(self):
+    def test_host_cache_off_returns_none(self):
         self.assertIsNone(self.repro._devshell_resolve_host_cache(
-            self._ns(devshell_host_cache=None)))
+            self._ns()))
 
     def test_host_cache_bare_uses_default(self):
         p = self.repro._devshell_resolve_host_cache(
-            self._ns(devshell_host_cache="__default__"))
+            self._ns(devshell_host_cache=True))
         self.assertEqual(p, self.repro.DEVSHELL_HOST_CACHE_DEFAULT)
 
     def test_host_cache_explicit_dir_resolves_absolute(self):
-        with tempfile.TemporaryDirectory() as td:
-            p = self.repro._devshell_resolve_host_cache(
-                self._ns(devshell_host_cache=td))
+        # `~` included: the dir need not exist yet, so expansion (not
+        # existence) is what makes the bind land where the user meant.
+        p = self.repro._devshell_resolve_host_cache(
+            self._ns(devshell_host_cache_dir="~/mycache"))
+        self.assertEqual(p, Path.home() / "mycache")
         self.assertTrue(p.is_absolute())
 
     def test_patches_out_defaults_to_cwd(self):

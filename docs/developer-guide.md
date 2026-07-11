@@ -410,7 +410,7 @@ The host sees only two paths from the running container:
    the host with your own identity. Refuses to launch if `$PWD ==
    $HOME` or resolves to `/`.
 2. **`<host-cache>` bound at `/cache` (rw).** Opt-in via
-   `--devshell-host-cache [DIR]`. Carries persistent per-cell state
+   `--devshell-host-cache`. Carries persistent per-cell state
    AND the user's AI tooling. Layout:
 
    ```
@@ -497,7 +497,8 @@ What this gets you:
 |------|--------|
 | `--devshell-rm` | remove the container; named volume + host cache are kept |
 | `--devshell-refetch` | re-download install/ccache/manifest into the volume / cache |
-| `--devshell-host-cache [DIR]` | bind a single host dir at `/cache`. Bare flag uses `~/.cache/ci-workflows/devshell-cache/`. Required for persistent AI state across sessions. |
+| `--devshell-host-cache` | bind `~/.cache/ci-workflows/devshell-cache/` at `/cache`. Required for persistent AI state across sessions. |
+| `--devshell-host-cache-dir DIR` | as above, but bind `DIR` instead of the default location. |
 | `--devshell-patches-out DIR` | override the `/patches` bind. Defaults to `$PWD`. |
 | `--devshell-image IMAGE` | override the container image (prefer a digest pin). |
 | `--devshell-as-root` | run the interactive shell as root. Files in `/patches` will be root-owned on the host. |

@@ -174,14 +174,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="with --devshell: remove the persistent container "
                         "and exit. Named volumes are kept (use "
                         "`docker volume rm devshell-<cell>` to reclaim).")
-    p.add_argument("--devshell-host-cache", nargs="?",
-                   const="__default__", default=None, metavar="DIR",
-                   help="with --devshell: bind a single host directory "
-                        "at /cache for persistence and AI tooling. "
-                        "Bare flag uses ~/.cache/ci-workflows/"
-                        "devshell-cache/. Expected layout: "
+    # Deliberately store_true rather than nargs="?" with an optional
+    # DIR: argparse binds an optional's nargs="?" value greedily, so
+    # `--devshell-host-cache <cell>` parked the cell in the flag and
+    # left the positional empty. The explicit path gets its own flag
+    # below, which no amount of argument order can confuse.
+    p.add_argument("--devshell-host-cache", action="store_true",
+                   help="with --devshell: bind ~/.cache/ci-workflows/"
+                        "devshell-cache/ at /cache for persistence and "
+                        "AI tooling. Expected layout: "
                         "cells/<cell-id>/{src,build,ccache}, "
-                        "ai/{skills,settings.json,memory/<repo>/<encoded>}.")
+                        "ai/{skills,settings.json,memory/<repo>/<encoded>}. "
+                        "Use --devshell-host-cache-dir to bind a "
+                        "different directory.")
+    p.add_argument("--devshell-host-cache-dir", metavar="DIR",
+                   help="with --devshell: like --devshell-host-cache, "
+                        "but bind DIR at /cache instead of the default "
+                        "location.")
     p.add_argument("--devshell-patches-out", metavar="DIR",
                    help="with --devshell: host directory bound at "
                         "/patches inside the container (rw). Defaults "
@@ -1240,15 +1249,15 @@ def _devshell_host_uid_gid() -> Tuple[int, int]:
 
 
 def _devshell_resolve_host_cache(args: argparse.Namespace) -> Optional[Path]:
-    """Map --devshell-host-cache (None/bare/explicit) to an absolute Path,
-    or None for the fully ephemeral default.
+    """Map --devshell-host-cache / --devshell-host-cache-dir to an
+    absolute Path, or None for the fully ephemeral default.
     """
-    v = args.devshell_host_cache
-    if v is None:
-        return None
-    if v == "__default__":
+    v = getattr(args, "devshell_host_cache_dir", None)
+    if v:
+        return Path(v).expanduser().resolve()
+    if args.devshell_host_cache:
         return DEVSHELL_HOST_CACHE_DEFAULT
-    return Path(v).expanduser().resolve()
+    return None
 
 
 def _devshell_resolve_patches_out(args: argparse.Namespace) -> Path:
