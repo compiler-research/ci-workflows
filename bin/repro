@@ -1821,7 +1821,17 @@ def main() -> int:
             and not args.job):
         pattern = args.passthrough[0]
         args.passthrough = args.passthrough[1:]
-        _resolve_pattern(pattern, args)
+        # A `recipe/version/os/arch` coord names a cell in cells.yaml,
+        # not a matrix row, and _devshell_cell resolves it directly --
+        # the whole point of the shorthand is to reach cells that no
+        # consumer matrix references yet, so globbing it against act's
+        # rows could only miss. Anything else, including a malformed
+        # coord, still goes to the globber: a row name is free to
+        # contain a slash, and only the 4-part shape is unambiguous.
+        if args.devshell and len(pattern.split("/")) == 4:
+            args.matrix = (args.matrix or []) + [f"name:{pattern}"]
+        else:
+            _resolve_pattern(pattern, args)
 
     # --devshell short-circuits the act run: provision the cell's
     # recipe install + sibling ccache + matching LLVM source, then

@@ -1438,6 +1438,65 @@ class DevshellCellTests(unittest.TestCase):
         self.assertIn("doesn't pull from a recipe cache", str(cm.exception))
 
 
+class DevshellCoordArgvTests(unittest.TestCase):
+    """Pin that a direct `recipe/version/os/arch` coord in the
+    positional slot reaches _devshell_cell rather than the act matrix
+    globber, which can only miss: the shorthand exists precisely for
+    cells no consumer matrix references yet.
+    """
+
+    COORD = "llvm-release/22/ubuntu-24.04/x86_64"
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def _cell_of(self, argv):
+        """Drive main() over argv; report the cell name it hands to
+        --devshell and the pattern (if any) it sent to the globber.
+        main() parses sys.argv itself, so argv goes in that way."""
+        seen = {}
+
+        def fake_devshell(a):
+            seen["name"] = self.repro._matrix_get(a.matrix or [], "name")
+            return 0
+
+        with mock.patch.object(sys, "argv", ["bin/repro"] + argv), \
+             mock.patch.object(self.repro, "cmd_devshell",
+                               side_effect=fake_devshell), \
+             mock.patch.object(self.repro, "_resolve_pattern") as glob, \
+             redirect_stderr(io.StringIO()):
+            self.assertEqual(self.repro.main(), 0)
+        seen["globbed"] = glob.called
+        seen["pattern"] = glob.call_args[0][0] if glob.called else None
+        return seen
+
+    def test_coord_positional_bypasses_the_matrix_globber(self):
+        seen = self._cell_of(["--devshell", self.COORD])
+        self.assertEqual(seen["name"], self.COORD)
+        self.assertFalse(seen["globbed"])
+
+    def test_row_name_positional_still_globs(self):
+        seen = self._cell_of(["--devshell", "ubu24-*-cppyy"])
+        self.assertEqual(seen["pattern"], "ubu24-*-cppyy")
+
+    def test_slashed_non_coord_positional_still_globs(self):
+        # Only the 4-part shape is unambiguously a coord. A row name is
+        # free to contain a slash, and must keep resolving through the
+        # globber rather than be mistaken for a malformed coord.
+        seen = self._cell_of(["--devshell", "llvm-release/22"])
+        self.assertEqual(seen["pattern"], "llvm-release/22")
+
+    def test_coord_positional_without_devshell_still_globs(self):
+        # The shorthand is a --devshell affordance; an act run must
+        # keep treating the positional as a row-name glob.
+        with mock.patch.object(sys, "argv", ["bin/repro", self.COORD]), \
+             mock.patch.object(self.repro, "_resolve_pattern") as glob, \
+             redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.repro.main()
+        self.assertTrue(glob.called)
+
+
 class DevshellImageTests(unittest.TestCase):
     """Pin --devshell's runner-image mapping: matches act's catthehacker
     defaults for supported Ubuntu cells, refuses other OSes."""
