@@ -1387,15 +1387,28 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
     # Start as root: repro-config needs apt-install + chown. `--user`
     # is deferred to the interactive `docker exec` so the AI runs as
     # `dev`.
-    subprocess.run(
-        ["docker", "run", "-d",
-         "--name", name,
-         *mount_args,
-         "-w", ws,
-         *env_args,
-         image, "sleep", "infinity"],
-        check=True, stdout=subprocess.DEVNULL,
-    )
+    try:
+        subprocess.run(
+            ["docker", "run", "-d",
+             "--name", name,
+             *mount_args,
+             "-w", ws,
+             *env_args,
+             image, "sleep", "infinity"],
+            check=True, stdout=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError as e:
+        # docker already printed its own diagnostic to stderr; a
+        # 25-line Python traceback on top of it just buries the line
+        # the user needs. 125 is docker's "container never started",
+        # and by far its most common cause here is a pull that didn't
+        # land -- the image is ~1 GB and the daemon fetches it through
+        # its own proxy, which times out more often than the host does.
+        hint = (f"\nhint: the image may not have pulled; run "
+                f"`docker pull {image}` and try again"
+                if e.returncode == 125 else "")
+        sys.exit(f"error: `docker run` failed (exit {e.returncode}) "
+                 f"starting devshell container {name}{hint}")
 
 
 def _devshell_run_config(name: str, ws: str) -> None:

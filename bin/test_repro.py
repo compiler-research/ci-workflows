@@ -1680,6 +1680,44 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
             )
         return run.call_args_list[-1][0][0]
 
+    def _ensure_raising(self, returncode):
+        """Drive _devshell_ensure_container with a `docker run` that
+        fails, and return the message it exits with."""
+        manifest = {"build_env": {"ccache": {
+            "base_dir": "/home/runner/work/x/x", "hash_dir": "false",
+        }}}
+        boom = subprocess.CalledProcessError(returncode, ["docker", "run"])
+        with mock.patch.object(self.repro, "_devshell_container_exists",
+                               return_value=False), \
+             mock.patch.object(self.repro.subprocess, "run",
+                               side_effect=boom), \
+             mock.patch.object(self.repro, "_devshell_host_uid_gid",
+                               return_value=(1000, 1000)):
+            with self.assertRaises(SystemExit) as cm:
+                self.repro._devshell_ensure_container(
+                    self._args(), "devshell-x", "img:tag",
+                    "/home/runner/work/x/x", manifest,
+                    volume_name="devshell-x", work_host_bind=None,
+                    host_cache=None, patches_out=Path("/tmp/proj"),
+                )
+        return str(cm.exception)
+
+    def test_docker_run_failure_exits_without_traceback(self):
+        # A failed pull used to surface as a raw CalledProcessError
+        # traceback with the whole argv in it -- 25 lines that bury
+        # docker's own one-line diagnostic.
+        msg = self._ensure_raising(125)
+        self.assertIn("`docker run` failed (exit 125)", msg)
+        self.assertIn("docker pull img:tag", msg)
+
+    def test_docker_run_failure_other_rc_omits_pull_hint(self):
+        # 125 means "container never started" (usually a missing
+        # image); other codes come from the container itself, where
+        # suggesting a pull would be a red herring.
+        msg = self._ensure_raising(1)
+        self.assertIn("`docker run` failed (exit 1)", msg)
+        self.assertNotIn("docker pull", msg)
+
     def test_volume_mode_binds_volume_at_workspace(self):
         patches = Path("/tmp/proj")
         argv = self._run_ensure(
