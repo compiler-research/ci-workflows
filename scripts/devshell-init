@@ -104,10 +104,30 @@ ws=""
 if [[ -n "${DEVSHELL_BUILD:-}" ]]; then
   ws="${DEVSHELL_BUILD%/_recipe_work*}"
   if [[ -d "$ws" ]]; then
-    cur_uid=$(stat -c %u "$ws" 2>/dev/null || echo "")
-    if [[ "$cur_uid" != "$dev_uid" ]]; then
-      chown -R "$dev_uid:$dev_gid" "$ws"
-    fi
+    # Docker Desktop's file sharing already maps host ownership into
+    # the container -- host-created files read back as the host uid,
+    # which is $dev_uid -- so the walk buys nothing there. It also
+    # cannot succeed: chown(2) over the shim is refused on read-only
+    # files, and git's pack files are 0444, so `set -e` would abort
+    # the whole config. The mount root itself always reads back as
+    # uid 0 on those filesystems, which is what fools the stat gate
+    # below into trying in the first place.
+    #
+    # A named volume is a real Linux filesystem seeded as root, and
+    # there the walk is exactly what makes the tree writable by dev.
+    fstype=$(awk -v p="$ws" '$2 == p { print $3 }' /proc/mounts | tail -1)
+    case "$fstype" in
+      fakeowner|virtiofs|osxfs|fuse.grpcfuse)
+        echo "devshell-init: $ws is a $fstype bind; host ownership is" \
+             "already mapped, skipping chown."
+        ;;
+      *)
+        cur_uid=$(stat -c %u "$ws" 2>/dev/null || echo "")
+        if [[ "$cur_uid" != "$dev_uid" ]]; then
+          chown -R "$dev_uid:$dev_gid" "$ws"
+        fi
+        ;;
+    esac
   fi
 fi
 
@@ -143,14 +163,18 @@ if [[ -d "${DEVSHELL_CACHE_MOUNT:-/cache}" ]]; then
     "$claude_root/skills" "$claude_root/settings.json" 2>/dev/null || true
 fi
 
-# Forkable AI-CLI installer. Default is a no-op stub; a downstream
-# fork's repro-config can replace `devshell_install_ai_cli` with a
-# real installer (pip, curl|sh, ...).
-devshell_install_ai_cli() {
-  echo "devshell: no AI CLI installed by default. Bake one into the" >&2
-  echo "          image or override devshell_install_ai_cli in this" >&2
-  echo "          fork's scripts/repro-config." >&2
-}
+# Forkable AI-CLI installer. repro-config runs this script as a child
+# process rather than sourcing it, so an override reaches us only the
+# way bash carries a function across a fork: `export -f`. Define the
+# no-op stub only when the caller has not supplied one, otherwise we
+# would clobber the very override we exist to honour.
+if ! declare -F devshell_install_ai_cli >/dev/null; then
+  devshell_install_ai_cli() {
+    echo "devshell: no AI CLI installed by default. Bake one into the" >&2
+    echo "          image or export devshell_install_ai_cli from this" >&2
+    echo "          fork's scripts/repro-config." >&2
+  }
+fi
 if ! command -v claude >/dev/null 2>&1; then
   devshell_install_ai_cli || true
 fi

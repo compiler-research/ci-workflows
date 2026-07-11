@@ -1438,6 +1438,116 @@ class DevshellCellTests(unittest.TestCase):
         self.assertIn("doesn't pull from a recipe cache", str(cm.exception))
 
 
+class DevshellCoordArgvTests(unittest.TestCase):
+    """Pin that a direct `recipe/version/os/arch` coord in the
+    positional slot reaches _devshell_cell rather than the act matrix
+    globber, which can only miss: the shorthand exists precisely for
+    cells no consumer matrix references yet.
+    """
+
+    COORD = "llvm-release/22/ubuntu-24.04/x86_64"
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def _cell_of(self, argv):
+        """Drive main() over argv; report the cell name it hands to
+        --devshell and the pattern (if any) it sent to the globber.
+        main() parses sys.argv itself, so argv goes in that way."""
+        seen = {}
+
+        def fake_devshell(a):
+            seen["name"] = self.repro._matrix_get(a.matrix or [], "name")
+            return 0
+
+        with mock.patch.object(sys, "argv", ["bin/repro"] + argv), \
+             mock.patch.object(self.repro, "cmd_devshell",
+                               side_effect=fake_devshell), \
+             mock.patch.object(self.repro, "_resolve_pattern") as glob, \
+             redirect_stderr(io.StringIO()):
+            self.assertEqual(self.repro.main(), 0)
+        seen["globbed"] = glob.called
+        seen["pattern"] = glob.call_args[0][0] if glob.called else None
+        return seen
+
+    def test_coord_positional_bypasses_the_matrix_globber(self):
+        seen = self._cell_of(["--devshell", self.COORD])
+        self.assertEqual(seen["name"], self.COORD)
+        self.assertFalse(seen["globbed"])
+
+    def test_row_name_positional_still_globs(self):
+        seen = self._cell_of(["--devshell", "ubu24-*-cppyy"])
+        self.assertEqual(seen["pattern"], "ubu24-*-cppyy")
+
+    def test_slashed_non_coord_positional_still_globs(self):
+        # Only the 4-part shape is unambiguously a coord. A row name is
+        # free to contain a slash, and must keep resolving through the
+        # globber rather than be mistaken for a malformed coord.
+        seen = self._cell_of(["--devshell", "llvm-release/22"])
+        self.assertEqual(seen["pattern"], "llvm-release/22")
+
+    def test_coord_positional_without_devshell_still_globs(self):
+        # The shorthand is a --devshell affordance; an act run must
+        # keep treating the positional as a row-name glob.
+        with mock.patch.object(sys, "argv", ["bin/repro", self.COORD]), \
+             mock.patch.object(self.repro, "_resolve_pattern") as glob, \
+             redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.repro.main()
+        self.assertTrue(glob.called)
+
+
+class DevshellHostCacheFlagTests(unittest.TestCase):
+    """Pin that no host-cache flag can absorb the cell.
+
+    --devshell-host-cache once took an optional DIR, and argparse binds
+    an optional's nargs="?" value greedily: the cell landed in the flag
+    and main() was left with no row name at all.
+    """
+
+    COORD = "llvm-release/22/ubuntu-24.04/x86_64"
+    # The resolver resolve()s the dir, and Windows anchors a rooted
+    # path to the current drive: `/hc` comes back as `D:\hc`.
+    HC = Path("/hc").resolve()
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def _cell_and_cache(self, argv):
+        seen = {}
+
+        def fake_devshell(a):
+            seen["name"] = self.repro._matrix_get(a.matrix or [], "name")
+            seen["cache"] = self.repro._devshell_resolve_host_cache(a)
+            return 0
+
+        with mock.patch.object(sys, "argv", ["bin/repro"] + argv), \
+             mock.patch.object(self.repro, "cmd_devshell",
+                               side_effect=fake_devshell), \
+             redirect_stderr(io.StringIO()):
+            self.assertEqual(self.repro.main(), 0)
+        return seen
+
+    def test_bare_flag_keeps_the_cell_and_takes_the_default_dir(self):
+        seen = self._cell_and_cache(
+            ["--devshell", "--devshell-host-cache", self.COORD])
+        self.assertEqual(seen["name"], self.COORD)
+        self.assertEqual(seen["cache"],
+                         self.repro.DEVSHELL_HOST_CACHE_DEFAULT)
+
+    def test_explicit_dir_flag_keeps_the_cell(self):
+        seen = self._cell_and_cache(
+            ["--devshell", "--devshell-host-cache-dir", "/hc", self.COORD])
+        self.assertEqual(seen["name"], self.COORD)
+        self.assertEqual(seen["cache"], self.HC)
+
+    def test_explicit_dir_wins_over_the_bare_flag(self):
+        seen = self._cell_and_cache(
+            ["--devshell", "--devshell-host-cache",
+             "--devshell-host-cache-dir", "/hc", self.COORD])
+        self.assertEqual(seen["cache"], self.HC)
+
+
 class DevshellImageTests(unittest.TestCase):
     """Pin --devshell's runner-image mapping: matches act's catthehacker
     defaults for supported Ubuntu cells, refuses other OSes."""
@@ -1459,6 +1569,27 @@ class DevshellImageTests(unittest.TestCase):
         self.assertIn("Linux Ubuntu cells", str(cm.exception))
 
 
+class DevshellPlatformTests(unittest.TestCase):
+    """Pin the cell-arch -> docker-platform mapping. Without it docker
+    serves the host's own variant of the multi-arch image, which on an
+    Apple Silicon host hands an x86_64 cell an arm64 container.
+    """
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def test_cell_arch_maps_to_docker_platform(self):
+        self.assertEqual(self.repro._devshell_platform("x86_64"),
+                         "linux/amd64")
+        self.assertEqual(self.repro._devshell_platform("arm64"),
+                         "linux/arm64")
+
+    def test_unknown_arch_exits_with_explanation(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.repro._devshell_platform("riscv64")
+        self.assertIn("docker platform", str(cm.exception))
+
+
 class DevshellHermeticResolverTests(unittest.TestCase):
     """Pin --devshell host-cache, patches-out, and AI-key resolution.
 
@@ -1471,23 +1602,26 @@ class DevshellHermeticResolverTests(unittest.TestCase):
         self.repro = _load_repro()
 
     def _ns(self, **kw):
-        kw.setdefault("devshell_host_cache", None)
+        kw.setdefault("devshell_host_cache", False)
+        kw.setdefault("devshell_host_cache_dir", None)
         kw.setdefault("devshell_patches_out", None)
         return argparse.Namespace(**kw)
 
-    def test_host_cache_none_returns_none(self):
+    def test_host_cache_off_returns_none(self):
         self.assertIsNone(self.repro._devshell_resolve_host_cache(
-            self._ns(devshell_host_cache=None)))
+            self._ns()))
 
     def test_host_cache_bare_uses_default(self):
         p = self.repro._devshell_resolve_host_cache(
-            self._ns(devshell_host_cache="__default__"))
+            self._ns(devshell_host_cache=True))
         self.assertEqual(p, self.repro.DEVSHELL_HOST_CACHE_DEFAULT)
 
     def test_host_cache_explicit_dir_resolves_absolute(self):
-        with tempfile.TemporaryDirectory() as td:
-            p = self.repro._devshell_resolve_host_cache(
-                self._ns(devshell_host_cache=td))
+        # `~` included: the dir need not exist yet, so expansion (not
+        # existence) is what makes the bind land where the user meant.
+        p = self.repro._devshell_resolve_host_cache(
+            self._ns(devshell_host_cache_dir="~/mycache"))
+        self.assertEqual(p, Path.home() / "mycache")
         self.assertTrue(p.is_absolute())
 
     def test_patches_out_defaults_to_cwd(self):
@@ -1564,8 +1698,121 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
                 work_host_bind=work_host_bind,
                 host_cache=host_cache,
                 patches_out=patches_out,
+                docker_platform="linux/amd64",
             )
         return run.call_args_list[-1][0][0]
+
+    def _ensure_raising(self, returncode):
+        """Drive _devshell_ensure_container with a `docker run` that
+        fails, and return the message it exits with."""
+        manifest = {"build_env": {"ccache": {
+            "base_dir": "/home/runner/work/x/x", "hash_dir": "false",
+        }}}
+        boom = subprocess.CalledProcessError(returncode, ["docker", "run"])
+        with mock.patch.object(self.repro, "_devshell_container_exists",
+                               return_value=False), \
+             mock.patch.object(self.repro.subprocess, "run",
+                               side_effect=boom), \
+             mock.patch.object(self.repro, "_devshell_host_uid_gid",
+                               return_value=(1000, 1000)):
+            with self.assertRaises(SystemExit) as cm:
+                self.repro._devshell_ensure_container(
+                    self._args(), "devshell-x", "img:tag",
+                    "/home/runner/work/x/x", manifest,
+                    volume_name="devshell-x", work_host_bind=None,
+                    host_cache=None, patches_out=Path("/tmp/proj"),
+                    docker_platform="linux/amd64",
+                )
+        return str(cm.exception)
+
+    def test_docker_run_failure_exits_without_traceback(self):
+        # A failed pull used to surface as a raw CalledProcessError
+        # traceback with the whole argv in it -- 25 lines that bury
+        # docker's own one-line diagnostic.
+        msg = self._ensure_raising(125)
+        self.assertIn("`docker run` failed (exit 125)", msg)
+        self.assertIn("docker pull img:tag", msg)
+
+    def test_docker_run_failure_other_rc_omits_pull_hint(self):
+        # 125 means "container never started" (usually a missing
+        # image); other codes come from the container itself, where
+        # suggesting a pull would be a red herring.
+        msg = self._ensure_raising(1)
+        self.assertIn("`docker run` failed (exit 1)", msg)
+        self.assertNotIn("docker pull", msg)
+
+    def _ensure_existing(self, actual_binds, **kw):
+        """Drive _devshell_ensure_container against a container that
+        already exists with `actual_binds`; report the docker argvs it
+        ran (empty when it simply reused the container)."""
+        manifest = {"build_env": {"ccache": {
+            "base_dir": "/home/runner/work/x/x", "hash_dir": "false",
+        }}}
+        kw.setdefault("volume_name", "devshell-x")
+        kw.setdefault("work_host_bind", None)
+        kw.setdefault("host_cache", None)
+        kw.setdefault("patches_out", Path("/tmp/proj"))
+        kw.setdefault("docker_platform", "linux/amd64")
+        with mock.patch.object(self.repro, "_devshell_container_exists",
+                               return_value=True), \
+             mock.patch.object(self.repro, "_devshell_container_running",
+                               return_value=True), \
+             mock.patch.object(self.repro, "_devshell_container_binds",
+                               return_value=actual_binds), \
+             mock.patch.object(self.repro, "_devshell_container_arch",
+                               return_value=kw.pop("actual_arch",
+                                                   "amd64")), \
+             mock.patch.object(self.repro.subprocess, "run") as run, \
+             mock.patch.object(self.repro, "_devshell_host_uid_gid",
+                               return_value=(1000, 1000)), \
+             redirect_stderr(io.StringIO()):
+            self.repro._devshell_ensure_container(
+                self._args(), "devshell-x", "img:tag",
+                "/home/runner/work/x/x", manifest, **kw)
+        return [c[0][0] for c in run.call_args_list]
+
+    def _fresh_binds(self):
+        # Host sources are Path-derived, so they serialise with `\` on
+        # Windows and `/` elsewhere -- spell them the same way the
+        # desired-bind map does, or every container looks stale.
+        return {
+            "/home/runner/work/x/x": "devshell-x",
+            "/patches": str(Path("/tmp/proj")),
+            "/ci-workflows": str(self.repro.REPO_ROOT),
+        }
+
+    def test_matching_container_is_reused_not_recreated(self):
+        # Already running with the mounts this run wants: do nothing.
+        self.assertEqual(self._ensure_existing(self._fresh_binds()), [])
+
+    def test_container_with_stale_workspace_bind_is_recreated(self):
+        # The real-world case: a container created against an older
+        # cache layout keeps its old bind, so the shell would show a
+        # tree that is NOT the one repro just fetched into.
+        stale = self._fresh_binds()
+        stale["/home/runner/work/x/x"] = "/old/cache/layout"
+        argvs = self._ensure_existing(
+            stale, volume_name=None,
+            work_host_bind=Path("/new/cache/cells/x"))
+        self.assertIn(["docker", "rm", "-f", "devshell-x"], argvs)
+        self.assertTrue(any(a[:2] == ["docker", "run"] for a in argvs))
+
+    def test_container_of_wrong_arch_is_recreated(self):
+        # A container created before --platform was passed took the
+        # host's own arch. On Apple Silicon that is arm64, which cannot
+        # run an x86_64 cell's binaries -- and its binds look correct,
+        # so only the arch check catches it.
+        self.assertIn(["docker", "rm", "-f", "devshell-x"],
+                      self._ensure_existing(self._fresh_binds(),
+                                            actual_arch="arm64"))
+
+    def test_platform_is_pinned_on_docker_run(self):
+        argv = self._run_ensure(
+            volume_name="devshell-x", work_host_bind=None,
+            host_cache=None, patches_out=Path("/tmp/proj"),
+        )
+        self.assertIn("--platform", argv)
+        self.assertEqual(argv[argv.index("--platform") + 1], "linux/amd64")
 
     def test_volume_mode_binds_volume_at_workspace(self):
         patches = Path("/tmp/proj")

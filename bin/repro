@@ -174,14 +174,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="with --devshell: remove the persistent container "
                         "and exit. Named volumes are kept (use "
                         "`docker volume rm devshell-<cell>` to reclaim).")
-    p.add_argument("--devshell-host-cache", nargs="?",
-                   const="__default__", default=None, metavar="DIR",
-                   help="with --devshell: bind a single host directory "
-                        "at /cache for persistence and AI tooling. "
-                        "Bare flag uses ~/.cache/ci-workflows/"
-                        "devshell-cache/. Expected layout: "
+    # Deliberately store_true rather than nargs="?" with an optional
+    # DIR: argparse binds an optional's nargs="?" value greedily, so
+    # `--devshell-host-cache <cell>` parked the cell in the flag and
+    # left the positional empty. The explicit path gets its own flag
+    # below, which no amount of argument order can confuse.
+    p.add_argument("--devshell-host-cache", action="store_true",
+                   help="with --devshell: bind ~/.cache/ci-workflows/"
+                        "devshell-cache/ at /cache for persistence and "
+                        "AI tooling. Expected layout: "
                         "cells/<cell-id>/{src,build,ccache}, "
-                        "ai/{skills,settings.json,memory/<repo>/<encoded>}.")
+                        "ai/{skills,settings.json,memory/<repo>/<encoded>}. "
+                        "Use --devshell-host-cache-dir to bind a "
+                        "different directory.")
+    p.add_argument("--devshell-host-cache-dir", metavar="DIR",
+                   help="with --devshell: like --devshell-host-cache, "
+                        "but bind DIR at /cache instead of the default "
+                        "location.")
     p.add_argument("--devshell-patches-out", metavar="DIR",
                    help="with --devshell: host directory bound at "
                         "/patches inside the container (rw). Defaults "
@@ -1049,6 +1058,25 @@ def _devshell_image(os_slug: str) -> str:
              f"only (cell os={os_slug})")
 
 
+def _devshell_platform(arch: str) -> str:
+    """Docker platform for the cell's arch.
+
+    The catthehacker images are multi-arch, so without --platform
+    docker silently picks the host's own architecture. On an Apple
+    Silicon host that means an arm64 container holding an x86_64
+    install tree: nothing the producer shipped can execute, and
+    anything rebuilt inside comes out arm64 and cannot link against
+    it. Pinning the platform to the cell's arch is what makes the
+    published binaries runnable, via Rosetta / qemu on a foreign host.
+    """
+    if arch == "x86_64":
+        return "linux/amd64"
+    if arch == "arm64":
+        return "linux/arm64"
+    sys.exit(f"error: --devshell cannot map cell arch '{arch}' to a "
+             f"docker platform (expected x86_64 or arm64)")
+
+
 def _devshell_compute_key(coord: Dict[str, str]) -> str:
     """Run actions/setup-recipe/compute_key.py the same way
     publish-recipe/setup-recipe do, to get a content-hash key that
@@ -1240,15 +1268,15 @@ def _devshell_host_uid_gid() -> Tuple[int, int]:
 
 
 def _devshell_resolve_host_cache(args: argparse.Namespace) -> Optional[Path]:
-    """Map --devshell-host-cache (None/bare/explicit) to an absolute Path,
-    or None for the fully ephemeral default.
+    """Map --devshell-host-cache / --devshell-host-cache-dir to an
+    absolute Path, or None for the fully ephemeral default.
     """
-    v = args.devshell_host_cache
-    if v is None:
-        return None
-    if v == "__default__":
+    v = getattr(args, "devshell_host_cache_dir", None)
+    if v:
+        return Path(v).expanduser().resolve()
+    if args.devshell_host_cache:
         return DEVSHELL_HOST_CACHE_DEFAULT
-    return Path(v).expanduser().resolve()
+    return None
 
 
 def _devshell_resolve_patches_out(args: argparse.Namespace) -> Path:
@@ -1292,7 +1320,7 @@ def _devshell_ensure_volume(name: str) -> None:
 
 
 def _devshell_seed_volume(volume: str, image: str, ws: str,
-                          src: Path) -> None:
+                          src: Path, docker_platform: str) -> None:
     """Copy `src`/. into the named volume at `ws`.
 
     One-shot container, not host `tar` piped through stdin, so the
@@ -1302,6 +1330,7 @@ def _devshell_seed_volume(volume: str, image: str, ws: str,
     """
     subprocess.run(
         ["docker", "run", "--rm",
+         "--platform", docker_platform,
          "-v", f"{volume}:{ws}",
          "-v", f"{src}:/seed:ro",
          image,
@@ -1311,12 +1340,68 @@ def _devshell_seed_volume(volume: str, image: str, ws: str,
     )
 
 
+def _devshell_container_binds(name: str) -> Dict[str, str]:
+    """Map destination -> source for an existing container's mounts.
+    A volume reports its name as the source; a bind, its host path.
+    """
+    r = subprocess.run(
+        ["docker", "inspect", name, "--format",
+         '{{range .Mounts}}{{.Destination}}\t'
+         '{{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}'
+         '\n{{end}}'],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return {}
+    binds = {}
+    for line in r.stdout.splitlines():
+        dst, _, src = line.partition("\t")
+        if dst:
+            binds[dst] = src
+    return binds
+
+
+def _devshell_container_arch(name: str) -> str:
+    """Architecture of the image an existing container was created
+    from ("amd64" / "arm64"), or "" when it can't be determined.
+    """
+    r = subprocess.run(
+        ["docker", "inspect", name, "--format", "{{.Image}}"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return ""
+    r = subprocess.run(
+        ["docker", "image", "inspect", r.stdout.strip(),
+         "--format", "{{.Architecture}}"],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _devshell_desired_binds(ws: str, *, volume_name: Optional[str],
+                            work_host_bind: Optional[Path],
+                            host_cache: Optional[Path],
+                            patches_out: Path) -> Dict[str, str]:
+    """The mounts the container must have to serve this invocation."""
+    workspace = volume_name if volume_name else str(work_host_bind)
+    binds = {
+        ws: workspace,
+        DEVSHELL_PATCHES_MOUNT: str(patches_out),
+        "/ci-workflows": str(REPO_ROOT),
+    }
+    if host_cache is not None:
+        binds[DEVSHELL_CACHE_MOUNT] = str(host_cache)
+    return binds
+
+
 def _devshell_ensure_container(args: argparse.Namespace, name: str,
                                image: str, ws: str, manifest: Dict,
                                *, volume_name: Optional[str],
                                work_host_bind: Optional[Path],
                                host_cache: Optional[Path],
-                               patches_out: Path) -> None:
+                               patches_out: Path,
+                               docker_platform: str) -> None:
     """Idempotently start the devshell container.
 
     `volume_name` and `work_host_bind` are mutually exclusive: the
@@ -1325,11 +1410,43 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
     `host_cache`, when given, is additionally bound at /cache.
     `patches_out` is always bound at /patches.
     """
+    desired = _devshell_desired_binds(
+        ws, volume_name=volume_name, work_host_bind=work_host_bind,
+        host_cache=host_cache, patches_out=patches_out,
+    )
     if _devshell_container_exists(name):
-        if not _devshell_container_running(name):
-            subprocess.run(["docker", "start", name], check=True,
+        # Mounts are fixed at creation: docker cannot remount a
+        # container that already exists. So a container left over from
+        # an invocation with a different --devshell-host-cache, a
+        # different $PWD, or an older cache layout keeps pointing at
+        # the paths it was born with -- while this run provisions the
+        # ones it just computed. The tree the shell sees would then
+        # silently not be the tree repro just fetched into.
+        #
+        # Re-creating is cheap and safe: every durable byte lives in
+        # the named volume, the host cache, or the image.
+        actual = _devshell_container_binds(name)
+        stale = sorted(d for d, src in desired.items()
+                       if actual.get(d) != src)
+        # Same for the architecture: a container predating --platform
+        # was created from whatever variant of the multi-arch image
+        # matched the host, which on Apple Silicon is arm64 -- the one
+        # arch that cannot run an x86_64 cell's binaries.
+        want_arch = docker_platform.split("/")[-1]
+        got_arch = _devshell_container_arch(name)
+        if got_arch and got_arch != want_arch:
+            stale.append(f"architecture ({got_arch}, want {want_arch})")
+        if stale:
+            _log(f"repro: devshell container {name} was created with a "
+                 f"different {', '.join(stale)}; re-creating it against "
+                 f"this run's configuration")
+            subprocess.run(["docker", "rm", "-f", name], check=True,
                            stdout=subprocess.DEVNULL)
-        return
+        else:
+            if not _devshell_container_running(name):
+                subprocess.run(["docker", "start", name], check=True,
+                               stdout=subprocess.DEVNULL)
+            return
     cfg = _devshell_ccache_cfg(manifest)
     no_hash_dir = "true" if cfg.get("hash_dir") == "false" else "false"
     uid, gid = _devshell_host_uid_gid()
@@ -1378,15 +1495,29 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
     # Start as root: repro-config needs apt-install + chown. `--user`
     # is deferred to the interactive `docker exec` so the AI runs as
     # `dev`.
-    subprocess.run(
-        ["docker", "run", "-d",
-         "--name", name,
-         *mount_args,
-         "-w", ws,
-         *env_args,
-         image, "sleep", "infinity"],
-        check=True, stdout=subprocess.DEVNULL,
-    )
+    try:
+        subprocess.run(
+            ["docker", "run", "-d",
+             "--platform", docker_platform,
+             "--name", name,
+             *mount_args,
+             "-w", ws,
+             *env_args,
+             image, "sleep", "infinity"],
+            check=True, stdout=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError as e:
+        # docker already printed its own diagnostic to stderr; a
+        # 25-line Python traceback on top of it just buries the line
+        # the user needs. 125 is docker's "container never started",
+        # and by far its most common cause here is a pull that didn't
+        # land -- the image is ~1 GB and the daemon fetches it through
+        # its own proxy, which times out more often than the host does.
+        hint = (f"\nhint: the image may not have pulled; run "
+                f"`docker pull {image}` and try again"
+                if e.returncode == 125 else "")
+        sys.exit(f"error: `docker run` failed (exit {e.returncode}) "
+                 f"starting devshell container {name}{hint}")
 
 
 def _devshell_run_config(name: str, ws: str) -> None:
@@ -1438,6 +1569,7 @@ def cmd_devshell(args: argparse.Namespace) -> int:
 
     coord = _devshell_cell(args)
     image = args.devshell_image or _devshell_image(coord["os"])
+    docker_platform = _devshell_platform(coord["arch"])
     key = _devshell_compute_key(coord)
     base = cache_io.resolve_cache_base()
 
@@ -1494,7 +1626,8 @@ def cmd_devshell(args: argparse.Namespace) -> int:
                      f"skipping host fetch")
             else:
                 _devshell_source(ws_probe_dir, manifest)
-                _devshell_seed_volume(volume, image, ws, ws_probe_dir)
+                _devshell_seed_volume(volume, image, ws, ws_probe_dir,
+                                      docker_platform)
         finally:
             shutil.rmtree(ws_probe_dir, ignore_errors=True)
         work_host_bind = None
@@ -1507,6 +1640,7 @@ def cmd_devshell(args: argparse.Namespace) -> int:
         work_host_bind=work_host_bind,
         host_cache=host_cache,
         patches_out=patches_out,
+        docker_platform=docker_platform,
     )
     _devshell_run_config(name, ws)
 
@@ -1821,7 +1955,17 @@ def main() -> int:
             and not args.job):
         pattern = args.passthrough[0]
         args.passthrough = args.passthrough[1:]
-        _resolve_pattern(pattern, args)
+        # A `recipe/version/os/arch` coord names a cell in cells.yaml,
+        # not a matrix row, and _devshell_cell resolves it directly --
+        # the whole point of the shorthand is to reach cells that no
+        # consumer matrix references yet, so globbing it against act's
+        # rows could only miss. Anything else, including a malformed
+        # coord, still goes to the globber: a row name is free to
+        # contain a slash, and only the 4-part shape is unambiguous.
+        if args.devshell and len(pattern.split("/")) == 4:
+            args.matrix = (args.matrix or []) + [f"name:{pattern}"]
+        else:
+            _resolve_pattern(pattern, args)
 
     # --devshell short-circuits the act run: provision the cell's
     # recipe install + sibling ccache + matching LLVM source, then

@@ -17,6 +17,24 @@ if ! command -v ccache >/dev/null 2>&1; then
     cmake ninja-build zstd ccache rsync clang libedit-dev git sudo
 fi
 
+# The AI CLI the devshell is built to host. devshell-init calls this
+# hook when `claude` isn't already on PATH, and honours an exported
+# override in place of its own no-op stub -- so this is what actually
+# puts claude in the shell. npm's global prefix inside the act image is
+# the node toolcache, which is on PATH for root and dev alike, so one
+# root-side install serves the unprivileged shell too.
+#
+# Never fatal: a devshell with no AI is still a working devshell, and
+# repro-config runs under `set -e`.
+devshell_install_ai_cli() {
+  echo "devshell: installing claude-code..."
+  if ! npm install -g @anthropic-ai/claude-code >/dev/null 2>&1; then
+    echo "::warning::devshell: claude-code install failed; install it" \
+         "by hand in the shell (npm install -g @anthropic-ai/claude-code)"
+  fi
+}
+export -f devshell_install_ai_cli
+
 bash /usr/local/bin/devshell-init
 
 # Detect & install whatever libstdc++-N-dev the producer used. Read
