@@ -1569,6 +1569,27 @@ class DevshellImageTests(unittest.TestCase):
         self.assertIn("Linux Ubuntu cells", str(cm.exception))
 
 
+class DevshellPlatformTests(unittest.TestCase):
+    """Pin the cell-arch -> docker-platform mapping. Without it docker
+    serves the host's own variant of the multi-arch image, which on an
+    Apple Silicon host hands an x86_64 cell an arm64 container.
+    """
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def test_cell_arch_maps_to_docker_platform(self):
+        self.assertEqual(self.repro._devshell_platform("x86_64"),
+                         "linux/amd64")
+        self.assertEqual(self.repro._devshell_platform("arm64"),
+                         "linux/arm64")
+
+    def test_unknown_arch_exits_with_explanation(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.repro._devshell_platform("riscv64")
+        self.assertIn("docker platform", str(cm.exception))
+
+
 class DevshellHermeticResolverTests(unittest.TestCase):
     """Pin --devshell host-cache, patches-out, and AI-key resolution.
 
@@ -1677,6 +1698,7 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
                 work_host_bind=work_host_bind,
                 host_cache=host_cache,
                 patches_out=patches_out,
+                docker_platform="linux/amd64",
             )
         return run.call_args_list[-1][0][0]
 
@@ -1699,6 +1721,7 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
                     "/home/runner/work/x/x", manifest,
                     volume_name="devshell-x", work_host_bind=None,
                     host_cache=None, patches_out=Path("/tmp/proj"),
+                    docker_platform="linux/amd64",
                 )
         return str(cm.exception)
 
@@ -1717,6 +1740,79 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
         msg = self._ensure_raising(1)
         self.assertIn("`docker run` failed (exit 1)", msg)
         self.assertNotIn("docker pull", msg)
+
+    def _ensure_existing(self, actual_binds, **kw):
+        """Drive _devshell_ensure_container against a container that
+        already exists with `actual_binds`; report the docker argvs it
+        ran (empty when it simply reused the container)."""
+        manifest = {"build_env": {"ccache": {
+            "base_dir": "/home/runner/work/x/x", "hash_dir": "false",
+        }}}
+        kw.setdefault("volume_name", "devshell-x")
+        kw.setdefault("work_host_bind", None)
+        kw.setdefault("host_cache", None)
+        kw.setdefault("patches_out", Path("/tmp/proj"))
+        kw.setdefault("docker_platform", "linux/amd64")
+        with mock.patch.object(self.repro, "_devshell_container_exists",
+                               return_value=True), \
+             mock.patch.object(self.repro, "_devshell_container_running",
+                               return_value=True), \
+             mock.patch.object(self.repro, "_devshell_container_binds",
+                               return_value=actual_binds), \
+             mock.patch.object(self.repro, "_devshell_container_arch",
+                               return_value=kw.pop("actual_arch",
+                                                   "amd64")), \
+             mock.patch.object(self.repro.subprocess, "run") as run, \
+             mock.patch.object(self.repro, "_devshell_host_uid_gid",
+                               return_value=(1000, 1000)), \
+             redirect_stderr(io.StringIO()):
+            self.repro._devshell_ensure_container(
+                self._args(), "devshell-x", "img:tag",
+                "/home/runner/work/x/x", manifest, **kw)
+        return [c[0][0] for c in run.call_args_list]
+
+    def _fresh_binds(self):
+        # Host sources are Path-derived, so they serialise with `\` on
+        # Windows and `/` elsewhere -- spell them the same way the
+        # desired-bind map does, or every container looks stale.
+        return {
+            "/home/runner/work/x/x": "devshell-x",
+            "/patches": str(Path("/tmp/proj")),
+            "/ci-workflows": str(self.repro.REPO_ROOT),
+        }
+
+    def test_matching_container_is_reused_not_recreated(self):
+        # Already running with the mounts this run wants: do nothing.
+        self.assertEqual(self._ensure_existing(self._fresh_binds()), [])
+
+    def test_container_with_stale_workspace_bind_is_recreated(self):
+        # The real-world case: a container created against an older
+        # cache layout keeps its old bind, so the shell would show a
+        # tree that is NOT the one repro just fetched into.
+        stale = self._fresh_binds()
+        stale["/home/runner/work/x/x"] = "/old/cache/layout"
+        argvs = self._ensure_existing(
+            stale, volume_name=None,
+            work_host_bind=Path("/new/cache/cells/x"))
+        self.assertIn(["docker", "rm", "-f", "devshell-x"], argvs)
+        self.assertTrue(any(a[:2] == ["docker", "run"] for a in argvs))
+
+    def test_container_of_wrong_arch_is_recreated(self):
+        # A container created before --platform was passed took the
+        # host's own arch. On Apple Silicon that is arm64, which cannot
+        # run an x86_64 cell's binaries -- and its binds look correct,
+        # so only the arch check catches it.
+        self.assertIn(["docker", "rm", "-f", "devshell-x"],
+                      self._ensure_existing(self._fresh_binds(),
+                                            actual_arch="arm64"))
+
+    def test_platform_is_pinned_on_docker_run(self):
+        argv = self._run_ensure(
+            volume_name="devshell-x", work_host_bind=None,
+            host_cache=None, patches_out=Path("/tmp/proj"),
+        )
+        self.assertIn("--platform", argv)
+        self.assertEqual(argv[argv.index("--platform") + 1], "linux/amd64")
 
     def test_volume_mode_binds_volume_at_workspace(self):
         patches = Path("/tmp/proj")
