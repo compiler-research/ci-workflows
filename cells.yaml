@@ -92,3 +92,12 @@ cells:
   - { recipe: llvm-root, version: 'ROOT-llvm20',   os: macos-26,        arch: arm64  }
   - { recipe: llvm-root, version: 'ROOT-llvm20',   os: macos-26-intel,  arch: x86_64 }
   - { recipe: llvm-root, version: 'ROOT-llvm20',   os: windows-2025,    arch: x86_64 }
+  # kokkos: pinned Serial/Release Kokkos for clad's *-kokkos rows. The apt
+  # Kokkos is unusable -- libtrilinos-kokkos-dev is the ancient Trilinos-
+  # bundled 3.4 (no host Kokkos::sqrt(double), only the complex overloads),
+  # and standalone libkokkos-dev ships a broken CMake package config -- so
+  # those rows consume this recipe instead. Because it is a source build,
+  # the rows keep their existing runner images: clad's non-arm kokkos row is
+  # ubuntu-22.04 (x86_64), its arm row ubuntu-24.04-arm.
+  - { recipe: kokkos,     version: '5.1.1',        os: ubuntu-22.04,     arch: x86_64 }
+  - { recipe: kokkos,     version: '5.1.1',        os: ubuntu-24.04-arm, arch: arm64  }

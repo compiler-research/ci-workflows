@@ -1,0 +1,26 @@
+recipe: kokkos
+description: |
+  Kokkos built from a tagged release (Serial backend, Release), installed
+  with its CMake package config so consumers find_package(Kokkos) and link
+  Kokkos::kokkos.
+
+  Why a source recipe rather than an apt package: Ubuntu's
+  libtrilinos-kokkos-dev is the Trilinos-bundled Kokkos 3.4, which predates
+  Kokkos's host MathematicalFunctions -- there is no Kokkos::sqrt(double),
+  only the Kokkos::complex overloads, so any host-math kernel fails to
+  compile. The standalone libkokkos-dev is newer (3.7 on Ubuntu 24.04, 5.x
+  on Debian sid) but ships a broken CMake package config (the imported
+  Kokkos::kokkos target references a non-existent include path on 24.04; a
+  KokkosTargets error on sid), so find_package(Kokkos) fails outright. A
+  pinned source build is the only reliable path to a modern,
+  find_package-able Kokkos in CI.
+
+  Serial-only keeps the build to ~1 minute and avoids the OpenMP-backend
+  requirement that Ubuntu's libkokkos-dev forces on every consumer TU.
+
+# Only fields read by build_manifest.py live here; the cmake invocation is
+# authoritative in build.py. Kokkos tags the release itself (no prefix), so
+# the version input is the tag, e.g. "5.1.1".
+source:
+  repo: https://github.com/kokkos/kokkos
+  branch_template: '{version}'

@@ -726,6 +726,12 @@ def build_act_command(args: argparse.Namespace) -> List[str]:
     cmd = [_require("act"), "-j", args.job]
     if args.workflow:
         cmd += ["-W", args.workflow]
+    if args.ci_workflows:
+        # Point setup-recipe at the local ci-workflows tree that
+        # _localize_workflow_for_ci_workflows staged, so un-pushed
+        # recipes build inline instead of being git-fetched from
+        # github. Path is relative to GITHUB_WORKSPACE in the container.
+        cmd += ["--env", f"CI_WORKFLOWS_LOCAL=.github/{_STAGE_DIR_NAME}/.repo"]
     # Default -P fallbacks for slugs act doesn't ship a mapping
     # for. Skip the slug if `~/.actrc` already maps it -- that's
     # the user's preferred image and command-line -P would silently
@@ -1837,7 +1843,7 @@ _STAGE_DIR_NAME = "act-ci-workflows-stage"
 def _localize_workflow_for_ci_workflows(
         workflow_path: Path, ci_workflows: Path) -> Path:
     """Stage the local ci-workflows actions under
-    `.github/.act-ci-workflows-stage/<name>` as symlinks, rewrite
+    `.github/.act-ci-workflows-stage/<name>` as copies, rewrite
     every `uses: compiler-research/ci-workflows/actions/<name>@<ref>`
     in `workflow_path` to `uses: ./.github/.act-ci-workflows-stage/
     <name>` (act's local-action form), and return the path to a
@@ -1849,10 +1855,10 @@ def _localize_workflow_for_ci_workflows(
         no `~/.cache/act/` involvement.
       - `<path>` must be inside the consumer's repo (act resolves
         relative to cwd / the workflow's repo root), so we stage
-        symlinks under `.github/`.
-      - Each ci-workflows action becomes its own symlink target
-        rather than the whole repo, so consumers reading the temp
-        workflow see a clean stage layout.
+        under `.github/`.
+      - Each ci-workflows action is copied individually, not the
+        whole repo -- act does not follow directory symlinks for
+        local actions, and a per-action layout keeps the stage clean.
     """
     consumer = Path.cwd()
     stage = consumer / ".github" / _STAGE_DIR_NAME
@@ -1874,13 +1880,32 @@ def _localize_workflow_for_ci_workflows(
         # of symlinking. Each action is a few small files; fast.
         shutil.copytree(action_dir, stage / action_dir.name)
 
-    text = workflow_path.read_text()
     rel = f"./.github/{_STAGE_DIR_NAME}"
-    text = re.sub(
-        r"uses:\s*compiler-research/ci-workflows/actions/(\w[\w-]*)@\S+",
-        lambda m: f"uses: {rel}/{m.group(1)}",
-        text,
-    )
+    nested_re = re.compile(
+        r"uses:\s*compiler-research/ci-workflows/actions/(\w[\w-]*)@\S+")
+
+    # Rewrite nested `uses:` inside the staged actions too: a composite
+    # action that calls another ci-workflows action (e.g. setup-kokkos ->
+    # setup-recipe) must resolve to the local staged copy, else act fetches
+    # it from github and the local change under test is bypassed.
+    for staged in stage.iterdir():
+        ay = staged / "action.yml"
+        if ay.is_file():
+            ay.write_text(nested_re.sub(
+                lambda m: f"uses: {rel}/{m.group(1)}", ay.read_text()))
+
+    # Also stage a full recipes+actions tree under .repo/ so setup-recipe
+    # can source un-pushed recipes locally (it reads __ci_workflows__/
+    # {recipes,actions}) instead of git-fetching from github. The run
+    # flow exports CI_WORKFLOWS_LOCAL=.github/<stage>/.repo to point at it.
+    repo_stage = stage / ".repo"
+    for sub in ("recipes", "actions"):
+        src = ci_workflows / sub
+        if src.is_dir():
+            shutil.copytree(src, repo_stage / sub)
+
+    text = workflow_path.read_text()
+    text = nested_re.sub(lambda m: f"uses: {rel}/{m.group(1)}", text)
     fd, tmp = tempfile.mkstemp(
         prefix=f"act-{workflow_path.stem}-localized-",
         suffix=".yml", dir=str(workflow_path.parent),
@@ -1893,7 +1918,7 @@ def _localize_workflow_for_ci_workflows(
 
 
 def _cleanup_ci_workflows_overlay() -> None:
-    """Remove the .github/.act-ci-workflows-stage/ symlink tree and
+    """Remove the .github/.act-ci-workflows-stage/ staging tree and
     any act-*-localized-*.yml temp workflow we wrote. Idempotent;
     best-effort."""
     consumer = Path.cwd()

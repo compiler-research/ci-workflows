@@ -102,13 +102,27 @@ runs:
         # `git remote add origin` ("remote already exists") since
         # `git init` is the only idempotent half of the pair.
         rm -rf __ci_workflows__
-        git init __ci_workflows__
-        cd __ci_workflows__
-        git remote add origin https://github.com/compiler-research/ci-workflows.git
-        git sparse-checkout init --no-cone
-        git sparse-checkout set recipes actions
-        git fetch --depth=1 origin "$REF"
-        git checkout FETCH_HEAD
+        # Local-checkout override: bin/repro --ci-workflows stages the
+        # dev's local ci-workflows tree (recipes + actions) into the
+        # consumer repo and exports CI_WORKFLOWS_LOCAL. Copy from there
+        # instead of fetching, so un-pushed recipe/action changes are
+        # exercised end-to-end. A relative value is resolved against
+        # GITHUB_WORKSPACE. Unset -> the normal git path below.
+        if [[ -n "${CI_WORKFLOWS_LOCAL:-}" ]]; then
+          src="${CI_WORKFLOWS_LOCAL}"
+          [[ "$src" != /* ]] && src="${GITHUB_WORKSPACE}/${src}"
+          mkdir -p __ci_workflows__
+          cp -r "$src/recipes" "$src/actions" __ci_workflows__/
+          echo "::notice title=setup-recipe::using local ci-workflows at $src (CI_WORKFLOWS_LOCAL)"
+        else
+          git init __ci_workflows__
+          cd __ci_workflows__
+          git remote add origin https://github.com/compiler-research/ci-workflows.git
+          git sparse-checkout init --no-cone
+          git sparse-checkout set recipes actions
+          git fetch --depth=1 origin "$REF"
+          git checkout FETCH_HEAD
+        fi
 
     - name: Compute key
       id: compute-key

@@ -1,0 +1,135 @@
+name: 'Setup Kokkos'
+description: |
+  Resolves a Kokkos install for consumer CI via the `kokkos` recipe: a
+  pinned Serial/Release source build that ships a working CMake package
+  config. Use this instead of an apt Kokkos -- libtrilinos-kokkos-dev is
+  the ancient Trilinos-bundled 3.4 (no host Kokkos::sqrt(double), only the
+  complex overloads) and the standalone libkokkos-dev ships a broken CMake
+  package config, so find_package(Kokkos) can consume neither.
+
+  The install lands at $GITHUB_WORKSPACE/kokkos -- a dedicated prefix, so
+  it coexists with setup-llvm's $GITHUB_WORKSPACE/install -- and Kokkos_ROOT
+  is exported via $GITHUB_ENV so a consumer's find_package(Kokkos) resolves
+  it with no further plumbing. Order relative to setup-llvm does not matter:
+  any pre-existing install/ is preserved across the recipe step, which
+  otherwise `rm -rf`s that path.
+
+inputs:
+  version:
+    required: false
+    default: '5.1.1'
+    description: 'Kokkos release tag to provision (interpolated into the recipe source branch).'
+  os:
+    required: true
+    description: |
+      OS slug for the recipe cache key -- a runner-image name like
+      "ubuntu-22.04" or "ubuntu-24.04-arm". Must match a cells.yaml entry
+      warmed for the kokkos recipe.
+  arch:
+    required: false
+    default: ''
+    description: |
+      Architecture slug (x86_64 / arm64). Derived from the os slug when
+      empty (ubuntu-*-arm -> arm64, else x86_64); pass explicitly on hosts
+      whose os slug doesn't carry the architecture.
+  build-on-miss:
+    required: false
+    default: 'false'
+    description: 'Forwarded to setup-recipe: build inline on a cache miss instead of failing fast.'
+  ref:
+    required: false
+    default: 'main'
+    description: 'ci-workflows ref for setup-recipe to read recipes/ from.'
+  cache-base:
+    required: false
+    default: ''
+    description: 'Forwarded to setup-recipe: override the recipe cache backend.'
+
+outputs:
+  prefix:
+    description: 'Kokkos install prefix ($GITHUB_WORKSPACE/kokkos).'
+    value: ${{ steps.finalize.outputs.prefix }}
+  kokkos-dir:
+    description: 'KokkosConfig.cmake directory.'
+    value: ${{ steps.finalize.outputs.kokkos-dir }}
+  cache-hit:
+    description: '"true" when the recipe came from the cache, "false" when built inline.'
+    value: ${{ steps.recipe.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve arch
+      id: resolve
+      shell: bash
+      env:
+        OS: ${{ inputs.os }}
+        ARCH_IN: ${{ inputs.arch }}
+      run: |
+        set -euo pipefail
+        if [[ -n "${ARCH_IN}" ]]; then
+          arch="${ARCH_IN}"
+        else
+          case "${OS}" in
+            *-arm) arch=arm64 ;;
+            *)     arch=x86_64 ;;
+          esac
+        fi
+        echo "arch=${arch}" >> "$GITHUB_OUTPUT"
+
+    # setup-recipe places the recipe at $GITHUB_WORKSPACE/install and
+    # `rm -rf`s that path first. Move any pre-existing install/ (e.g.
+    # setup-llvm's) aside so setup-kokkos is order-independent.
+    - name: Preserve existing install prefix
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ -d "${GITHUB_WORKSPACE}/install" ]]; then
+          rm -rf "${GITHUB_WORKSPACE}/.install.pre-kokkos"
+          mv "${GITHUB_WORKSPACE}/install" "${GITHUB_WORKSPACE}/.install.pre-kokkos"
+        fi
+
+    - name: Kokkos recipe (cache or inline build)
+      id: recipe
+      uses: compiler-research/ci-workflows/actions/setup-recipe@main
+      with:
+        recipe:        kokkos
+        version:       ${{ inputs.version }}
+        os:            ${{ inputs.os }}
+        arch:          ${{ steps.resolve.outputs.arch }}
+        build-on-miss: ${{ inputs.build-on-miss }}
+        ref:           ${{ inputs.ref }}
+        cache-base:    ${{ inputs.cache-base }}
+
+    # Relocate Kokkos to a dedicated prefix and restore the preserved
+    # install/, so Kokkos and setup-llvm's LLVM coexist.
+    - name: Relocate Kokkos and restore install prefix
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -rf "${GITHUB_WORKSPACE}/kokkos"
+        mv "${GITHUB_WORKSPACE}/install" "${GITHUB_WORKSPACE}/kokkos"
+        if [[ -d "${GITHUB_WORKSPACE}/.install.pre-kokkos" ]]; then
+          mv "${GITHUB_WORKSPACE}/.install.pre-kokkos" "${GITHUB_WORKSPACE}/install"
+        fi
+
+    - name: Finalize outputs
+      id: finalize
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        RECIPE_HIT: ${{ steps.recipe.outputs.cache-hit }}
+      run: |
+        set -euo pipefail
+        prefix="${GITHUB_WORKSPACE}/kokkos"
+        # lib vs lib64 varies by distro; Kokkos_ROOT lets find_package
+        # resolve either, and Kokkos_DIR points straight at the config.
+        kdir="$(dirname "$(find "${prefix}" -name KokkosConfig.cmake | head -1)")"
+        echo "prefix=${prefix}"       >> "$GITHUB_OUTPUT"
+        echo "kokkos-dir=${kdir}"     >> "$GITHUB_OUTPUT"
+        echo "Kokkos_ROOT=${prefix}"  >> "$GITHUB_ENV"
+        if [[ -n "${kdir}" ]]; then
+          echo "Kokkos_DIR=${kdir}"   >> "$GITHUB_ENV"
+        fi
+        src=$([[ "${RECIPE_HIT}" == "true" ]] && echo recipe-cache || echo inline-build)
+        echo "::notice title=setup-kokkos::version=${VERSION} source=${src} prefix=${prefix}"
