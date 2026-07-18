@@ -119,7 +119,7 @@ would collide with the workflow's `mkdir`, and drops you into a
 shell inside the post-run container. On shell exit you're prompted
 to dump any in-container edits as a patch on the host.
 
-Iterate on a `ci-workflows` action without pushing:
+Iterate on a `ci-workflows` action or recipe without pushing:
 
 ```bash
 ~/sources/ci-workflows/bin/repro \
@@ -127,8 +127,14 @@ Iterate on a `ci-workflows` action without pushing:
     <row-name>
 ```
 
-Stage / temp-workflow files are cleaned at exit; disk after the
-run is zero (image cache aside). See `bin/repro --help` and
+`--ci-workflows` stages the local recipes and actions into the consumer
+repo and rewrites every ci-workflows action `uses:` — both the
+workflow's top-level ones and those nested inside a staged composite
+action (e.g. `setup-kokkos` → `setup-recipe`) — to the staged copy;
+`setup-recipe` sources recipes from the stage instead of git-fetching.
+So an un-pushed action or recipe is exercised end-to-end. Stage /
+temp-workflow files are cleaned at exit; disk after the run is zero
+(image cache aside). See `bin/repro --help` and
 [docs/developer-guide.md](docs/developer-guide.md) for the rest.
 
 ## Iterating on LLVM with a warm ccache: `--devshell`
@@ -178,11 +184,12 @@ Linux container, with the platform-mismatch overhead under Rosetta.
 ```
 recipes/<name>/
   recipe.yaml          metadata fields the manifest reads
-  build.sh             imperative build invoked by setup-recipe and publish-recipe
+  build.py|build.sh    imperative build invoked by setup-recipe and publish-recipe
   patches/             optional, applied to the source tree
 
 actions/
   setup-recipe/        consumer-side: probe → download or build-on-miss
+  setup-kokkos/        consumer-side: setup-recipe wrapper that installs Kokkos and exports Kokkos_ROOT
   publish-recipe/      producer-side: build under ccache + tar/zstd + upload
   wake-on-lan/         send a magic packet to wake a self-hosted runner; no-op under act
   lib/cache-io.sh      scheme-aware probe/download/upload helpers; sourced by both actions and the CLI

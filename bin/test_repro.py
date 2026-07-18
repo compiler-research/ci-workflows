@@ -39,7 +39,7 @@ repro = _load_repro()
 def _ns(**kw) -> argparse.Namespace:
     defaults = dict(list=False, job=None, workflow=None, matrix=[],
                     shell=True, save_temps=False, dry_run=False,
-                    passthrough=[])
+                    passthrough=[], ci_workflows=None)
     defaults.update(kw)
     return argparse.Namespace(**defaults)
 
@@ -67,6 +67,18 @@ class BuildActCommandTests(unittest.TestCase):
         cmd = repro.build_act_command(_ns(job="test", shell=False))
         self.assertEqual(cmd[:3], ["act", "-j", "test"])
         self.assertNotIn("--reuse", cmd)
+
+    def test_ci_workflows_exports_local_env(self):
+        # --ci-workflows must point setup-recipe at the staged tree via
+        # CI_WORKFLOWS_LOCAL; without it, no such --env is emitted.
+        with_cw = repro.build_act_command(
+            _ns(job="build", shell=False, ci_workflows=Path("x")))
+        self.assertIn(
+            f"CI_WORKFLOWS_LOCAL=.github/{repro._STAGE_DIR_NAME}/.repo",
+            with_cw)
+        without = repro.build_act_command(_ns(job="build", shell=False))
+        self.assertFalse(any(a.startswith("CI_WORKFLOWS_LOCAL=")
+                             for a in without))
 
     def test_workflow_passes_dash_W(self):
         cmd = repro.build_act_command(
@@ -1858,6 +1870,69 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
         self.assertIn(
             "DEVSHELL_AI_REPO_ENCODED=-Users-v-work-CppInterOp2", argv)
         self.assertIn(f"HOME={self.repro.DEVSHELL_DEV_HOME}", argv)
+
+
+# ---------------------------------------------------------------------------
+# --ci-workflows local staging (_localize_workflow_for_ci_workflows)
+# ---------------------------------------------------------------------------
+
+class LocalizeWorkflowTests(unittest.TestCase):
+    """Staging must rewrite every ci-workflows action `uses:` -- top-level
+    and nested -- to the local copy, and stage a recipes+actions tree for
+    setup-recipe, so an un-pushed change is exercised instead of fetched."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        # A local ci-workflows checkout: a composite action that nests
+        # another ci-workflows action, plus a recipe.
+        self.ci = root / "ci-workflows"
+        (self.ci / "actions" / "setup-kokkos").mkdir(parents=True)
+        (self.ci / "actions" / "setup-recipe").mkdir(parents=True)
+        (self.ci / "recipes" / "kokkos").mkdir(parents=True)
+        (self.ci / "actions" / "setup-kokkos" / "action.yml").write_text(
+            "runs:\n  steps:\n    - uses: compiler-research/ci-workflows/"
+            "actions/setup-recipe@main\n")
+        (self.ci / "actions" / "setup-recipe" / "action.yml").write_text(
+            "runs:\n  using: composite\n")
+        (self.ci / "recipes" / "kokkos" / "recipe.yaml").write_text(
+            "name: kokkos\n")
+        # A consumer repo whose workflow uses the composite action.
+        self.consumer = root / "consumer"
+        wf_dir = self.consumer / ".github" / "workflows"
+        wf_dir.mkdir(parents=True)
+        self.workflow = wf_dir / "ci.yml"
+        self.workflow.write_text(
+            "jobs:\n  build:\n    steps:\n      - uses: compiler-research/"
+            "ci-workflows/actions/setup-kokkos@main\n")
+        # _localize reads Path.cwd() as the consumer repo root.
+        self._cwd = os.getcwd()
+        os.chdir(self.consumer)
+
+    def tearDown(self):
+        os.chdir(self._cwd)
+        self._tmp.cleanup()
+
+    def test_stages_and_rewrites_local_tree(self):
+        localized = repro._localize_workflow_for_ci_workflows(
+            self.workflow, self.ci)
+        stage = self.consumer / ".github" / repro._STAGE_DIR_NAME
+        rel = f"./.github/{repro._STAGE_DIR_NAME}"
+
+        # The composite action is staged locally (copied, not fetched) and
+        # its nested ci-workflows `uses:` now resolves to the staged copy.
+        nested = (stage / "setup-kokkos" / "action.yml").read_text()
+        self.assertIn(f"uses: {rel}/setup-recipe", nested)
+        self.assertNotIn("compiler-research/ci-workflows", nested)
+        # A recipes+actions tree is staged under .repo/ for setup-recipe to
+        # source via CI_WORKFLOWS_LOCAL instead of git-fetching.
+        self.assertTrue((stage / ".repo" / "recipes" / "kokkos").is_dir())
+        self.assertTrue((stage / ".repo" / "actions" / "setup-recipe").is_dir())
+        # The top-level `uses:` is rewritten in the temp workflow, and the
+        # original workflow is left untouched.
+        self.assertIn(f"uses: {rel}/setup-kokkos", localized.read_text())
+        self.assertIn("compiler-research/ci-workflows",
+                      self.workflow.read_text())
 
 
 if __name__ == "__main__":
