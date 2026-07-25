@@ -39,6 +39,10 @@ sys.path.insert(0, str(SCRIPT_DIR / ".." / ".." / "actions" / "lib"))
 
 import llvm_build  # noqa: E402
 
+# LLVM test utilities a consumer's lit suite resolves under the recipe
+# install prefix ($LLVM/bin/FileCheck; a few RUN lines use count/not).
+_LIT_UTILS = ["FileCheck", "count", "not"]
+
 
 def _oop_targets(build_dir: Path) -> list[str]:
     """Discover orc_rt_<platform> ninja targets in the configured build.
@@ -133,7 +137,17 @@ def main() -> int:
 
     cmake_args = (
         llvm_build.base_cmake_args(str(out_dir / "install"))
-        + [f"-DLLVM_ENABLE_PROJECTS={projects}"]
+        + [f"-DLLVM_ENABLE_PROJECTS={projects}",
+           # FileCheck and friends go through add_llvm_utility(), which
+           # emits an install rule and an install-<tool> target only under
+           # LLVM_INSTALL_UTILS -- OFF by default, hence no test tools in
+           # the artifact. With it ON they install into
+           # LLVM_UTILS_INSTALL_DIR, which defaults to bin/, and become
+           # ordinary LLVM_DISTRIBUTION_COMPONENTS candidates. Utilities
+           # left out of the distribution get an empty export arg
+           # (LLVMDistributionSupport.cmake, get_target_export_arg), so
+           # this ships the ones named below and no others.
+           "-DLLVM_INSTALL_UTILS=ON"]
         + llvm_build.dylib_flags()
         + compiler_rt_flags
         + llvm_build.cmake_extra()
@@ -144,9 +158,12 @@ def main() -> int:
 
     llvm_build.quick_check_or_continue()
 
+    # The lit utilities ride the main ninja line so they are on disk
+    # before cleanup_intermediates() drops the objects they build from.
     subprocess.run(
         ["ninja", "-j", ncpus,
-         "clang", "clangInterpreter", "clangStaticAnalyzerCore"],
+         "clang", "clangInterpreter", "clangStaticAnalyzerCore",
+         *_LIT_UTILS],
         check=True,
     )
 
@@ -166,8 +183,9 @@ def main() -> int:
     llvm_build.cleanup_intermediates()
 
     # Pass OOP_TARGETS as extra DIST_COMPONENTS so install-distribution
-    # ships them and LLVMExports.cmake stays self-consistent.
-    llvm_build.install_distribution(extras=oop_targets)
+    # ships them and LLVMExports.cmake stays self-consistent. The lit
+    # utilities ride along the same way.
+    llvm_build.install_distribution(extras=oop_targets + _LIT_UTILS)
 
     # llvm-jitlink-executor's CMakeLists registers an install() rule with
     # COMPONENT defaulting to "Unspecified", so it can't ride DIST
@@ -180,7 +198,10 @@ def main() -> int:
         shutil.copy(src_jitlink, dst)
         dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-    llvm_build.smoke()
+    # Fail the publish rather than the consumer: an artifact without the
+    # lit utilities is exactly the bug this recipe just grew a fix for.
+    exe = ".exe" if sys.platform == "win32" else ""
+    llvm_build.smoke(required_files=[f"bin/{t}{exe}" for t in _LIT_UTILS])
 
     print(f"build.py: done. SRC_COMMIT={src_commit}", flush=True)
     return 0
