@@ -15,21 +15,25 @@ Outputs (env, written to GITHUB_ENV when present):
   SRC_COMMIT             sha of llvm-project HEAD that was built
 
 FIXME: dedup with recipes/llvm-asan/build.py.
-The compiler-rt OFF flags below, the _oop_targets() helper, and the
-llvm-jitlink-executor install copy are near-verbatim copies from
-llvm-asan/build.py. Lift the three into actions/lib/llvm_build.py
-once a third LLVM-family recipe needs them (e.g. llvm-msan), or
-sooner if the duplication starts drifting between the two recipes.
+The compiler-rt OFF flags below and the _oop_targets() helper are
+near-verbatim copies from llvm-asan/build.py. Lift the two into
+actions/lib/llvm_build.py once a third LLVM-family recipe needs them
+(e.g. llvm-msan), or sooner if the duplication starts drifting between
+the two recipes. Note that actions/lib/**.py is in the recipe cache
+key, so the lift invalidates every cell in cells.yaml -- land it with
+a change that has to rebuild them anyway.
 The shape ranged from "small focused helpers" to "build_llvm_release
 function with kwargs that other recipes specialize"; pick at lift time.
+
+llvm-asan and llvm-debug still hand-copy the lit utilities out of
+build/bin. They can take the LLVM_INSTALL_UTILS route below instead;
+each move invalidates only its own cells.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import shutil
-import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +42,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR / ".." / ".." / "actions" / "lib"))
 
 import llvm_build  # noqa: E402
+
+# LLVM test utilities a consumer's lit suite resolves under the recipe
+# install prefix ($LLVM/bin/FileCheck; a few RUN lines use count/not).
+_LIT_UTILS = ["FileCheck", "count", "not"]
 
 
 def _oop_targets(build_dir: Path) -> list[str]:
@@ -133,7 +141,17 @@ def main() -> int:
 
     cmake_args = (
         llvm_build.base_cmake_args(str(out_dir / "install"))
-        + [f"-DLLVM_ENABLE_PROJECTS={projects}"]
+        + [f"-DLLVM_ENABLE_PROJECTS={projects}",
+           # FileCheck and friends go through add_llvm_utility(), which
+           # emits an install rule and an install-<tool> target only under
+           # LLVM_INSTALL_UTILS -- OFF by default, hence no test tools in
+           # the artifact. With it ON they install into
+           # LLVM_UTILS_INSTALL_DIR, which defaults to bin/, and become
+           # ordinary LLVM_DISTRIBUTION_COMPONENTS candidates. Utilities
+           # left out of the distribution get an empty export arg
+           # (LLVMDistributionSupport.cmake, get_target_export_arg), so
+           # this ships the ones named below and no others.
+           "-DLLVM_INSTALL_UTILS=ON"]
         + llvm_build.dylib_flags()
         + compiler_rt_flags
         + llvm_build.cmake_extra()
@@ -144,9 +162,12 @@ def main() -> int:
 
     llvm_build.quick_check_or_continue()
 
+    # The lit utilities ride the main ninja line so they are on disk
+    # before cleanup_intermediates() drops the objects they build from.
     subprocess.run(
         ["ninja", "-j", ncpus,
-         "clang", "clangInterpreter", "clangStaticAnalyzerCore"],
+         "clang", "clangInterpreter", "clangStaticAnalyzerCore",
+         *_LIT_UTILS],
         check=True,
     )
 
@@ -166,21 +187,23 @@ def main() -> int:
     llvm_build.cleanup_intermediates()
 
     # Pass OOP_TARGETS as extra DIST_COMPONENTS so install-distribution
-    # ships them and LLVMExports.cmake stays self-consistent.
-    llvm_build.install_distribution(extras=oop_targets)
+    # ships them and LLVMExports.cmake stays self-consistent. The lit
+    # utilities and the OOP-JIT executor ride along the same way -- the
+    # executor is an add_llvm_utility() too, so LLVM_INSTALL_UTILS gives
+    # it a component like any other and cmake names the installed file
+    # for us (llvm-jitlink-executor.exe on Windows).
+    dist_extras = oop_targets + _LIT_UTILS
+    if need_oop:
+        dist_extras.append("llvm-jitlink-executor")
+    llvm_build.install_distribution(extras=dist_extras)
 
-    # llvm-jitlink-executor's CMakeLists registers an install() rule with
-    # COMPONENT defaulting to "Unspecified", so it can't ride DIST
-    # components. Copy by hand into bin/ so consumers find it next to
-    # clang at $LLVM/bin/llvm-jitlink-executor.
-    src_jitlink = build_dir / "bin" / "llvm-jitlink-executor"
-    if src_jitlink.is_file():
-        dst = out_dir / "install" / "bin" / "llvm-jitlink-executor"
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(src_jitlink, dst)
-        dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-
-    llvm_build.smoke()
+    # Fail the publish rather than the consumer: an artifact without the
+    # lit utilities is exactly the bug this recipe just grew a fix for.
+    exe = ".exe" if sys.platform == "win32" else ""
+    required = [f"bin/{t}{exe}" for t in _LIT_UTILS]
+    if need_oop:
+        required.append(f"bin/llvm-jitlink-executor{exe}")
+    llvm_build.smoke(required_files=required)
 
     print(f"build.py: done. SRC_COMMIT={src_commit}", flush=True)
     return 0

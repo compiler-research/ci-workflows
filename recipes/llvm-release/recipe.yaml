@@ -8,6 +8,10 @@ description: |
   served by apt-llvm.org / brew llvm@N / choco llvm and bypass this
   recipe entirely.
 
+  The install carries the LLVM test utilities FileCheck, count and
+  `not` next to clang, so a consumer's lit suite resolves them under
+  the recipe install prefix.
+
   For LLVM >= 22, build.py also enables compiler-rt with everything
   off except orc_rt + llvm-jitlink-executor — same shape as llvm-asan
   — so consumers that exercise the OOP-JIT runtime (CppInterOp's
