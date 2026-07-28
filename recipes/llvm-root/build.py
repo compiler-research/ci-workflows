@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Builds an LLVM/Clang install tree against root-project/llvm-project's
-cling-llvm20 / ROOT-llvm20 branches. Source repo and branch template
+cling-llvm22 / ROOT-llvm22 branches. Source repo and branch template
 are read from recipe.yaml so a tag bump there is the single point of
 edit.
 
@@ -15,8 +15,8 @@ of this install. See recipe.yaml for the why.
 Inputs (env): see actions/lib/llvm_build.py docstring.
   RECIPE_VERSION         flavor selector. Substitutes into
                          recipe.yaml's source.branch_template
-                         ({version} → branch). Today: 'cling-llvm20'
-                         or 'ROOT-llvm20'. Factored into the cache
+                         ({version} → branch). Today: 'cling-llvm22'
+                         or 'ROOT-llvm22'. Factored into the cache
                          key so each flavor has its own asset.
 
 Outputs (env, written to GITHUB_ENV when present):
