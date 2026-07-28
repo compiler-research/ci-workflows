@@ -161,8 +161,14 @@ def build_manifest(recipe: str, version: str, os_: str, arch: str,
     build_script_name = bs.name if bs is not None else "unknown"
 
     repo = _grep_yaml_value(yaml_path, "repo") or "unknown"
-    branch_tpl = _grep_yaml_value(yaml_path, "branch_template") or ""
-    branch = branch_tpl.replace("{version}", version) if branch_tpl else "unknown"
+    # Prefer the ref the build script actually cloned. Substituting the
+    # version into branch_template only describes recipes where the two
+    # match: a tag-pinned llvm-release cell would read as the branch
+    # release/23.1.0-rc2.x.
+    branch = os.environ.get("SRC_REF", "")
+    if not branch:
+        branch_tpl = _grep_yaml_value(yaml_path, "branch_template") or ""
+        branch = branch_tpl.replace("{version}", version) if branch_tpl else "unknown"
 
     return {
         "key": key,

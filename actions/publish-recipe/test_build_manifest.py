@@ -125,6 +125,35 @@ class BuildManifestTests(unittest.TestCase):
             )
             self.assertEqual(m["source"]["branch"], "ROOT-llvm20-some-tag")
 
+    def test_src_ref_wins_over_branch_template(self):
+        """A recipe that resolves its own ref reports that ref.
+
+        llvm-release maps a bare major to release/N.x but a dotted
+        version to the llvmorg tag, so substituting the version into
+        branch_template would name a branch that does not exist.
+        """
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.dict(os.environ,
+                             {"SRC_REF": "llvmorg-23.1.0-rc2"}, clear=True):
+            _make_recipe(Path(d), "r",
+                         branch_template="release/{version}.x")
+            m = build_manifest.build_manifest(
+                "r", "23.1.0-rc2", "ubuntu-24.04", "x86_64", "k",
+                recipe_root=d,
+            )
+            self.assertEqual(m["source"]["branch"], "llvmorg-23.1.0-rc2")
+
+    def test_empty_src_ref_falls_back_to_template(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.dict(os.environ, {"SRC_REF": ""}, clear=True):
+            _make_recipe(Path(d), "r",
+                         branch_template="release/{version}.x")
+            m = build_manifest.build_manifest(
+                "r", "22", "ubuntu-24.04", "x86_64", "k",
+                recipe_root=d,
+            )
+            self.assertEqual(m["source"]["branch"], "release/22.x")
+
     def test_build_py_recipe(self):
         with tempfile.TemporaryDirectory() as d, \
              mock.patch.dict(os.environ, {}, clear=True):
