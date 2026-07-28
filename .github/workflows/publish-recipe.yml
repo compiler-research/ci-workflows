@@ -31,7 +31,7 @@ on:
         type: string
         required: true
       version:
-        description: "Version/flavor as in cells.yaml (e.g. '22', 'ROOT-llvm20', 'cling-llvm20')."
+        description: "Version/flavor as in cells.yaml (e.g. '22', 'ROOT-llvm22', 'cling-llvm22')."
         type: string
         required: true
         default: '22'

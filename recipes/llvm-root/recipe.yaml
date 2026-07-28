@@ -1,11 +1,11 @@
 recipe: llvm-root
 description: |
-  LLVM/Clang built against root-project/llvm-project's cling-llvm20
-  (cling's patches alone) or ROOT-llvm20 (cling's patches + ROOT's
+  LLVM/Clang built against root-project/llvm-project's cling-llvm22
+  (cling's patches alone) or ROOT-llvm22 (cling's patches + ROOT's
   extra clang patches) branches. Consumed via setup-recipe by:
-    - CppInterOp's cppyy/cling rows (need cling-llvm20; build cling
+    - CppInterOp's cppyy/cling rows (need cling-llvm22; build cling
       themselves on top),
-    - CppInterOp's ROOT integration job (needs ROOT-llvm20; ROOT
+    - CppInterOp's ROOT integration job (needs ROOT-llvm22; ROOT
       builds its own bundled cling on top).
   Each flavor maps to a `version` value below; the cache key
   partitions on it, so the same recipe directory ships two distinct
@@ -23,9 +23,11 @@ description: |
 
 # `version` doubles as the flavor selector here — each value maps to a
 # branch on root-project/llvm-project under the same date-stamped
-# ladder (currently 20260408-01). When ROOT or cling cuts a new patch
+# ladder (currently 20260619-01). When ROOT or cling cuts a new patch
 # set, edit the date stamp here; the cache key moves and the new
-# asset republishes for both flavors.
+# asset republishes for both flavors. One stamp serves both flavors,
+# so they must move together — and the LLVM major moves with them,
+# since the ladder is per-major (…-llvm20-* vs …-llvm22-*).
 source:
   repo: https://github.com/root-project/llvm-project
-  branch_template: '{version}-20260408-01'
+  branch_template: '{version}-20260619-01'

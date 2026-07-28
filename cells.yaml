@@ -81,17 +81,20 @@ cells:
   # llvm-root: `version` doubles as a flavor selector and substitutes
   # into recipes/llvm-root/recipe.yaml's branch_template. Two flavors
   # track root-project/llvm-project's paired branches:
-  #   cling-llvm20 = cling's patches alone (CppInterOp's cppyy/cling row).
+  #   cling-llvm22 = cling's patches alone (CppInterOp's cppyy/cling row).
   #                  Linux-only today; macOS / Windows cling rows still
-  #                  share the ROOT-llvm20 superset to keep one cell warm.
-  #   ROOT-llvm20  = cling + ROOT's extra clang patches. Built across
+  #                  share the ROOT-llvm22 superset to keep one cell warm.
+  #   ROOT-llvm22  = cling + ROOT's extra clang patches. Built across
   #                  the full CppInterOp matrix so every cling-using
   #                  consumer has a ready cell.
-  - { recipe: llvm-root, version: 'cling-llvm20',  os: ubuntu-24.04,    arch: x86_64 }
-  - { recipe: llvm-root, version: 'ROOT-llvm20',   os: ubuntu-24.04,    arch: x86_64 }
-  - { recipe: llvm-root, version: 'ROOT-llvm20',   os: macos-26,        arch: arm64  }
-  - { recipe: llvm-root, version: 'ROOT-llvm20',   os: macos-26-intel,  arch: x86_64 }
-  - { recipe: llvm-root, version: 'ROOT-llvm20',   os: windows-2025,    arch: x86_64 }
+  # The llvm20 pair is gone: ROOT moved to LLVM 22, cling's master
+  # followed, and recipe.yaml's branch_template carries one date stamp
+  # for both flavors -- so the two majors cannot be warm at once.
+  - { recipe: llvm-root, version: 'cling-llvm22',  os: ubuntu-24.04,    arch: x86_64 }
+  - { recipe: llvm-root, version: 'ROOT-llvm22',   os: ubuntu-24.04,    arch: x86_64 }
+  - { recipe: llvm-root, version: 'ROOT-llvm22',   os: macos-26,        arch: arm64  }
+  - { recipe: llvm-root, version: 'ROOT-llvm22',   os: macos-26-intel,  arch: x86_64 }
+  - { recipe: llvm-root, version: 'ROOT-llvm22',   os: windows-2025,    arch: x86_64 }
   # kokkos: pinned Serial/Release Kokkos for clad's *-kokkos rows. The apt
   # Kokkos is unusable -- libtrilinos-kokkos-dev is the ancient Trilinos-
   # bundled 3.4 (no host Kokkos::sqrt(double), only the complex overloads),

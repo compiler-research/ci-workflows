@@ -38,7 +38,7 @@ on:
       llvm-flavor-version:
         type: string
         default: ''
-        description: "setup-llvm flavor-version (e.g. 'cling-llvm20' for flavor:cling); empty otherwise."
+        description: "setup-llvm flavor-version (e.g. 'cling-llvm22' for flavor:cling); empty otherwise."
       python-version:
         type: string
         required: true

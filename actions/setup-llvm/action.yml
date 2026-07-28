@@ -75,7 +75,7 @@ inputs:
     default: ''
     description: |
       Overrides the recipe `version` input for variant flavors. For
-      flavor=cling: 'cling-llvm20' or 'ROOT-llvm20' (selects branch on
+      flavor=cling: 'cling-llvm22' or 'ROOT-llvm22' (selects branch on
       root-project/llvm-project). Defaults to `version` when empty.
   build-on-miss:
     required: false
