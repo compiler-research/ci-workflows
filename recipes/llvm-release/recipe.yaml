@@ -19,6 +19,12 @@ description: |
   Windows cells (arch: x86) skip compiler-rt: orc_rt's COFF support
   is x86_64-only and the OOP-JIT is disabled on Windows consumers.
 
+# branch_template describes the bare-major form only. build.py owns the
+# mapping (_source_ref): '22' is release/22.x, anything else is the
+# upstream release tag, so '23.1.0-rc2' pins llvmorg-23.1.0-rc2 and a
+# release candidate can be published under its own name. The resolved
+# ref reaches the manifest as SRC_REF rather than through this template.
+#
 # Only fields read by build_manifest.py live here. The cmake invocation
 # and trim list are authoritative in build.py — having them duplicated
 # here as decorative metadata would silently drift. Add a field here

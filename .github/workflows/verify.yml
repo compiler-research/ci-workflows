@@ -186,6 +186,13 @@ jobs:
         shell: bash
         working-directory: bin
         run: python3 -W error::ResourceWarning -m unittest discover -p 'test_*.py' -v
+      # Recipe build scripts are covered per directory, like the above:
+      # they are not packages and each is named build.py, so one
+      # discovery run over recipes/ would collide on the module name.
+      - name: recipes/llvm-release unit tests
+        shell: bash
+        working-directory: recipes/llvm-release
+        run: python3 -W error::ResourceWarning -m unittest discover -p 'test_*.py' -v
 
   # End-to-end dry-run of the real publish-recipe action against the
   # llvm-dry-run fixture recipe with cache-base: file:///... so no

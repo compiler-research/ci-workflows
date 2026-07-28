@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Builds a vanilla Clang/LLVM install tree from release/{version}.x.
+"""Builds a vanilla Clang/LLVM install tree from an upstream LLVM ref.
 
 Recipe-specific bits live here (source clone, cmake flags, ninja
 targets, post-install hooks). The shared install-tree publish flow
@@ -8,11 +8,13 @@ install-distribution, find_package smoke) lives in
 actions/lib/llvm_build.py.
 
 Inputs (env): see actions/lib/llvm_build.py docstring.
-  RECIPE_VERSION         major LLVM version (release/{version}.x).
+  RECIPE_VERSION         LLVM major ('22'), or a release tag suffix
+                         ('23.1.0-rc2'). See _source_ref.
   RECIPE_ARCH            optional cell arch slug for cross compilation
 
 Outputs (env, written to GITHUB_ENV when present):
   SRC_COMMIT             sha of llvm-project HEAD that was built
+  SRC_REF                the ref that sha was cloned from
 
 FIXME: dedup with recipes/llvm-asan/build.py.
 The compiler-rt OFF flags below and the _oop_targets() helper are
@@ -46,6 +48,34 @@ import llvm_build  # noqa: E402
 # LLVM test utilities a consumer's lit suite resolves under the recipe
 # install prefix ($LLVM/bin/FileCheck; a few RUN lines use count/not).
 _LIT_UTILS = ["FileCheck", "count", "not"]
+
+
+def _source_ref(version: str) -> str:
+    """Map the recipe version to a ref on llvm/llvm-project.
+
+    A bare major ('22') tracks release/22.x, which keeps moving as
+    point releases land; the key covers the version, not the commit,
+    so such a cell holds whatever HEAD it warmed on. Anything else is
+    an upstream tag ('23.1.0-rc2' -> llvmorg-23.1.0-rc2), immutable,
+    so the cell names exactly what it holds.
+    """
+    if re.fullmatch(r"\d+", version):
+        return f"release/{version}.x"
+    return f"llvmorg-{version}"
+
+
+def _record_src_ref(ref: str) -> None:
+    """Publish the cloned ref as SRC_REF for the manifest step.
+
+    build_manifest.py otherwise rebuilds source.branch from
+    recipe.yaml's branch_template, which describes the bare-major form
+    only.
+    """
+    github_env = os.environ.get("GITHUB_ENV", "")
+    if not github_env:
+        return
+    with open(github_env, "a") as f:
+        f.write(f"SRC_REF={ref}\n")
 
 
 def _oop_targets(build_dir: Path) -> list[str]:
@@ -83,22 +113,23 @@ def main() -> int:
     version = os.environ["RECIPE_VERSION"]
     ncpus = os.environ["NCPUS"]
 
-    # Parse + validate the LLVM major before any side effects.
+    # Parse + validate the LLVM major before any side effects; the
+    # prefix reads the same out of '22' and out of '23.1.0-rc2'.
     # The threshold (>= 22) governs the OOP-JIT compiler-rt branch;
     # the previous form silently fell back to need_oop=False on any
     # ValueError, which produced an artifact without the OOP runtime
     # when the caller passed a non-integer version (e.g. '22.1') —
     # exactly the consumers most likely to need OOP. Parse the major
-    # prefix and refuse anything that doesn't yield an integer; the
-    # recipe's source.branch_template also assumes integer-major
-    # releases (release/{version}.x), so erroring here surfaces the
-    # misuse before any git operation.
+    # prefix and refuse anything that doesn't yield an integer, so the
+    # misuse surfaces before any git operation rather than as a clone
+    # against a ref nobody publishes.
     try:
         major = int(version.split('.')[0])
     except ValueError:
         print(
-            f"::error::recipe llvm-release expects an integer-like "
-            f"version (e.g. '22' or '22.1'); got '{version}'",
+            f"::error::recipe llvm-release expects an LLVM major "
+            f"(e.g. '22') or a release tag suffix (e.g. '23.1.0-rc2'); "
+            f"got '{version}'",
             file=sys.stderr,
         )
         return 1
@@ -109,12 +140,15 @@ def main() -> int:
     need_oop = major >= 22 and not win32
 
     os.chdir(work_dir)
+    src_ref = _source_ref(version)
+    print(f"build.py: version={version}; cloning {src_ref}", flush=True)
     llvm_build.clone_shallow(
         "https://github.com/llvm/llvm-project.git",
-        f"release/{version}.x",
+        src_ref,
         work_dir / "llvm-project",
     )
     src_commit = llvm_build.record_src_commit(work_dir / "llvm-project")
+    _record_src_ref(src_ref)
 
     build_dir = work_dir / "llvm-project" / "build"
     build_dir.mkdir(exist_ok=True)

@@ -20,6 +20,10 @@
 support_window:
   - 20
   - 22
+  # 23 is pre-release: release/23.x is cut and tagging candidates, no
+  # final yet. It is in the window because consumers test against it
+  # early; the cell that serves it is pinned to a tag, see below.
+  - 23
 
 caps:
   # Soft cap: prune-cache emits ::warning:: when total Release storage
@@ -78,6 +82,16 @@ cells:
   # bug) only surface on a 32-bit MSVC build.
   - { recipe: llvm-release, version: '22',         os: windows-2025,     arch: x86    }
   - { recipe: llvm-release, version: '22',         os: windows-11-arm,   arch: arm64  }
+  # Release candidate, so consumers meet an API break before the
+  # release rather than after: no package manager ships a major until
+  # it is final. Pinned to the tag rather than '23' -- release/23.x
+  # moves while the key does not, so a branch-tracking cell freezes
+  # silently under a name claiming the whole line. Bumping to rc3 is a
+  # one-line edit that moves the key and republishes. Consumers keep
+  # clang-runtime '23' and pass the tag as setup-llvm's flavor-version.
+  # Linux x86_64 only; every other platform is a full LLVM build, so
+  # add rows when a consumer needs one.
+  - { recipe: llvm-release, version: '23.1.0-rc2', os: ubuntu-24.04,     arch: x86_64 }
   # llvm-root: `version` doubles as a flavor selector and substitutes
   # into recipes/llvm-root/recipe.yaml's branch_template. Two flavors
   # track root-project/llvm-project's paired branches:
