@@ -16,7 +16,7 @@ on:
         description: 'owner/repo of CppJIT to check out.'
       cppjit-ref:
         type: string
-        default: master
+        default: main
         description: 'CppJIT git ref to check out.'
       cppinterop-ref:
         type: string
