@@ -1,0 +1,204 @@
+name: 'Setup BioDynaMo'
+description: |
+  Resolves a BioDynaMo install for consumer CI via the `biodynamo` recipe and
+  exports the environment its build system expects, so a consumer's
+  find_package(BioDynaMo) resolves with no further plumbing.
+
+  The install lands at $GITHUB_WORKSPACE/biodynamo -- a dedicated prefix, so it
+  coexists with setup-llvm's $GITHUB_WORKSPACE/install -- and BDMSYS plus the
+  rest of thisbdm.sh's environment are exported via $GITHUB_ENV. Order relative
+  to setup-llvm does not matter: any pre-existing install/ is preserved across
+  the recipe step, which otherwise `rm -rf`s that path.
+
+  Unlike setup-kokkos, which only needs Kokkos_ROOT, BioDynaMo ships a
+  thisbdm.sh that sets a dozen variables (ROOTSYS, BDM_ROOT_DIR,
+  CMAKE_PREFIX_PATH, LD_LIBRARY_PATH, ROOT_INCLUDE_PATH, ...). A composite
+  action cannot leave a sourced shell behind, so this one sources the script
+  and marshals whatever it changed into $GITHUB_ENV.
+
+inputs:
+  version:
+    required: true
+    description: |
+      BioDynaMo tag to provision, e.g. "v1.05-cr-20260812-01". Interpolated
+      into the recipe source branch, so it must be a git ref on the source
+      repo -- clone_shallow passes it to `git clone -b` and a bare commit sha
+      will not resolve. See recipes/biodynamo/recipe.yaml for the tag naming
+      rules; BioDynaMo's own version generator parses `git describe`, so the
+      vX.YY prefix is required and not merely conventional.
+  os:
+    required: true
+    description: |
+      OS slug for the recipe cache key -- a runner-image name like
+      "ubuntu-24.04". Must match a cells.yaml entry warmed for this recipe.
+  arch:
+    required: false
+    default: ''
+    description: |
+      Architecture slug (x86_64 / arm64). Derived from the os slug when empty
+      (ubuntu-*-arm -> arm64, else x86_64).
+  build-on-miss:
+    required: false
+    default: 'false'
+    description: 'Forwarded to setup-recipe: build inline on a cache miss instead of failing fast.'
+  ref:
+    required: false
+    default: 'main'
+    description: 'ci-workflows ref for setup-recipe to read recipes/ from.'
+  cache-base:
+    required: false
+    default: ''
+    description: 'Forwarded to setup-recipe: override the recipe cache backend.'
+
+outputs:
+  bdmsys:
+    description: 'BioDynaMo install prefix ($GITHUB_WORKSPACE/biodynamo).'
+    value: ${{ steps.finalize.outputs.bdmsys }}
+  cache-hit:
+    description: '"true" when the recipe came from the cache, "false" when built inline.'
+    value: ${{ steps.recipe.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve arch
+      id: resolve
+      shell: bash
+      env:
+        OS: ${{ inputs.os }}
+        ARCH_IN: ${{ inputs.arch }}
+      run: |
+        set -euo pipefail
+        if [[ -n "${ARCH_IN}" ]]; then
+          arch="${ARCH_IN}"
+        else
+          case "${OS}" in
+            *-arm) arch=arm64 ;;
+            *)     arch=x86_64 ;;
+          esac
+        fi
+        echo "arch=${arch}" >> "$GITHUB_OUTPUT"
+
+    # The artifact is relocatable but not self-contained, so the consumer has to
+    # supply what it links against: UseBioDynaMo.cmake fails outright without
+    # MPI ("We did not find any OpenMPI installation") and requires OpenMP,
+    # libbiodynamo.so carries numa, blas/lapack and libgit2 symbols, and ROOT's
+    # cling shells out to the compiler ROOT was built with, so g++-11 must exist
+    # or any cppyy/JIT use dies inside libCling.
+    #
+    # cmake and make are here for a subtler reason: on a cache hit build.py
+    # never runs, so the toolchain its own apt list happened to install is
+    # absent and the consumer cannot build against what it just downloaded. The
+    # inline-build path masked that, because the recipe installed them itself.
+    - name: Install BioDynaMo's host dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        # NEEDRESTART_MODE=l: list services needing a restart, do not restart
+        # them. Left to its default, needrestart bounces systemd-networkd and
+        # systemd-resolved partway through the job when a library upgrade pulls
+        # them in -- restarting the runner's network stack underneath a build
+        # that is about to fetch a few hundred MB.
+        sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
+          apt-get update -qq
+        sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
+          apt-get install -y --no-install-recommends \
+          cmake make git \
+          libopenmpi-dev libomp-dev libnuma-dev libblas-dev liblapack-dev \
+          libgit2-dev g++-11
+
+    # setup-recipe places the recipe at $GITHUB_WORKSPACE/install and `rm -rf`s
+    # that path first. Move any pre-existing install/ aside so this action is
+    # order-independent with respect to setup-llvm.
+    - name: Preserve existing install prefix
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ -d "${GITHUB_WORKSPACE}/install" ]]; then
+          rm -rf "${GITHUB_WORKSPACE}/.install.pre-biodynamo"
+          mv "${GITHUB_WORKSPACE}/install" "${GITHUB_WORKSPACE}/.install.pre-biodynamo"
+        fi
+
+    - name: BioDynaMo recipe (cache or inline build)
+      id: recipe
+      uses: compiler-research/ci-workflows/actions/setup-recipe@main
+      with:
+        recipe:        biodynamo
+        version:       ${{ inputs.version }}
+        os:            ${{ inputs.os }}
+        arch:          ${{ steps.resolve.outputs.arch }}
+        build-on-miss: ${{ inputs.build-on-miss }}
+        ref:           ${{ inputs.ref }}
+        cache-base:    ${{ inputs.cache-base }}
+
+    - name: Relocate BioDynaMo and restore install prefix
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -rf "${GITHUB_WORKSPACE}/biodynamo"
+        mv "${GITHUB_WORKSPACE}/install" "${GITHUB_WORKSPACE}/biodynamo"
+        if [[ -d "${GITHUB_WORKSPACE}/.install.pre-biodynamo" ]]; then
+          mv "${GITHUB_WORKSPACE}/.install.pre-biodynamo" "${GITHUB_WORKSPACE}/install"
+        fi
+
+    - name: Export the thisbdm.sh environment
+      id: finalize
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        RECIPE_HIT: ${{ steps.recipe.outputs.cache-hit }}
+      run: |
+        set -euo pipefail
+        prefix="${GITHUB_WORKSPACE}/biodynamo"
+
+        # Diff the environment across the source rather than hand-listing the
+        # variables: thisbdm.sh sets a dozen and the set changes with the
+        # BioDynaMo version. Values are single-line paths, so plain
+        # NAME=value lines into $GITHUB_ENV are sufficient.
+        before="$(mktemp)"; after="$(mktemp)"; srclog="$(mktemp)"
+        env | sort > "$before"
+        # `set -u` has to come off across the source: thisbdm.sh reads
+        # BDM_THISBDM_LOGLEVEL without a default, so under -u it aborts partway
+        # and leaves the environment half-configured. Keep its output rather
+        # than discarding it -- the script reports real problems on stderr while
+        # still returning 0, so that text is the only diagnosis available when
+        # something goes wrong.
+        set +u
+        # shellcheck disable=SC1091
+        source "${prefix}/bin/thisbdm.sh" > "$srclog" 2>&1
+        set -u
+        # Returning 0 proves nothing; BDMSYS being set is the real signal.
+        if [[ -z "${BDMSYS:-}" ]]; then
+          echo "::error title=setup-biodynamo::sourcing ${prefix}/bin/thisbdm.sh did not set BDMSYS" >&2
+          cat "$srclog" >&2
+          exit 1
+        fi
+        env | sort > "$after"
+
+        comm -13 "$before" "$after" | while IFS= read -r line; do
+          # Only well-formed NAME=value assignments. `env` renders multi-line
+          # values (exported shell functions, notably) across several lines, and
+          # the continuation and blank lines are not assignments -- appending
+          # one makes the runner reject the whole file with "invalid format '',
+          # expected a line with '=' or '<<'".
+          [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+          name="${line%%=*}"
+          # Skip shell bookkeeping that must not leak into later steps.
+          case "$name" in
+            _|SHLVL|PWD|OLDPWD|BASH_*|PIPESTATUS) continue ;;
+          esac
+          printf '%s\n' "$line" >> "$GITHUB_ENV"
+        done
+        rm -f "$before" "$after" "$srclog"
+
+        echo "bdmsys=${prefix}" >> "$GITHUB_OUTPUT"
+
+        # Surface what the artifact actually carries. ROOT supplies the RNG
+        # BioDynaMo draws from, so its version is a scientific input, not just
+        # a build detail; build.py stamps it into the install tree.
+        prov="${prefix}/share/bdm-recipe-provenance.json"
+        if [[ -f "$prov" ]]; then
+          echo "::notice title=setup-biodynamo::$(tr -d '\n ' < "$prov")"
+        fi
+        src=$([[ "${RECIPE_HIT}" == "true" ]] && echo recipe-cache || echo inline-build)
+        echo "::notice title=setup-biodynamo::version=${VERSION} source=${src} BDMSYS=${prefix}"
