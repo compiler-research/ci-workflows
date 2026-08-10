@@ -76,7 +76,7 @@ runs:
         set -euo pipefail
         # Neutral dir so the in-tree python/cppjit can't shadow the install.
         cd "${RUNNER_TEMP}"
-        python -c "import cppjit.cppyy; print('cppjit import OK')"
+        python -c "import cppjit; print('cppjit import OK')"
 
     - name: Run test suite
       shell: bash
@@ -122,15 +122,17 @@ runs:
 
         if [[ "${VALGRIND}" == "true" && "${RUNNER_OS}" == "Linux" ]]; then
           echo "::group::valgrind"
+          # Suppressions are vendored under .github/valgrind/.
+          SUPP_DIR="../.github/valgrind"
           if [[ "${RUNNER_ARCH}" == "ARM64" ]]; then
-            PERVER="../etc/clang${LLVM_VERSION}-valgrind_arm.supp"
+            PERVER="${SUPP_DIR}/clang${LLVM_VERSION}-valgrind_arm.supp"
           else
-            PERVER="../etc/clang${LLVM_VERSION}-valgrind.supp"
+            PERVER="${SUPP_DIR}/clang${LLVM_VERSION}-valgrind.supp"
           fi
           # Stack all suppression files (valgrind aborts on a missing file).
           SUPP_ARGS=()
-          for _supp in "../etc/valgrind-cppyy-cling.supp" \
-                       "../etc/cppinterop-clang${LLVM_VERSION}-valgrind.supp" \
+          for _supp in "${SUPP_DIR}/valgrind-cppjit-cling.supp" \
+                       "${SUPP_DIR}/cppinterop-clang${LLVM_VERSION}-valgrind.supp" \
                        "${PERVER}"; do
             [[ -f "${_supp}" ]] && SUPP_ARGS+=(--suppressions="${_supp}") || echo "::notice::no ${_supp}"
           done
