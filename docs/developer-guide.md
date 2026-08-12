@@ -367,24 +367,60 @@ bin/repro consumes via `--ci-workflows <path>`.
   `.github/act-ci-workflows-stage/` and
   `.github/workflows/act-*-localized-*.yml` by hand.
 
-## Iterating on LLVM with `--devshell`
+## Iterating on a recipe with `--devshell`
 
 `bin/repro <cell> --devshell` is a different mode: it doesn't run
-a workflow. It downloads the cell's published install +
-sibling-ccache + manifest, shallow-clones llvm-project at the
-manifest's pinned `SRC_COMMIT`, and drops you into a long-lived
-container ready for incremental rebuilds against the producer's
-ccache.
+a workflow. It downloads the cell's install + sibling-ccache +
+manifest, shallow-clones the recipe's source at the manifest's
+pinned `SRC_COMMIT`, and drops you into a long-lived container
+ready for incremental rebuilds against the producer's ccache.
+
+This works for **any** recipe, not only the LLVM ones. The source
+directory is derived from the recipe's `source.repo` (so
+`llvm-*` land in `_recipe_work/llvm-project`, `kokkos` in
+`_recipe_work/kokkos`, `biodynamo` in `_recipe_work/biodynamo`),
+and the cmake invocation recorded in the manifest is replayed with
+its producer-side paths rewritten to local ones — see
+`actions/lib/devshell_cmake.py`.
 
 Use it when:
 
-- A workflow ran clean in CI but you want to edit something *in
-  LLVM itself* and rebuild fast (the `bin/repro <row>` shell only
-  reproduces the row's own build, which doesn't iterate well).
+- A workflow ran clean in CI but you want to edit something *in the
+  recipe's own source* and rebuild fast (the `bin/repro <row>` shell
+  only reproduces the row's own build, which doesn't iterate well).
 - You're triaging a cppyy / CppInterOp issue that needs a
   patched LLVM.
 - You want to verify a recipe's published install actually compiles
-  the next dependent layer (CppInterOp, cling) before relying on it.
+  the next dependent layer (CppInterOp, cling, a simulation built
+  against BioDynaMo) before relying on it.
+- You want to debug an artifact that is *not published yet* — see
+  "Devshell against a local build" below.
+
+### Devshell against a local build
+
+`--devshell` reads from whatever cache base is configured, so it
+does not require a published cell. To debug an artifact you built
+yourself:
+
+```bash
+# 1. Pack an existing install tree into the local cache.
+bin/recipe-cache pack <recipe> <version> <os> <arch> --from /path/to/install
+
+# 2. Point the devshell at it.
+RECIPE_CACHE_BASE=file://$HOME/.cache/recipe-cache/ \
+  bin/repro <recipe>/<version>/<os>/<arch> --devshell
+```
+
+Two things are deliberately tolerated on this path, because a
+packed entry is not a published one:
+
+- **No sibling ccache.** `publish-recipe` emits `<key>.ccache.tar.zst`;
+  `recipe-cache pack` does not. The fetch logs that it is missing and
+  continues, so the devshell starts cold rather than failing.
+- **No source tree.** `pack` stamps a placeholder `source.repo` of
+  `mockup://` that cannot be cloned, so the clone is skipped and you
+  get a container with the install and no checkout. That is the point
+  of the mode: inspecting or *running* a packed artifact.
 
 ### Cell argument
 

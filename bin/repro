@@ -984,8 +984,6 @@ DEVSHELL_HOST_CACHE_DEFAULT = (
 # the manifest value when present so ccache keys match the producer.
 DEVSHELL_RUNNER_WORKSPACE = "/home/runner/work/ci-workflows/ci-workflows"
 DEVSHELL_CCACHE_SUBDIR    = ".ccache"
-DEVSHELL_SRC_SUBDIR       = "_recipe_work/llvm-project"
-DEVSHELL_BUILD_SUBDIR     = "_recipe_work/llvm-project/build"
 DEVSHELL_INSTALL_SUBDIR   = "_recipe_out/install"
 
 DEVSHELL_PATCHES_MOUNT = "/patches"
@@ -1112,6 +1110,7 @@ def _devshell_fetch(base: str, key: str, work: Path,
     sys.path.insert(0, str(REPO_ROOT / "actions" / "lib"))
     import cache_io  # noqa: E402
     import json
+    import urllib.error
     import urllib.request
 
     # Layout under `work` (host) mirrors publish-recipe's runner
@@ -1134,19 +1133,33 @@ def _devshell_fetch(base: str, key: str, work: Path,
 
     # Sibling ccache: archive's top-level dir is `.ccache/`, extracting
     # to `<work>/` lands the ccache at `<work>/.ccache/`.
+    #
+    # Optional, because only publish-recipe emits this asset. An entry created
+    # by `bin/recipe-cache pack` -- the documented way to mock up a cache from
+    # an existing build -- has an install tree and a manifest but no ccache, and
+    # a hard failure there makes the whole local `file://` workflow unusable for
+    # the case it exists to serve. A cold cache is a slow devshell, not a broken
+    # one.
     ccache_dir = ccache_root / DEVSHELL_CCACHE_SUBDIR
     if refetch or not ccache_dir.is_dir():
         if ccache_dir.is_dir():
             shutil.rmtree(ccache_dir)
         asset = f"{key}.ccache.tar.zst"
         _log(f"repro: fetching ccache ({asset})...")
-        if base.startswith("file://"):
-            with (Path(base[len("file://"):]) / asset).open("rb") as f:
-                cache_io._zstd_decode_into_tar(f, ccache_root)
-        else:
-            with urllib.request.urlopen(
-                    f"{base.rstrip('/')}/{asset}", timeout=300) as r:
-                cache_io._zstd_decode_into_tar(r, ccache_root)
+        try:
+            if base.startswith("file://"):
+                with (Path(base[len("file://"):]) / asset).open("rb") as f:
+                    cache_io._zstd_decode_into_tar(f, ccache_root)
+            else:
+                with urllib.request.urlopen(
+                        f"{base.rstrip('/')}/{asset}", timeout=300) as r:
+                    cache_io._zstd_decode_into_tar(r, ccache_root)
+        except (OSError, urllib.error.URLError) as e:
+            # The directory still has to exist: CCACHE_LOGFILE points inside it
+            # and ccache fails outright if it cannot open the log.
+            ccache_dir.mkdir(parents=True, exist_ok=True)
+            _log(f"repro: no sibling ccache for this cell ({e}); "
+                 f"the devshell will start with a cold cache")
 
     # Manifest: plain JSON, no zstd/tar.
     if refetch or not manifest.is_file():
@@ -1162,8 +1175,8 @@ def _devshell_fetch(base: str, key: str, work: Path,
     return json.loads(manifest.read_text())
 
 
-def _devshell_source(work: Path, manifest: Dict) -> Path:
-    """Shallow-clone llvm-project at the manifest's SRC_COMMIT.
+def _devshell_source(work: Path, manifest: Dict) -> Optional[Path]:
+    """Shallow-clone the recipe's source at the manifest's SRC_COMMIT.
 
     `git init` + `git fetch --depth=1 origin <commit>` instead of a
     full-history clone: llvm-project's full history is ~3 GB and
@@ -1179,10 +1192,19 @@ def _devshell_source(work: Path, manifest: Dict) -> Path:
     src = manifest.get("source") or {}
     repo = src.get("repo")
     commit = src.get("commit")
+    # `bin/recipe-cache pack` mocks up a cache entry from an existing build and
+    # stamps a placeholder source it cannot know. There is nothing to clone, but
+    # the install tree is real, so hand back a devshell without a source tree
+    # rather than refusing: inspecting or running a packed artifact is the case
+    # pack exists to serve.
+    if manifest.get("kind") == "mockup" or repo == "mockup://":
+        _log("repro: mockup manifest (packed from an existing build); "
+             "no source tree to fetch")
+        return None
     if not repo or not commit or commit == "unknown":
         sys.exit(f"error: manifest missing source.{{repo,commit}}; "
                  f"cannot reproduce")
-    src_dir = work / DEVSHELL_SRC_SUBDIR
+    src_dir = work / _devshell_src_subdir(manifest)
     if not (src_dir / ".git").is_dir():
         _log(f"repro: shallow-fetching {repo} @ {commit[:12]} "
              f"(use `git fetch --unshallow` inside the container "
@@ -1199,6 +1221,27 @@ def _devshell_source(work: Path, manifest: Dict) -> Path:
     subprocess.run(["git", "-C", str(src_dir),
                     "checkout", "--detach", commit], check=True)
     return src_dir
+
+
+def _devshell_src_subdir(manifest: Dict) -> str:
+    """Workspace-relative source directory, derived from the recipe's source.
+
+    Every recipe clones into WORK_DIR/<basename of source.repo>, so deriving it
+    here reproduces the producer's layout without a new manifest field. That
+    matters beyond tidiness: CCACHE_BASEDIR rewrites paths relative to the
+    workspace, so a source directory that doesn't match the producer's turns
+    every lookup into a miss. The llvm-* recipes all resolve to `llvm-project`,
+    which is what this was hardcoded to before it needed to serve others.
+    """
+    repo = ((manifest.get("source") or {}).get("repo") or "")
+    name = repo.rstrip("/").rsplit("/", 1)[-1]
+    if name.endswith(".git"):
+        name = name[:-len(".git")]
+    return f"_recipe_work/{name or 'source'}"
+
+
+def _devshell_build_subdir(manifest: Dict) -> str:
+    return f"{_devshell_src_subdir(manifest)}/build"
 
 
 def _devshell_ccache_cfg(manifest: Dict) -> Dict[str, str]:
@@ -1471,9 +1514,14 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
           if cfg.get("hash_dir") == "false" else []),
         "-e", "CMAKE_C_COMPILER_LAUNCHER=ccache",
         "-e", "CMAKE_CXX_COMPILER_LAUNCHER=ccache",
+        "-e", f"DEVSHELL_INSTALL={ws}/{DEVSHELL_INSTALL_SUBDIR}",
+        # LLVM_PREFIX is the old name for DEVSHELL_INSTALL, kept because muscle
+        # memory and out-of-tree scripts still reach for it. Deprecated: drop
+        # once nothing in-tree references it and the old name has been out of
+        # the docs long enough that nobody is following a stale README.
         "-e", f"LLVM_PREFIX={ws}/{DEVSHELL_INSTALL_SUBDIR}",
-        "-e", f"DEVSHELL_SRC={ws}/{DEVSHELL_SRC_SUBDIR}",
-        "-e", f"DEVSHELL_BUILD={ws}/{DEVSHELL_BUILD_SUBDIR}",
+        "-e", f"DEVSHELL_SRC={ws}/{_devshell_src_subdir(manifest)}",
+        "-e", f"DEVSHELL_BUILD={ws}/{_devshell_build_subdir(manifest)}",
         "-e", f"DEVSHELL_MANIFEST={ws}/manifest.json",
         "-e", f"CCACHE_LOGFILE={ws}/{DEVSHELL_CCACHE_SUBDIR}/ccache.log",
         "-e", f"HOME={DEVSHELL_DEV_HOME}",
