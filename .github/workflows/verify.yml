@@ -13,6 +13,10 @@ on:
       - 'recipes/**'
       - 'actions/**'
       - 'bin/**'
+      # scripts/ holds repro-config and the devshell cmake replay, which
+      # bin/repro executes inside the container. Without this entry a PR that
+      # touches only scripts/ runs no checks at all.
+      - 'scripts/**'
       - '.github/workflows/**'
 
 permissions:
@@ -192,6 +196,10 @@ jobs:
       - name: recipes/llvm-release unit tests
         shell: bash
         working-directory: recipes/llvm-release
+        run: python3 -W error::ResourceWarning -m unittest discover -p 'test_*.py' -v
+      - name: scripts/ unit tests
+        shell: bash
+        working-directory: scripts
         run: python3 -W error::ResourceWarning -m unittest discover -p 'test_*.py' -v
 
   # End-to-end dry-run of the real publish-recipe action against the

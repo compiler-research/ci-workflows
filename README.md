@@ -137,7 +137,7 @@ temp-workflow files are cleaned at exit; disk after the run is zero
 (image cache aside). See `bin/repro --help` and
 [docs/developer-guide.md](docs/developer-guide.md) for the rest.
 
-## Iterating on LLVM with a warm ccache: `--devshell`
+## Iterating on a recipe with a warm ccache: `--devshell`
 
 `bin/repro <cell> --devshell` skips the workflow and instead drops
 you into a long-lived container with the cell's published install,
@@ -175,6 +175,23 @@ invocation from `manifest.cmake_args`, and warns on dev-package
 version drift. A smoke compile of `lib/Support/Allocator.cpp.o`
 verifies that the producer cache actually reaches the consumer
 environment before handing off the shell.
+
+Works for any recipe, not only the LLVM ones: the source directory
+comes from the recipe's `source.repo` and the manifest's recorded cmake
+invocation is replayed with producer paths rewritten locally.
+
+`--devshell` reads from whatever cache base is set, so it also works
+against an artifact you built yourself rather than a published cell:
+
+```bash
+bin/recipe-cache pack <recipe> <version> <os> <arch> --from /path/to/install
+RECIPE_CACHE_BASE=file://$HOME/.cache/recipe-cache/ \
+  bin/repro <recipe>/<version>/<os>/<arch> --devshell
+```
+
+A packed entry has no sibling ccache and no cloneable source, so the
+devshell starts cold and without a checkout -- see
+[docs/developer-guide.md](docs/developer-guide.md).
 
 Linux-only for now (Ubuntu cells); macOS hosts work via the bundled
 Linux container, with the platform-mismatch overhead under Rosetta.

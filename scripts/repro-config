@@ -145,49 +145,52 @@ else
 fi
 
 build="${DEVSHELL_BUILD:?env not set; bin/repro --devshell exports it}"
-src="${DEVSHELL_SRC:?env not set; bin/repro --devshell exports it}/llvm"
-prefix="${LLVM_PREFIX:?env not set; bin/repro --devshell exports it}"
+src="${DEVSHELL_SRC:?env not set; bin/repro --devshell exports it}"
+prefix="${DEVSHELL_INSTALL:-${LLVM_PREFIX:?env not set; bin/repro --devshell exports it}}"
 manifest="${DEVSHELL_MANIFEST:?env not set; bin/repro --devshell exports it}"
 
 if [[ ! -f "$build/CMakeCache.txt" ]]; then
   mkdir -p "$build"
   cd "$build"
-  # Replay the recipe's own cmake invocation from the manifest's
-  # cmake_args field (post-#53). Substitute CMAKE_INSTALL_PREFIX with
-  # the consumer's local LLVM_PREFIX and resolve the source path
-  # relative to the build dir. ccache hashes the full compile command,
-  # so any drift here defeats the sibling-cache pre-warm. The fallback
-  # path (no cmake_args in manifest) computes flags via llvm_build for
-  # backwards compatibility with pre-#53 publishes.
+  # Replay the recipe's own cmake invocation from the manifest's cmake_args
+  # field (post-#53), rewriting the two things that are producer-specific: the
+  # install prefix and the source path. ccache hashes the full compile command,
+  # so any drift here defeats the sibling-cache pre-warm.
+  #
+  # The source rewrite has to cover both shapes recipes use. LLVM's build.py
+  # runs cmake from a build directory and passes the relative `../llvm`, since
+  # its CMakeLists lives in an llvm/ subdirectory. Every other recipe passes an
+  # absolute `-S <work_dir>/<name>` -- which points at the *producer's*
+  # filesystem and does not exist here, so passing it through unchanged
+  # configures against nothing.
   exec_cmake_args=$(python3 - <<'PY'
 import json, os, shlex, sys
+sys.path.insert(0, "/ci-workflows/scripts")
+import devshell_cmake
+
 manifest = json.load(open(os.environ["DEVSHELL_MANIFEST"]))
 args = manifest.get("cmake_args") or []
-prefix = os.environ["LLVM_PREFIX"]
-src = os.environ["DEVSHELL_SRC"] + "/llvm"
-if args:
-    out = []
-    for a in args:
-        if a == "cmake":
-            continue
-        if a.startswith("-DCMAKE_INSTALL_PREFIX="):
-            out.append(f"-DCMAKE_INSTALL_PREFIX={prefix}")
-            continue
-        if a == "../llvm":
-            out.append(src)
-            continue
-        out.append(a)
-else:
-    sys.path.insert(0, "/ci-workflows/actions/lib")
-    import llvm_build
-    out = (llvm_build.base_cmake_args(prefix)
-           + ["-DLLVM_ENABLE_PROJECTS=clang"]
-           + llvm_build.cmake_extra()
-           + [src])
+if not args:
+    sys.exit(0)
+out = devshell_cmake.rewrite(
+    args,
+    prefix=os.environ.get("DEVSHELL_INSTALL") or os.environ["LLVM_PREFIX"],
+    src=os.environ["DEVSHELL_SRC"],
+    build=os.environ["DEVSHELL_BUILD"],
+)
 print(" ".join(shlex.quote(x) for x in out))
 PY
 )
-  eval cmake "$exec_cmake_args"
+  if [[ -z "$exec_cmake_args" ]]; then
+    # Pre-#53 publishes carry no cmake_args. Guessing the flags is only
+    # possible for LLVM, and a wrong guess is worse than no configure: it
+    # produces a build tree whose compile commands miss the producer's ccache
+    # entirely. Leave it to the dev, who can see the manifest.
+    echo "::warning title=devshell::manifest has no cmake_args; skipping the" \
+         "cmake configure. Configure \$DEVSHELL_BUILD by hand."
+  else
+    eval cmake "$exec_cmake_args"
+  fi
 fi
 
 # Sanity check: smoke-compile one TU every LLVM build has

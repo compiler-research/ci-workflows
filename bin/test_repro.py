@@ -1937,3 +1937,63 @@ class LocalizeWorkflowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DevshellSrcSubdirTests(unittest.TestCase):
+    """The devshell source directory has to match the one the producer built
+    in: CCACHE_BASEDIR rewrites paths relative to the workspace, so a mismatch
+    turns every ccache lookup into a miss and silently costs the dev the warm
+    cache the devshell exists to provide."""
+
+    def _for(self, repo):
+        return repro._devshell_src_subdir({"source": {"repo": repo}})
+
+    def test_llvm_recipes_keep_their_existing_path(self):
+        """Regression guard: this was hardcoded to llvm-project, and every
+        llvm-* recipe must still resolve to exactly that."""
+        for repo in ("https://github.com/llvm/llvm-project",
+                     "https://github.com/root-project/llvm-project",
+                     "https://github.com/llvm/llvm-project.git"):
+            self.assertEqual(self._for(repo), "_recipe_work/llvm-project", repo)
+
+    def test_non_llvm_recipes_get_their_own_directory(self):
+        self.assertEqual(self._for("https://github.com/kokkos/kokkos"),
+                         "_recipe_work/kokkos")
+        self.assertEqual(
+            self._for("https://github.com/vgvassilev/biodynamo.git"),
+            "_recipe_work/biodynamo")
+
+    def test_trailing_slash_does_not_produce_an_empty_name(self):
+        self.assertEqual(self._for("https://github.com/kokkos/kokkos/"),
+                         "_recipe_work/kokkos")
+
+    def test_missing_source_falls_back_rather_than_yielding_the_workdir(self):
+        """A manifest with no source must not resolve to _recipe_work/ itself,
+        which would drop the checkout on top of the build tree."""
+        self.assertEqual(repro._devshell_src_subdir({}), "_recipe_work/source")
+
+    def test_build_subdir_hangs_off_the_source_subdir(self):
+        m = {"source": {"repo": "https://github.com/kokkos/kokkos"}}
+        self.assertEqual(repro._devshell_build_subdir(m),
+                         "_recipe_work/kokkos/build")
+
+
+class DevshellMockupSourceTests(unittest.TestCase):
+    """`bin/recipe-cache pack` stamps a placeholder source it cannot know, so
+    the devshell has to tolerate an entry it can't clone. Without this the
+    documented pack + file:// route dies in git rather than handing over a
+    shell with the packed install."""
+
+    def test_mockup_manifest_skips_the_clone(self):
+        m = {"kind": "mockup",
+             "source": {"repo": "mockup://", "commit": "n/a"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(subprocess, "run") as run:
+                self.assertIsNone(repro._devshell_source(Path(tmp), m))
+            run.assert_not_called()
+
+    def test_a_real_manifest_still_refuses_when_source_is_unknown(self):
+        m = {"source": {"repo": "https://example.invalid/x", "commit": "unknown"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                repro._devshell_source(Path(tmp), m)
