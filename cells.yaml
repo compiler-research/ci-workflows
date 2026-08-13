@@ -118,3 +118,21 @@ cells:
   # ubuntu-22.04 (x86_64), its arm row ubuntu-24.04-arm.
   - { recipe: kokkos,     version: '5.1.1',        os: ubuntu-22.04,     arch: x86_64 }
   - { recipe: kokkos,     version: '5.1.1',        os: ubuntu-24.04-arm, arch: arm64  }
+  # biodynamo: agent-based simulation framework consumed by CARTopiaX. The
+  # artifact bundles its own ROOT under third_party/root, so it is far larger
+  # than the other recipes here. build.py measures the install and records
+  # install_size_mib in share/bdm-recipe-provenance.json; check it against
+  # caps.soft_gb before adding rows.
+  #
+  # ubuntu-24.04 only for now. Both extra host packages the recipe needs are
+  # available there (g++-11 from noble's own repos, python3.9 from deadsnakes),
+  # and 22.04 would need deadsnakes just the same, so it buys nothing. No arm64
+  # row: BioDynaMo's external/ROOT.cmake has no aarch64 Linux tarball selected
+  # (that branch is commented out upstream), so there is no ROOT to download.
+  #
+  # `version` is a git tag on vgvassilev/biodynamo -- clone_shallow passes it to
+  # `git clone -b`, so it cannot be a bare sha. Like the llvm-release rc row
+  # above it pins a tag rather than a branch, so cutting the next serial moves
+  # the key and republishes; see recipes/biodynamo/recipe.yaml for the naming
+  # rules, which BioDynaMo's own version generator constrains.
+  - { recipe: biodynamo,  version: 'v1.05-cr-20260812-01', os: ubuntu-24.04,     arch: x86_64 }

@@ -1,0 +1,53 @@
+recipe: biodynamo
+description: |
+  BioDynaMo built from a tagged release, installed as a relocatable tree that
+  carries its own ROOT under third_party/root. Consumers source
+  install/bin/thisbdm.sh (see actions/setup-biodynamo) and then
+  find_package(BioDynaMo) resolves with no further plumbing.
+
+  Why a recipe rather than an inline build: BioDynaMo is a ~30 minute build
+  that every downstream simulation repo (CARTopiaX and friends) would
+  otherwise repeat on every CI run, and it downloads a ~300 MB prebuilt ROOT
+  tarball from CERN while doing so. Publishing it once per cell turns that
+  into a cache fetch.
+
+  Two host packages are not optional and are installed by build.py:
+
+    python3.9  ROOT's PyROOT/cppyy are extension modules built against one
+               CPython minor (libcppyy3_9.so for the ROOT BioDynaMo bundles),
+               and BioDynaMo now requires that exact minor at configure time.
+               No Ubuntu LTS ships 3.9 -- 22.04 has 3.10, 24.04 has 3.12 --
+               so it comes from the deadsnakes PPA.
+    g++-11     cling shells out to the compiler ROOT was built with to locate
+               the standard library headers. When it is missing, `import
+               cppyy` dies inside libCling with a segmentation violation.
+
+  Built with -DNOPYENV=YES: without it the generated thisbdm.sh runs
+  `pyenv shell <version>` and cannot be sourced on a machine without pyenv,
+  which would make the published artifact unusable on any consumer that
+  doesn't replicate the producer's pyenv installation.
+
+# The version input is a git tag on the source repo below; clone_shallow passes
+# it to `git clone -b`, so a bare commit sha will not work.
+#
+# Tag shape is v<major>.<minor>-cr-<date>-<serial>, e.g.
+# v1.05-cr-20260810-01. Both halves are load-bearing:
+#
+#   v<major>.<minor>  required, not decorative. BioDynaMo's
+#                     util/version/generate_version_files.py derives its
+#                     version from `git describe` and matches it against
+#                     v([0-9]+)\.([0-9]+); anything else leaves the fallback
+#                     regex returning None and the build dies with an
+#                     AttributeError, then a missing bdm_version.h in
+#                     rootcling.
+#   -cr-<date>-<serial>  keeps the fork's tags out of upstream's namespace --
+#                     it carries commits upstream does not have -- and mirrors
+#                     the date-stamped ladder recipes/llvm-root uses.
+#
+# Cutting a new tag is also what moves the cache key: the key is a content hash
+# over this directory plus version/os/arch, so a new tag republishes the cell,
+# while a branch-tracking version would freeze the key as the branch advanced
+# and age the artifact silently.
+source:
+  repo: https://github.com/vgvassilev/biodynamo
+  branch_template: '{version}'
