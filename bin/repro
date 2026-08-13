@@ -1454,7 +1454,6 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
                                stdout=subprocess.DEVNULL)
             return
     cfg = _devshell_ccache_cfg(manifest)
-    no_hash_dir = "true" if cfg.get("hash_dir") == "false" else "false"
     uid, gid = _devshell_host_uid_gid()
     repo, encoded = _devshell_ai_repo_key(patches_out)
     env_args: list[str] = [
@@ -1462,7 +1461,14 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
         "-e", "CXX=clang++",
         "-e", f"CCACHE_DIR={ws}/{DEVSHELL_CCACHE_SUBDIR}",
         "-e", f"CCACHE_BASEDIR={ws}",
-        "-e", f"CCACHE_NOHASHDIR={no_hash_dir}",
+        # ccache's boolean environment variables are presence-based: any value
+        # enables them and an explicit "false" is rejected outright ("invalid
+        # boolean environment variable value"), so the off case has to omit the
+        # variable rather than set it. Manifests predating #51, and the mockups
+        # `recipe-cache pack` writes, carry no ccache block at all -- which is
+        # where this fired.
+        *(["-e", "CCACHE_NOHASHDIR=true"]
+          if cfg.get("hash_dir") == "false" else []),
         "-e", "CMAKE_C_COMPILER_LAUNCHER=ccache",
         "-e", "CMAKE_CXX_COMPILER_LAUNCHER=ccache",
         "-e", f"LLVM_PREFIX={ws}/{DEVSHELL_INSTALL_SUBDIR}",
