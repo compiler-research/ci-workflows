@@ -230,6 +230,28 @@ matching the new (version, os, arch) tuple. The push trigger
 takes care of the build on the next merge that touches the
 recipe directory or the workflow file.
 
+## Adding a project to `bin/start`
+
+Add an entry to `projects.yaml`: the clone URL, the matrix row a new
+contributor should develop against, and the cell that row resolves to.
+`verify.yml` fails the PR if the cell is not in `cells.yaml`, so a
+typo or a decommissioned cell cannot reach a student.
+
+Pick the plainest Linux row -- not a sanitizer, cross-compile or
+self-hosted one. This is the environment somebody meets the project in,
+not a matrix audit.
+
+The cell is written out rather than derived from the project's own
+workflows on purpose. There is no single convention to derive it from:
+CARTopiaX annotates its rows with `use-recipe` and `recipe-version`,
+while CppInterOp names a `clang-runtime` plus a `flavor` and leaves the
+recipe to `setup-llvm`. Re-implementing each consumer's mapping is how
+a contributor silently ends up in the wrong toolchain. The `workflow`
+and `row` fields record where the cell came from, and `bin/start` reads
+`recipe-version` back out of that row once the project is cloned -- so
+a project that bumps its pin wins over a stale entry here, and the
+catalog going a little stale is self-healing rather than harmful.
+
 ## Bumping the LLVM version
 
 Change the `version` input on the `setup-recipe` call in your
@@ -366,6 +388,48 @@ bin/repro consumes via `--ci-workflows <path>`.
   exit; if a run is killed hard, remove
   `.github/act-ci-workflows-stage/` and
   `.github/workflows/act-*-localized-*.yml` by hand.
+
+## Onboarding a contributor: `bin/start`
+
+Everything below this line assumes you know which cell you want and
+which flags make it persist. `bin/start` is the same machinery for
+somebody who does not: it reads `projects.yaml`, shows each project
+with its toolchain and whether that cell is published, and hands the
+selection to `--devshell`. It is a front end, not a second
+implementation -- `bin/repro` is imported and `cmd_devshell` called
+directly, the way `bin/test_repro.py` already imports it.
+
+Prerequisites are Docker, git and a Python 3. Not `act`: a project's
+cell is named by coordinate, and `_devshell_cell` short-circuits the
+act matrix lookup for a direct coordinate.
+
+Two entry paths, one command:
+
+```bash
+# from nothing: clone this repo, pick from the menu, it clones for you
+git clone https://github.com/compiler-research/ci-workflows
+cd ci-workflows && ./bin/start
+
+# from a checkout you already have: no menu, no prompts
+cd ~/src/CARTopiaX && ~/src/ci-workflows/bin/start
+```
+
+The second form matches on the `origin` remote rather than the
+directory name, so forks and renamed directories resolve.
+
+On selection it enables host-cache mode -- a newcomer's download should
+survive `docker volume rm` and a machine move -- binds the checkout at
+`/patches`, and lets `repro-config` do the rest: the recipe's
+`devshell-setup.sh`, the ccache wiring, and the Claude Code install.
+Nothing is copied out afterwards, because `/patches` *is* the checkout;
+git runs host-side, where the credentials are and where a container
+running an AI agent cannot reach them.
+
+`--list` prints the catalog and exits, which is also the cheap way to
+see whether a cell has actually been warmed.
+
+To add a project, see
+[Adding a project to `bin/start`](#adding-a-project-to-binstart).
 
 ## Iterating on a recipe with `--devshell`
 
@@ -565,12 +629,29 @@ Idempotent — runs once per fetch, no-ops on rebuild:
    verbatim (exported by `bin/repro` from
    `manifest.build_env.ccache.compiler_check`). Warns when the
    consumer's `$CC --version` diverges.
-5. **cmake configure**: replays the recipe's own cmake invocation
+5. **recipe host deps**: runs
+   `recipes/<recipe>/devshell-setup.sh` off the read-only
+   `/ci-workflows` bind, when the recipe ships one. Step 1 installs
+   the LLVM set and nothing else, so any recipe with dependencies
+   beyond it needs this — without it the biodynamo devshell cannot
+   configure (`We did not find any OpenMPI installation`) or build a
+   consumer against the artifact. Warns rather than aborts.
+
+   The script is deliberately outside `compute_key.py`'s hashed set
+   (`recipe.yaml`, the build script, `patches/**`,
+   `actions/lib/**.py`): it changes what a *devshell* installs, never
+   what the published artifact contains, so editing it must not
+   orphan the recipe's cells. The corollary is that it duplicates
+   `build.py`'s package list by hand — keep the two in step.
+6. **cmake configure**: replays the recipe's own cmake invocation
    from `manifest.cmake_args`, substituting
    `CMAKE_INSTALL_PREFIX` and the source path. Pre-`cmake_args`
    manifests fall back to `llvm_build.base_cmake_args() +
-   LLVM_ENABLE_PROJECTS=clang`.
-6. **smoke compile**: builds
+   LLVM_ENABLE_PROJECTS=clang`. Failure warns rather than aborting,
+   and clears the `CMakeCache.txt` cmake leaves behind on abort so a
+   later session retries — a devshell whose *recipe* source is not
+   configured is still a working devshell.
+7. **smoke compile**: builds
    `lib/Support/CMakeFiles/LLVMSupport.dir/Allocator.cpp.o`. Zero
    ccache hits ⇒ producer cache isn't reaching the consumer (drift
    the earlier checks didn't catch); surfaces a `::warning::`

@@ -136,6 +136,33 @@ jobs:
             fi
           done
           exit $fail
+      - name: projects.yaml entries name a real cell
+        # bin/start renders this catalog before anything is cloned, so a
+        # coord here that no cell serves shows a student a project they
+        # cannot actually enter. Membership in cells.yaml is the right
+        # test rather than a backend probe: it is what makes a cell
+        # warmed and kept, and it keeps this check offline.
+        run: |
+          set -euo pipefail
+          fail=0
+          count=$(yq '.projects | length' projects.yaml)
+          for i in $(seq 0 $((count - 1))); do
+            name=$(yq -r ".projects[$i].name" projects.yaml)
+            for f in name description repo workflow row recipe version os arch; do
+              v=$(yq -r ".projects[$i].$f // \"\"" projects.yaml)
+              if [ -z "$v" ]; then
+                echo "::error file=projects.yaml::$name missing field: $f"
+                fail=1
+              fi
+            done
+            coord=$(yq -r ".projects[$i] | [.recipe, .version, .os, .arch] | @tsv" projects.yaml)
+            if ! yq -r '.cells[] | [.recipe, .version, .os, .arch] | @tsv' cells.yaml \
+                 | grep -qxF "$coord"; then
+              echo "::error file=projects.yaml::$name names a cell absent from cells.yaml: $coord"
+              fail=1
+            fi
+          done
+          exit $fail
       - name: No orphan recipe directories
         # Catches recipes/ subdirs that aren't referenced by cells.yaml.
         # An orphan recipe directory is dead weight — it's never built,
@@ -158,6 +185,83 @@ jobs:
             echo "$orphans"
             exit 1
           fi
+
+  # The only job that actually provisions a devshell. The unit tests
+  # cover the Python deciding *what* to provision and publish-dryrun
+  # covers the recipe pipeline, but the chain that hands a developer a
+  # working container -- fetch, repro-config, the recipe's
+  # devshell-setup.sh, the cmake replay -- was previously proven only by
+  # someone running it on a laptop. That is how the biodynamo devshell
+  # shipped unable to configure anything.
+  #
+  # biodynamo rather than a cheaper cell on purpose: it is the only
+  # recipe shipping a devshell-setup.sh, and an LLVM cell cannot regress
+  # that hook because repro-config installs LLVM's dependencies anyway.
+  # The coord comes from projects.yaml so a version bump does not leave
+  # this job testing a cell nobody offers.
+  #
+  # Costs a ~1 GB act-image pull plus the cell download on every PR that
+  # touches bin/, scripts/ or recipes/.
+  devshell-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the biodynamo cell from projects.yaml
+        id: cell
+        run: |
+          set -euo pipefail
+          coord=$(yq -r '.projects[] | select(.recipe == "biodynamo")
+            | .recipe + "/" + .version + "/" + .os + "/" + .arch' \
+            projects.yaml | head -1)
+          if [ -z "$coord" ]; then
+            echo "::error file=projects.yaml::no biodynamo project to smoke"
+            exit 1
+          fi
+          echo "coord=$coord" >> "$GITHUB_OUTPUT"
+
+      - name: bin/start lists the catalog
+        run: |
+          set -euo pipefail
+          ./bin/start --list | tee listing
+          # An empty catalog still exits 0, so assert on content.
+          grep -q 'CARTopiaX' listing
+
+      - name: Provision a devshell and assert it is usable
+        env:
+          COORD: ${{ steps.cell.outputs.coord }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/smoke.sh" <<'SH'
+          set -eo pipefail
+          fail=0
+          check() {
+            if eval "$2" >/dev/null 2>&1; then
+              echo "  ok    $1"
+            else
+              echo "  FAIL  $1"; fail=1
+            fi
+          }
+          # The recipe's host dependencies, i.e. devshell-setup.sh ran.
+          # Without it the configure below dies on missing OpenMPI.
+          check "mpicxx present"        "command -v mpicxx"
+          check "python3.9 present"     "command -v python3.9"
+          # The artifact, and the environment a consumer build needs.
+          check "thisbdm.sh sets BDMSYS" \
+            'set +u; . "$DEVSHELL_INSTALL/bin/thisbdm.sh" >/dev/null 2>&1; [ -n "$BDMSYS" ]'
+          # The cmake replay reached the end. This is the assertion that
+          # would have caught the original breakage.
+          check "recipe build tree configured" \
+            '[ -f "$DEVSHELL_BUILD/CMakeCache.txt" ]'
+          # The "claude-ready" half of the promise.
+          check "claude on PATH"        "command -v claude"
+          exit $fail
+          SH
+          ./bin/repro --devshell \
+              --devshell-host-cache-dir "$RUNNER_TEMP/devshell-cache" \
+              --devshell-script "$RUNNER_TEMP/smoke.sh" \
+              "$COORD"
 
   # Cross-OS unit tests for every Python module in the recipe pipeline.
   # Each function has minimal-effective tests (happy path + targeted

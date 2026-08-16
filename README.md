@@ -11,6 +11,31 @@ eventually MSan stacks and sanitizer-CPython).
 > and the trade-offs you're accepting. The rest of this README is a
 > quick reference.
 
+## Just want to start working on a project? `bin/start`
+
+You need Docker, git and a Python 3. Not `act`, and not a toolchain --
+that gets downloaded.
+
+```bash
+git clone https://github.com/compiler-research/ci-workflows
+cd ci-workflows && ./bin/start
+```
+
+It lists the projects in [`projects.yaml`](projects.yaml) with the
+toolchain each develops against, clones the one you pick, and opens a
+container holding that exact toolchain -- the same artifact the
+project's CI uses -- with its host dependencies installed and Claude
+Code ready. Run it from inside a checkout you already have and it skips
+the menu.
+
+Your checkout is bind-mounted, not copied, so edits show up on the host
+immediately and you commit, push and open pull requests from there.
+No credentials are copied into the container.
+
+`./bin/start --list` prints the catalog without prompting. See
+[Onboarding a contributor](docs/developer-guide.md#onboarding-a-contributor-binstart)
+for what it sets up and how to add a project to the list.
+
 ## Consumer side: `setup-recipe`
 
 In a downstream workflow:
