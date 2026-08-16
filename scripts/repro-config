@@ -188,8 +188,26 @@ PY
     # entirely. Leave it to the dev, who can see the manifest.
     echo "::warning title=devshell::manifest has no cmake_args; skipping the" \
          "cmake configure. Configure \$DEVSHELL_BUILD by hand."
-  else
-    eval cmake "$exec_cmake_args"
+  elif ! eval cmake "$exec_cmake_args"; then
+    # Not fatal. This configure is a convenience for devs who intend to
+    # rebuild the recipe's own source; the install tree, the ccache and
+    # the AI CLI are all in place without it, so failing here would cost
+    # the dev the whole shell over an optional step.
+    #
+    # It fails routinely for recipes with host dependencies beyond
+    # LLVM's. build.py apt-installs those itself before configuring, but
+    # that runs on the *producer*; the block at the top of this script
+    # installs only the LLVM set, so e.g. the biodynamo recipe stops at
+    # "We did not find any OpenMPI installation".
+    #
+    # Drop the half-written cache: cmake writes CMakeCache.txt even when
+    # it aborts, and leaving it would make every later session take the
+    # skip branch above and never retry the configure.
+    rm -rf "$build/CMakeCache.txt" "$build/CMakeFiles"
+    echo "::warning title=devshell::the recipe's cmake configure failed;" \
+         "the devshell is still usable. To rebuild \$DEVSHELL_SRC, apt-install" \
+         "the host packages the recipe's build.py installs, then re-run" \
+         "bin/repro --devshell."
   fi
 fi
 
