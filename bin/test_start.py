@@ -242,6 +242,38 @@ class RenderTest(unittest.TestCase):
         self.assertIn("not published yet", text)
 
 
+class DetectProjectTest(unittest.TestCase):
+    """Running from inside a checkout must not ask which project it is."""
+
+    def test_slug_normalises_ssh_https_and_dot_git(self):
+        for url in ("https://github.com/compiler-research/CARTopiaX",
+                    "https://github.com/compiler-research/CARTopiaX.git",
+                    "git@github.com:compiler-research/CARTopiaX.git",
+                    "https://github.com/compiler-research/CARTopiaX/"):
+            self.assertEqual(start._repo_slug(url),
+                             "compiler-research/cartopiax", url)
+
+    def test_matches_on_the_origin_remote_not_the_directory_name(self):
+        projects = start.load_projects(_write(WELL_FORMED))
+        repro = mock.Mock()
+        repro._origin_repo_slug.return_value = "compiler-research/CARTopiaX"
+        with mock.patch.object(start.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0,
+                                         stdout="/home/s/renamed-dir\n")
+            got = start.detect_project(repro, projects)
+        self.assertIsNotNone(got)
+        self.assertEqual(got[0]["name"], "CARTopiaX")
+        self.assertEqual(got[1], Path("/home/s/renamed-dir"))
+
+    def test_uncatalogued_or_non_git_cwd_falls_through_to_the_menu(self):
+        projects = start.load_projects(_write(WELL_FORMED))
+        repro = mock.Mock()
+        repro._origin_repo_slug.return_value = "someone/unrelated"
+        self.assertIsNone(start.detect_project(repro, projects))
+        repro._origin_repo_slug.return_value = None
+        self.assertIsNone(start.detect_project(repro, projects))
+
+
 class CellStatusTest(unittest.TestCase):
     """Three outcomes, three different things for the student to do."""
 

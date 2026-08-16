@@ -384,6 +384,45 @@ def _value_after(line: str, key: str) -> Optional[str]:
     return value or None
 
 
+def _repo_slug(url: str) -> str:
+    """owner/repo out of a clone URL, for comparing catalog to remote."""
+    trimmed = url.rstrip("/")
+    if trimmed.endswith(".git"):
+        trimmed = trimmed[:-len(".git")]
+    parts = trimmed.replace(":", "/").split("/")
+    return "/".join(parts[-2:]).lower() if len(parts) >= 2 else trimmed.lower()
+
+
+def detect_project(repro, projects: List[Dict[str, str]]
+                   ) -> Optional[Tuple[Dict[str, str], Path]]:
+    """If the cwd is a checkout of a catalogued project, return it.
+
+    Two entry paths, one command. Someone starting from nothing runs
+    this from the ci-workflows clone and picks off the menu; someone
+    already sitting in their checkout should not be asked which
+    project they are in, nor where to put it. Matching is on the
+    origin remote rather than the directory name, so a fork or a
+    renamed directory still resolves.
+    """
+    slug = repro._origin_repo_slug()
+    if not slug:
+        return None
+    for p in projects:
+        if _repo_slug(p["repo"]) != slug.lower():
+            continue
+        try:
+            top = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if top.returncode != 0 or not top.stdout.strip():
+            return None
+        return p, Path(top.stdout.strip())
+    return None
+
+
 #: Matrix keys that name a recipe version, most specific first. The
 #: same pair `_devshell_cell` maps from, because consumers disagree:
 #: CARTopiaX says `recipe-version`, CppInterOp says `clang-runtime`.
@@ -534,16 +573,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     base = cache_io.resolve_cache_base()
     cells = repro.published_cells()
 
-    statuses = [cell_status(repro, base, p, cells) for p in projects]
-    render(projects, statuses)
-    index = select(len(projects))
-    if index is None:
-        return 0
-    project = projects[index]
-
-    checkout = resolve_checkout(project)
-    if checkout is None:
-        return 1
+    detected = detect_project(repro, projects)
+    if detected is not None:
+        # Announce, don't ask. cd'ing into the checkout and running this
+        # is already the answer to both questions the menu path asks,
+        # and nothing here writes to the checkout -- it is bind-mounted,
+        # not modified. The line below is the disclosure.
+        project, checkout = detected
+        print(f"  in a {project['name']} checkout ({checkout});"
+              f" skipping the menu.")
+        print(f"    {cell_status(repro, base, project, cells)}")
+    else:
+        statuses = [cell_status(repro, base, p, cells) for p in projects]
+        render(projects, statuses)
+        index = select(len(projects))
+        if index is None:
+            return 0
+        project = projects[index]
+        maybe_checkout = resolve_checkout(project)
+        if maybe_checkout is None:
+            return 1
+        checkout = maybe_checkout
 
     coord = coord_of(project)
     pinned = repo_pinned_version(checkout, project)
