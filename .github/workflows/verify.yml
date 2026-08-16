@@ -136,6 +136,33 @@ jobs:
             fi
           done
           exit $fail
+      - name: projects.yaml entries name a real cell
+        # bin/start renders this catalog before anything is cloned, so a
+        # coord here that no cell serves shows a student a project they
+        # cannot actually enter. Membership in cells.yaml is the right
+        # test rather than a backend probe: it is what makes a cell
+        # warmed and kept, and it keeps this check offline.
+        run: |
+          set -euo pipefail
+          fail=0
+          count=$(yq '.projects | length' projects.yaml)
+          for i in $(seq 0 $((count - 1))); do
+            name=$(yq -r ".projects[$i].name" projects.yaml)
+            for f in name description repo workflow row recipe version os arch; do
+              v=$(yq -r ".projects[$i].$f // \"\"" projects.yaml)
+              if [ -z "$v" ]; then
+                echo "::error file=projects.yaml::$name missing field: $f"
+                fail=1
+              fi
+            done
+            coord=$(yq -r ".projects[$i] | [.recipe, .version, .os, .arch] | @tsv" projects.yaml)
+            if ! yq -r '.cells[] | [.recipe, .version, .os, .arch] | @tsv' cells.yaml \
+                 | grep -qxF "$coord"; then
+              echo "::error file=projects.yaml::$name names a cell absent from cells.yaml: $coord"
+              fail=1
+            fi
+          done
+          exit $fail
       - name: No orphan recipe directories
         # Catches recipes/ subdirs that aren't referenced by cells.yaml.
         # An orphan recipe directory is dead weight — it's never built,

@@ -1,0 +1,51 @@
+# projects.yaml -- the projects `bin/start` offers a newcomer.
+#
+# cells.yaml answers "what does the cache hold"; this file answers "who
+# is it for". They are separate because the two lists diverge: most
+# cells serve several projects, and a project pins exactly one cell for
+# the environment it wants a contributor to develop in -- not
+# necessarily every cell its CI matrix touches.
+#
+# Why the cell is written out here rather than derived from the
+# project's own workflows: there is no single convention to derive it
+# from. CARTopiaX annotates its matrix rows with `use-recipe` /
+# `recipe-version`, but CppInterOp names a `clang-runtime` plus a
+# `flavor` and lets setup-llvm decide the recipe, and other consumers
+# do neither. Reading each project's workflow correctly would mean
+# reimplementing every consumer's mapping, and getting it wrong hands a
+# student a silently wrong toolchain. An explicit row is checked by
+# verify.yml against cells.yaml, so a stale one fails CI here instead.
+#
+# Adding a project:
+#   - Pick the matrix row a new contributor should develop against --
+#     the plainest Linux row, not the sanitizer or cross-compile ones.
+#   - Record its cell. It must already appear in cells.yaml; verify.yml
+#     rejects the entry otherwise.
+#   - `workflow` and `row` are provenance: they say where the cell came
+#     from, and bin/start reads `recipe-version` back out of `workflow`
+#     after cloning so a project that bumps its pin wins over a stale
+#     row here.
+#
+# Fields: name, description, repo, workflow, row, recipe, version, os,
+# arch. All required.
+
+projects:
+  - name: CARTopiaX
+    description: CAR T-cell therapy agent-based model, built on BioDynaMo
+    repo: https://github.com/compiler-research/CARTopiaX
+    workflow: .github/workflows/ci.yml
+    row: ubu24-gcc
+    recipe: biodynamo
+    version: v1.05-cr-20260812-01
+    os: ubuntu-24.04
+    arch: x86_64
+
+  - name: CppInterOp
+    description: C++ interoperability layer backing cppyy and Python bindings
+    repo: https://github.com/compiler-research/CppInterOp
+    workflow: .github/workflows/main.yml
+    row: ubu24-x86-gcc12-llvm22
+    recipe: llvm-release
+    version: '22'
+    os: ubuntu-24.04
+    arch: x86_64

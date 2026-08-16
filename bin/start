@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""Newcomer entry point: pick a project, land in a container ready to work in.
+
+    git clone https://github.com/compiler-research/ci-workflows
+    cd ci-workflows && ./bin/start
+
+Prints the projects in projects.yaml with the toolchain each one
+develops against, takes a number, clones the project if it isn't on
+disk yet, and hands the whole thing to `bin/repro --devshell` -- which
+downloads that toolchain from the recipe cache, installs the recipe's
+host dependencies, and opens a shell with Claude Code in it.
+
+Why a second entry point rather than a `bin/repro` flag: repro's
+audience already knows what a matrix row is and why they want to
+reproduce one. This one's audience has been handed a link by a
+supervisor. Nothing here is new machinery -- the module is loaded and
+`cmd_devshell` called directly, so provisioning, container naming,
+ccache wiring and the AI setup all stay in one place. What this file
+owns is the catalog, the prompts, and the decision of what to hand
+`cmd_devshell`.
+
+Deliberately stdlib-only, like bin/repro: a student running this has
+Docker and a Python, and that has to be enough. That is also why
+projects.yaml is parsed here by hand instead of with PyYAML.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PROJECTS_YAML = REPO_ROOT / "projects.yaml"
+#: Where a project gets cloned when the user accepts the default.
+DEFAULT_SRC_PARENT = Path.home() / "src"
+#: Mirrors bin/repro's DEVSHELL_HOST_CACHE_DEFAULT, which is what
+#: --devshell-host-cache resolves to and where the cell is unpacked.
+DEVSHELL_HOST_CACHE = Path.home() / ".cache" / "ci-workflows" / "devshell-cache"
+#: Free space below which we say so. Advisory, not a floor: preflight
+#: runs before a project is picked, and cells differ by an order of
+#: magnitude -- biodynamo unpacks to ~800 MB, an LLVM cell to ~4 GB --
+#: so any single number would either block a small project needlessly
+#: or wave a big one through.
+WARN_FREE_GIB = 10
+
+_COORD_KEYS = ("recipe", "version", "os", "arch")
+_REQUIRED = ("name", "description", "repo", "workflow", "row") + _COORD_KEYS
+
+
+def _load_repro():
+    """Import the extensionless bin/repro as a module.
+
+    Same SourceFileLoader dance bin/test_repro.py uses; repro is
+    import-safe (everything is behind functions and a main() guard).
+    """
+    path = REPO_ROOT / "bin" / "repro"
+    loader = importlib.machinery.SourceFileLoader("repro", str(path))
+    spec = importlib.util.spec_from_loader("repro", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+# ---------------------------------------------------------------- catalog
+
+
+def load_projects(path: Optional[Path] = None) -> List[Dict[str, str]]:
+    """Parse projects.yaml's `projects:` list.
+
+    Hand-rolled for the same reason published_cells() is -- no PyYAML
+    on a student's machine. The accepted shape is deliberately narrow:
+    a `- name: value` line opens an entry and further indented
+    `key: value` lines extend it. Only the first colon splits, so a
+    description may contain them.
+
+    Entries missing a required field are dropped rather than raised
+    on: a malformed row should cost the student that one project, not
+    the whole menu. verify.yml is what makes malformed rows loud.
+    """
+    if path is None:
+        path = PROJECTS_YAML
+    if not path.is_file():
+        return []
+    out: List[Dict[str, str]] = []
+    cur: Optional[Dict[str, str]] = None
+    in_projects = False
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if line.startswith("projects:"):
+            in_projects = True
+            continue
+        if not in_projects:
+            continue
+        # Any new top-level key ends the projects: block.
+        if line and not line[0].isspace() and not line.startswith("#"):
+            break
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            if cur:
+                out.append(cur)
+            cur = {}
+            stripped = stripped[2:].strip()
+        if cur is None or ":" not in stripped:
+            continue
+        key, _, value = stripped.partition(":")
+        cur[key.strip()] = value.strip().strip("'").strip('"')
+    if cur:
+        out.append(cur)
+    return [p for p in out if all(k in p and p[k] for k in _REQUIRED)]
+
+
+def coord_of(project: Dict[str, str]) -> Dict[str, str]:
+    """The (recipe, version, os, arch) tuple a project develops against."""
+    return {k: project[k] for k in _COORD_KEYS}
+
+
+def coord_str(coord: Dict[str, str]) -> str:
+    return "/".join(coord[k] for k in _COORD_KEYS)
+
+
+# -------------------------------------------------------------- preflight
+
+
+def _docker_status() -> Tuple[bool, str]:
+    """Return (ok, detail) for the docker daemon.
+
+    Client version and daemon reachability are separate failures with
+    separate fixes, so they get separate messages: an installed client
+    that can't reach a daemon means "start Docker Desktop", a missing
+    binary means "install it".
+    """
+    if shutil.which("docker") is None:
+        return False, "not installed -- see https://docs.docker.com/get-docker/"
+    try:
+        version = subprocess.run(
+            ["docker", "version", "--format", "{{.Client.Version}}"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        info = subprocess.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"could not be queried ({e})"
+    if info.returncode != 0:
+        return False, (f"{version or 'installed'}, but the daemon is not "
+                       f"running -- start Docker and try again")
+    return True, f"{version or info.stdout.strip()}, daemon up"
+
+
+def _disk_status() -> Tuple[bool, str]:
+    """Free space where the unpacked cell will land.
+
+    Measured at the cache location rather than $PWD, which on a laptop
+    is often a different volume. Never blocks: see WARN_FREE_GIB.
+    """
+    probe = DEVSHELL_HOST_CACHE
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        free_gib = shutil.disk_usage(probe).free / (1024 ** 3)
+    except OSError as e:
+        return True, f"could not be determined ({e})"
+    detail = f"{free_gib:.0f} GB free at {probe}"
+    if free_gib < WARN_FREE_GIB:
+        detail += " -- tight for the larger cells"
+    return True, detail
+
+
+def _host_machine() -> str:
+    """The machine's architecture, not the interpreter's.
+
+    platform.machine() reports the *process* arch, so an x86_64 Python
+    under Rosetta calls an Apple Silicon Mac "x86_64" -- and then we
+    would fail to warn about exactly the machine that needs the
+    warning. sysctl.proc_translated is macOS's answer to "am I being
+    translated"; it is absent on a native process.
+    """
+    import platform as _platform
+    machine = _platform.machine().lower()
+    if _platform.system().lower() != "darwin" or machine != "x86_64":
+        return machine
+    try:
+        out = subprocess.run(["sysctl", "-n", "sysctl.proc_translated"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return machine
+    return "arm64" if out.stdout.strip() == "1" else machine
+
+
+def _platform_status() -> Tuple[bool, str]:
+    """Note x86_64-on-arm64 translation rather than failing on it.
+
+    A translated container is fine for developing and wrong for
+    timing, so this is information the user needs and not a reason to
+    stop.
+    """
+    import platform as _platform
+    system = _platform.system().lower()
+    machine = _host_machine()
+    if machine in ("arm64", "aarch64"):
+        return True, (f"{system}/{machine} -- x86_64 containers run "
+                      f"translated (fine to develop in, not to time)")
+    return True, f"{system}/{machine}"
+
+
+def preflight() -> bool:
+    """Print the environment checks; return False if any blocks."""
+    checks = [
+        ("docker", _docker_status()),
+        ("disk", _disk_status()),
+        ("platform", _platform_status()),
+    ]
+    print("  checking prerequisites")
+    ok = True
+    for label, (passed, detail) in checks:
+        prefix = "    " if passed else "  ! "
+        print(f"{prefix}{label:<18}{detail}")
+        ok = ok and passed
+    print()
+    return ok
+
+
+# ------------------------------------------------------------ cell status
+
+
+def _asset_size(base: str, key: str) -> Optional[int]:
+    """Content-Length of the cell's install asset, or None.
+
+    A HEAD rather than cache_io.cache_probe(), which throws the size
+    away -- the download size is the single most useful number to show
+    someone about to wait for it. Kept here rather than added to
+    cache_io for the reason in the module docstring: that directory
+    feeds the cache key.
+    """
+    asset = f"{key}.tar.zst"
+    if base.startswith("file://"):
+        p = Path(base[len("file://"):]) / asset
+        return p.stat().st_size if p.is_file() else None
+    if not base.startswith(("http://", "https://")):
+        return None
+    req = urllib.request.Request(f"{base.rstrip('/')}/{asset}", method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if not 200 <= resp.status < 400:
+                return None
+            length = resp.headers.get("Content-Length")
+            return int(length) if length else None
+    except (urllib.error.HTTPError, urllib.error.URLError,
+            ValueError, OSError):
+        return None
+
+
+def cell_status(repro, base: str, project: Dict[str, str],
+                cells: List[Dict[str, str]]) -> str:
+    """One line describing whether this project's cell is usable.
+
+    Two failures are worth distinguishing. Not in cells.yaml means the
+    catalog is stale and no amount of waiting helps. In cells.yaml but
+    not on the backend means the cell simply hasn't been warmed yet,
+    which fixes itself on the next publish.
+    """
+    coord = coord_of(project)
+    if not any(all(coord[k] == c[k] for k in _COORD_KEYS) for c in cells):
+        return "unknown cell -- not in cells.yaml, this entry is stale"
+    try:
+        key = repro._devshell_compute_key(coord)
+    except (subprocess.CalledProcessError, SystemExit):
+        return "cell key could not be computed"
+    size = _asset_size(base, key)
+    if size is None:
+        return "not published yet -- pick another, or warm this cell first"
+    return f"published -- {size / (1024 ** 2):.0f} MB download"
+
+
+# ------------------------------------------------------------------ menu
+
+
+def render(projects: List[Dict[str, str]], statuses: List[str]) -> None:
+    print("  ci-workflows projects")
+    print()
+    for i, (p, status) in enumerate(zip(projects, statuses), start=1):
+        coord = coord_of(p)
+        print(f"  {i:>2}  {p['name']:<14} {p['description']}")
+        print(f"      {'':<14} {coord['recipe']} {coord['version']} "
+              f"- {coord['os']}/{coord['arch']}")
+        print(f"      {'':<14} {status}")
+        print()
+
+
+def select(count: int) -> Optional[int]:
+    """Prompt until a valid index or a quit. Returns a 0-based index.
+
+    EOF counts as quit so a piped or non-interactive run exits cleanly
+    instead of looping on an empty read.
+    """
+    while True:
+        try:
+            raw = input(f"  select a project [1-{count}], or q to quit: ")
+        except EOFError:
+            print()
+            return None
+        raw = raw.strip().lower()
+        if raw in ("q", "quit", "exit"):
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= count:
+            return int(raw) - 1
+        print(f"  not a choice: {raw!r}")
+
+
+def _confirm(prompt: str, default: bool = True) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    try:
+        raw = input(f"  {prompt} {suffix} ").strip().lower()
+    except EOFError:
+        print()
+        return False
+    if not raw:
+        return default
+    return raw in ("y", "yes")
+
+
+# -------------------------------------------------------------- checkout
+
+
+def resolve_checkout(project: Dict[str, str]) -> Optional[Path]:
+    """Find or create the project's checkout; return its path.
+
+    An existing directory is reused as-is and never touched -- it is
+    the user's working copy, and this tool has no business pulling or
+    resetting it.
+    """
+    default = DEFAULT_SRC_PARENT / project["name"]
+    print()
+    print(f"  {project['name']}")
+    print(f"    clone to    {default}            [enter to accept]")
+    print(f"    toolchain   {project['recipe']} {project['version']}")
+    print()
+    try:
+        raw = input(f"  path [{default}]: ").strip()
+    except EOFError:
+        print()
+        return None
+    dest = Path(raw).expanduser().resolve() if raw else default
+
+    if dest.is_dir():
+        if not (dest / ".git").is_dir():
+            print(f"  {dest} exists but is not a git checkout; "
+                  f"pick another path.")
+            return None
+        print(f"  using the checkout already at {dest}")
+        return dest
+
+    if not _confirm(f"clone {project['repo']} to {dest}?"):
+        return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["git", "clone", project["repo"], str(dest)])
+    if r.returncode != 0:
+        print(f"  git clone failed (exit {r.returncode})")
+        return None
+    return dest
+
+
+def _value_after(line: str, key: str) -> Optional[str]:
+    """Pull `key: value` out of one line, inline-flow or block.
+
+    Stops at a comma or a closing brace so an inline row like
+    `{ name: r, recipe-version: v1, arch: x86_64 }` yields just `v1`.
+    """
+    _, _, rest = line.partition(key)
+    rest = rest.lstrip().lstrip(":").strip()
+    value = rest.split(",")[0].split("}")[0].strip().strip("'\"")
+    return value or None
+
+
+#: Matrix keys that name a recipe version, most specific first. The
+#: same pair `_devshell_cell` maps from, because consumers disagree:
+#: CARTopiaX says `recipe-version`, CppInterOp says `clang-runtime`.
+_VERSION_KEYS = ("recipe-version", "clang-runtime")
+
+#: `name:` as a mapping key: opening a block item, or after `{` / `,`
+#: inline. Anchored at both ends because a substring test matches the
+#: wrong row -- `ubu24-x86-gcc12-llvm22` against the line for
+#: `ubu24-x86-gcc12-llvm22-cppyy` -- and matches `flavor-name:` too.
+_NAME_RE = re.compile(r"(?:[{,]|^\s*-)\s*name:\s*([^,}\s]+)")
+
+
+def _row_name(line: str) -> Optional[str]:
+    """The row this line opens, or None if it opens no row."""
+    m = _NAME_RE.search(line)
+    return m.group(1).strip("'\"") if m else None
+
+
+def _collect_versions(line: str, into: Dict[str, str]) -> None:
+    """Record any version keys on `line`; first occurrence wins."""
+    for key in _VERSION_KEYS:
+        if key in line and key not in into:
+            value = _value_after(line, key)
+            if value:
+                into[key] = value
+
+
+def repo_pinned_version(checkout: Path,
+                        project: Dict[str, str]) -> Optional[str]:
+    """Read the version the project itself pins for its recorded row.
+
+    The catalog makes the menu renderable before anything is cloned,
+    but the project is the authority on what it builds against, so a
+    bumped pin must not strand a contributor on last month's
+    toolchain. This is a targeted scan of one row, not a workflow
+    parser: it handles the inline and block matrix shapes because
+    consumers use both, and returns None the moment the answer is not
+    unambiguous. Being a little stale beats guessing.
+
+    Only the version is recovered. A project that changes its recipe,
+    os or arch outruns this check and needs the projects.yaml row
+    updated by hand; verify.yml is what catches the result.
+    """
+    wf = checkout / project["workflow"]
+    if not wf.is_file():
+        return None
+    lines = wf.read_text().splitlines()
+    for i, line in enumerate(lines):
+        if _row_name(line) != project["row"]:
+            continue
+        # Collect the whole row before choosing, so precedence is by
+        # key and not by which line happened to come first.
+        found: Dict[str, str] = {}
+        _collect_versions(line, found)
+        # A block item carries its remaining keys indented past the
+        # `-`; an inline one ends here and the walk stops immediately.
+        indent = len(line) - len(line.lstrip())
+        for nxt in lines[i + 1:]:
+            if not nxt.strip() or nxt.lstrip().startswith("#"):
+                continue
+            if len(nxt) - len(nxt.lstrip()) <= indent:
+                break
+            _collect_versions(nxt, found)
+        for key in _VERSION_KEYS:
+            if key in found:
+                return found[key]
+        return None
+    return None
+
+
+# ------------------------------------------------------------------ main
+
+
+def launch(repro, project: Dict[str, str], checkout: Path,
+           coord: Dict[str, str]) -> int:
+    """Hand off to bin/repro's devshell.
+
+    The Namespace is the full set cmd_devshell and its helpers read.
+    Host-cache mode is on because a newcomer wants the download to
+    survive `docker volume rm` and a machine move; the coordinate goes
+    through `matrix` because _devshell_cell takes a direct coord there
+    and skips act entirely.
+    """
+    # Say where the work lives before the shell opens, because the
+    # question it answers ("how do I get my changes out?") otherwise
+    # gets asked after the fact. There is no export step: /patches is
+    # the checkout, so git runs on the host, where the credentials
+    # are -- and deliberately nowhere near a container running an AI
+    # agent. The container has no git identity for the same reason.
+    print()
+    print(f"  {checkout} is mounted at /patches inside the container.")
+    print("  Edits appear there immediately; commit, push and open "
+          "pull requests")
+    print("  from the host as usual -- no credentials are copied "
+          "into the container.")
+    print()
+    args = argparse.Namespace(
+        matrix=[f"name:{coord_str(coord)}"],
+        devshell_host_cache=True,
+        devshell_host_cache_dir=None,
+        devshell_patches_out=str(checkout),
+        devshell_image=None,
+        devshell_refetch=False,
+        devshell_rm=False,
+        devshell_script=None,
+        devshell_as_root=False,
+    )
+    return repro.cmd_devshell(args)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="bin/start",
+        description="Pick a ci-workflows project and open a dev container "
+                    "for it.",
+    )
+    parser.add_argument(
+        "--list", action="store_true",
+        help="print the catalog with cell status and exit (no prompts)",
+    )
+    args = parser.parse_args(argv)
+
+    projects = load_projects()
+    if not projects:
+        print(f"error: no usable entries in {PROJECTS_YAML}", file=sys.stderr)
+        return 1
+
+    if args.list:
+        repro = _load_repro()
+        sys.path.insert(0, str(REPO_ROOT / "actions" / "lib"))
+        import cache_io  # noqa: E402
+        base = cache_io.resolve_cache_base()
+        cells = repro.published_cells()
+        print()
+        render(projects, [cell_status(repro, base, p, cells)
+                          for p in projects])
+        return 0
+
+    print()
+    if not preflight():
+        print("  fix the flagged items above, then run ./bin/start again.")
+        return 1
+
+    repro = _load_repro()
+    sys.path.insert(0, str(REPO_ROOT / "actions" / "lib"))
+    import cache_io  # noqa: E402
+
+    base = cache_io.resolve_cache_base()
+    cells = repro.published_cells()
+
+    statuses = [cell_status(repro, base, p, cells) for p in projects]
+    render(projects, statuses)
+    index = select(len(projects))
+    if index is None:
+        return 0
+    project = projects[index]
+
+    checkout = resolve_checkout(project)
+    if checkout is None:
+        return 1
+
+    coord = coord_of(project)
+    pinned = repo_pinned_version(checkout, project)
+    if pinned and pinned != coord["version"]:
+        print(f"  note: {project['name']} pins {pinned}, projects.yaml "
+              f"records {coord['version']}; using the repo's.")
+        coord["version"] = pinned
+
+    return launch(repro, project, checkout, coord)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
