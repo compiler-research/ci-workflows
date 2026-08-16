@@ -149,6 +149,30 @@ src="${DEVSHELL_SRC:?env not set; bin/repro --devshell exports it}"
 prefix="${DEVSHELL_INSTALL:-${LLVM_PREFIX:?env not set; bin/repro --devshell exports it}}"
 manifest="${DEVSHELL_MANIFEST:?env not set; bin/repro --devshell exports it}"
 
+# Recipes whose host dependencies exceed LLVM's can ship a
+# devshell-setup.sh beside their build.py; run it before the configure
+# below. build.py installs those packages too, but on the producer,
+# which is no help to a dev here: without them the recipe's own source
+# will not configure, and neither will a consumer building against the
+# artifact.
+#
+# Not fatal, for the same reason the configure below is not: a package
+# that failed to install should cost the dev that package, not the shell.
+recipe_name=$(python3 - <<'PY' "$manifest"
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("recipe") or "")
+except (OSError, json.JSONDecodeError, IndexError):
+    pass
+PY
+)
+hook="/ci-workflows/recipes/${recipe_name}/devshell-setup.sh"
+if [[ -n "$recipe_name" && -f "$hook" ]]; then
+  echo "devshell: installing ${recipe_name}'s host dependencies..."
+  bash "$hook" || echo "::warning title=devshell::${hook} failed;" \
+    "the recipe's own source may not configure."
+fi
+
 if [[ ! -f "$build/CMakeCache.txt" ]]; then
   mkdir -p "$build"
   cd "$build"
