@@ -97,11 +97,26 @@ jobs:
               cmake ninja-build g++ git \
               libedit-dev libeigen3-dev libboost-dev
             if [[ "${VALGRIND}" == "true" ]]; then
-              sudo apt-get install -y valgrind libc6-dbg
+              sudo apt-get install -y libc6-dbg
             fi
           elif [[ "${RUNNER_OS}" == "macOS" ]]; then
             brew install ninja eigen boost gnu-sed
           fi
+
+      - name: Setup valgrind
+        if: ${{ inputs.valgrind && runner.os == 'Linux' }}
+        uses: mamba-org/setup-micromamba@v3
+        with:
+          environment-name: valgrind-env
+          create-args: valgrind
+          condarc: |
+            channels:
+              - conda-forge
+
+      - name: Add valgrind to PATH
+        if: ${{ inputs.valgrind && runner.os == 'Linux' }}
+        shell: bash
+        run: echo "${MAMBA_ROOT_PREFIX:-$HOME/micromamba}/envs/valgrind-env/bin" >> "${GITHUB_PATH}"
 
       - name: Setup LLVM ${{ inputs.llvm-version }}
         uses: compiler-research/ci-workflows/actions/setup-llvm@main
