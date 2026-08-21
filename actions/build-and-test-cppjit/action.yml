@@ -9,8 +9,8 @@ inputs:
   cppinterop-ref:
     required: false
     description: |
-      CppInterOp ref to build CppJIT against. Unset (default) uses CppJIT's own
-      pinned CPPINTEROP_GIT_TAG which defines the current version/tag that CppJIT is based on
+      CppInterOp ref to build against: branch, tag, or commit SHA (PR
+      heads included). Unset uses CppJIT's pinned CPPINTEROP_GIT_TAG.
   cxx-standard:
     required: false
     default: '20'
@@ -47,6 +47,16 @@ runs:
         # Test/CI deps come from the cppjit/requirements.txt
         python -m pip install -r "${GITHUB_WORKSPACE}/requirements.txt"
 
+    # PR-head SHAs sit on no branch, so ExternalProject's clone+checkout
+    # cannot reach them; fetch the ref here and build the tree in place.
+    - name: Checkout CppInterOp ${{ inputs.cppinterop-ref }}
+      if: ${{ inputs.cppinterop-ref != '' }}
+      uses: actions/checkout@v6
+      with:
+        repository: compiler-research/CppInterOp
+        ref: ${{ inputs.cppinterop-ref }}
+        path: cppinterop-src
+
     - name: Build and install CppJIT
       shell: bash
       env:
@@ -61,11 +71,11 @@ runs:
         fi
         # Set CPPJIT_USE_CLING=ON for Cling (Cling_DIR auto-derives from LLVM_DIR,
         # setup-llvm flavor:cling installs cling at the sibling cmake path).
-        # cppinterop-ref: overrides CPPINTEROP_GIT_TAG when explicitly specified (e.g for nightlies
-        # or testing a development branch), otherwise default to CppJIT's own pinned version 
+        # cppinterop-ref overrides CppJIT's pin; the tree comes from the
+        # checkout step above.
         EXTRA_ARGS=()
         [[ "${CLING}" == "true" ]] && EXTRA_ARGS+=(--config-settings=cmake.define.CPPJIT_USE_CLING=ON)
-        [[ -n "${CPPINTEROP_REF}" ]] && EXTRA_ARGS+=(--config-settings=cmake.define.CPPINTEROP_GIT_TAG="${CPPINTEROP_REF}")
+        [[ -n "${CPPINTEROP_REF}" ]] && EXTRA_ARGS+=(--config-settings=cmake.define.CPPINTEROP_SOURCE_DIR="${GITHUB_WORKSPACE}/cppinterop-src")
         python -m pip install . -v \
           --config-settings=cmake.define.LLVM_DIR="${LLVM_DIR}" \
           ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
