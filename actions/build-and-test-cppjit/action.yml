@@ -15,6 +15,24 @@ inputs:
     required: false
     default: '20'
     description: 'Runtime C++ standard ("17"/"20") (passed to CPPINTEROP_EXTRA_INTERPRETER_ARGS)'
+  build-type:
+    required: false
+    default: 'Release'
+    description: 'CMAKE_BUILD_TYPE for the CppJIT build.'
+  sanitizer:
+    required: false
+    default: ''
+    description: |
+      CPPJIT_SANITIZERS value: '' or "Address;Undefined". Compiles with
+      the clang setup-llvm installed and runs the suite under its asan
+      runtime with leak detection off (leak coverage stays with the
+      valgrind cells).
+  python-flavor:
+    required: false
+    default: ''
+    description: |
+      Forward of the caller's python-flavor. 'asan' skips the LD_PRELOAD
+      of the asan runtime — that interpreter already links it.
   cling:
     required: false
     default: 'false'
@@ -31,6 +49,12 @@ inputs:
     required: false
     default: 'false'
     description: 'Also run the disabled xfail crash/skipif tests'
+  extra-cmake-defines:
+    required: false
+    default: ''
+    description: |
+      Whitespace-separated KEY=VALUE list, each forwarded to the CppJIT
+      build as a CMake cache define. Values with spaces are unsupported.
 
 runs:
   using: composite
@@ -43,9 +67,11 @@ runs:
         # flavor, boost/eigen for the cppyy tests, valgrind for the vg cell)
         # are installed by the caller BEFORE setup-llvm — see cppjit.yml's
         # "Install dependencies" step
-        python -m pip install --upgrade pip
+        # setup-cpython flavors ship no unversioned `python`; they export
+        # PYTHON_EXECUTABLE instead.
+        "${PYTHON_EXECUTABLE:-python}" -m pip install --upgrade pip
         # Test/CI deps come from the cppjit/requirements.txt
-        python -m pip install -r "${GITHUB_WORKSPACE}/requirements.txt"
+        "${PYTHON_EXECUTABLE:-python}" -m pip install -r "${GITHUB_WORKSPACE}/requirements.txt"
 
     # PR-head SHAs sit on no branch, so ExternalProject's clone+checkout
     # cannot reach them; fetch the ref here and build the tree in place.
@@ -62,6 +88,9 @@ runs:
       env:
         CPPINTEROP_REF: ${{ inputs.cppinterop-ref }}
         CLING: ${{ inputs.cling }}
+        BUILD_TYPE: ${{ inputs.build-type }}
+        SANITIZER: ${{ inputs.sanitizer }}
+        EXTRA_DEFINES: ${{ inputs.extra-cmake-defines }}
       run: |
         set -euo pipefail
         if [[ "${RUNNER_OS}" == "macOS" ]]; then
@@ -73,10 +102,21 @@ runs:
         # setup-llvm flavor:cling installs cling at the sibling cmake path).
         # cppinterop-ref overrides CppJIT's pin; the tree comes from the
         # checkout step above.
-        EXTRA_ARGS=()
+        EXTRA_ARGS=(--config-settings=cmake.build-type="${BUILD_TYPE}")
         [[ "${CLING}" == "true" ]] && EXTRA_ARGS+=(--config-settings=cmake.define.CPPJIT_USE_CLING=ON)
         [[ -n "${CPPINTEROP_REF}" ]] && EXTRA_ARGS+=(--config-settings=cmake.define.CPPINTEROP_SOURCE_DIR="${GITHUB_WORKSPACE}/cppinterop-src")
-        python -m pip install . -v \
+        if [[ -n "${SANITIZER}" ]]; then
+          # The suite preloads clang_rt.asan; gcc's libasan cannot back
+          # it, so the build must use the clang setup-llvm installed.
+          export CC="${GITHUB_WORKSPACE}/install/bin/clang"
+          export CXX="${GITHUB_WORKSPACE}/install/bin/clang++"
+          EXTRA_ARGS+=(--config-settings=cmake.define.CPPJIT_SANITIZERS="${SANITIZER}")
+        fi
+        # Word-splitting is the list separator by design.
+        for def in ${EXTRA_DEFINES}; do
+          EXTRA_ARGS+=(--config-settings=cmake.define."${def}")
+        done
+        "${PYTHON_EXECUTABLE:-python}" -m pip install . -v \
           --config-settings=cmake.define.LLVM_DIR="${LLVM_DIR}" \
           ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 
@@ -86,7 +126,7 @@ runs:
         set -euo pipefail
         # Neutral dir so the in-tree python/cppjit can't shadow the install.
         cd "${RUNNER_TEMP}"
-        python -c "import cppjit; print('cppjit import OK')"
+        "${PYTHON_EXECUTABLE:-python}" -c "import cppjit; print('cppjit import OK')"
 
     - name: Run test suite
       shell: bash
@@ -95,11 +135,37 @@ runs:
         VALGRIND: ${{ inputs.valgrind }}
         RUN_XFAIL_CRASHING_TESTS: ${{ inputs.run-xfail-crashing-tests }}
         LLVM_VERSION: ${{ inputs.llvm-version }}
+        SANITIZER: ${{ inputs.sanitizer }}
+        PYTHON_FLAVOR: ${{ inputs.python-flavor }}
       run: |
         set -uo pipefail
         cd test
-        make -j4 PYTHON=python || { echo "::error::dictionary build (make) failed"; exit 1; }
+        if [[ "${RUNNER_OS}" == "macOS" ]]; then
+          JOBS="$(sysctl -n hw.ncpu)"
+        else
+          JOBS="$(nproc)"
+        fi
+        make -j"${JOBS}" PYTHON="${PYTHON_EXECUTABLE:-python}" || { echo "::error::dictionary build (make) failed"; exit 1; }
         export CPPINTEROP_EXTRA_INTERPRETER_ARGS="-std=c++${CXX_STD}"
+
+        if [[ -n "${SANITIZER}" ]]; then
+          export IS_ASAN=true
+          # Python's arena allocator and interning read as leaks at
+          # shutdown; leak coverage stays with the valgrind cells.
+          export ASAN_OPTIONS=detect_leaks=0
+          if [[ "${RUNNER_OS}" == "Linux" && "${PYTHON_FLAVOR}" != "asan" ]]; then
+            # A vanilla interpreter needs the runtime present before
+            # libcppjit loads; an asan-flavored one already links it.
+            LD_PRELOAD="$("${GITHUB_WORKSPACE}/install/bin/clang" -print-file-name=libclang_rt.asan.so)"
+            # -print-file-name echoes the bare name back when the runtime
+            # is absent; fail here instead of ld.so spew on every process.
+            if [[ ! -f "${LD_PRELOAD}" ]]; then
+              echo "::error::libclang_rt.asan.so not found in the toolchain (${LD_PRELOAD})"
+              exit 1
+            fi
+            export LD_PRELOAD
+          fi
+        fi
 
         SED=sed
         [[ "${RUNNER_OS}" == "macOS" ]] && SED=gsed
@@ -109,7 +175,7 @@ runs:
         echo "::group::Full test suite"
         # -p no:cacheprovider prevents writing .pytest_cache into the upstream-identical tree
         set -o pipefail
-        python -m pytest -ra --tb=short -p no:cacheprovider --durations=25 \
+        "${PYTHON_EXECUTABLE:-python}" -m pytest -ra --tb=short -p no:cacheprovider --durations=25 \
           | tee complete_testrun.log 2>&1 || RETCODE=$?
         set +o pipefail
         tail -n1 complete_testrun.log > "${GITHUB_WORKSPACE}/pytest-summary.txt" || true
@@ -119,13 +185,13 @@ runs:
           # A crash here = an xfail that stopped crashing and should drop its marker.
           echo "::group::xfail-crash sweep"
           find . -name "*.py" -exec "${SED}" -i '/run=False/!s/^ *@mark.xfail\(.*\)/#&/' {} \;
-          python -m pytest -n 1 -m "xfail" --runxfail -ra --max-worker-restart 512 | tee test_crashed.log 2>&1 || true
+          "${PYTHON_EXECUTABLE:-python}" -m pytest -n 1 -m "xfail" --runxfail -ra --max-worker-restart 512 | tee test_crashed.log 2>&1 || true
           git checkout .
           echo "::endgroup::"
 
           echo "::group::xfail->skipif sweep"
           find . -name "*.py" -exec "${SED}" -i -E 's/(^ *)@mark.xfail\(run=(.*)/\1@mark.skipif(condition=not \2/g' {} \;
-          python -m pytest --runxfail -ra | tee test_xfailed.log 2>&1 || true
+          "${PYTHON_EXECUTABLE:-python}" -m pytest --runxfail -ra | tee test_xfailed.log 2>&1 || true
           git checkout .
           echo "::endgroup::"
         fi
@@ -149,7 +215,7 @@ runs:
           export IS_VALGRIND=true
           valgrind --show-error-list=yes --error-exitcode=1 --track-origins=yes \
             --gen-suppressions=all ${SUPP_ARGS[@]+"${SUPP_ARGS[@]}"} \
-            python -m pytest -m "not xfail" -ra --ignore=test_leakcheck.py || RETCODE=$?
+            "${PYTHON_EXECUTABLE:-python}" -m pytest -m "not xfail" -ra --ignore=test_leakcheck.py || RETCODE=$?
           unset IS_VALGRIND
           echo "::endgroup::"
         fi
