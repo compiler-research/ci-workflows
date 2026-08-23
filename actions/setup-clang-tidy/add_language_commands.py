@@ -17,7 +17,6 @@ Usage: add_language_commands.py <build-dir> [<source-dir>] [--force-include H]
 import json
 import re
 import shlex
-import subprocess
 import sys
 from pathlib import Path
 
@@ -26,6 +25,10 @@ HEADER_SUFFIXES = (".h", ".hpp", ".hh", ".hxx")
 # Flags whose value is the next argument rather than joined to them. Keeping
 # the flag but dropping its value is how an -isystem include path silently
 # goes missing.
+# What marks a directory as generated rather than written. Any one of them
+# is enough; a half-configured tree may not have all.
+BUILD_MARKERS = ("CMakeCache.txt", "CMakeFiles", "build.ninja")
+
 VALUE_FLAGS = frozenset({
     "-I", "-isystem", "-iquote", "-idirafter", "-include", "-imacros",
     "-D", "-U", "-F", "-isysroot", "--sysroot", "-target", "-x", "-arch",
@@ -79,17 +82,32 @@ def base_command(db: list[dict]) -> list[str]:
     raise SystemExit("error: no C++ entry to take flags from")
 
 
-def tracked(source: Path, patterns: list[str]) -> list[str]:
-    return subprocess.run(["git", "ls-files", *patterns], cwd=source,
-                          capture_output=True, text=True,
-                          check=True).stdout.split()
+def iter_sources(source: Path, wanted: tuple[str, ...]):
+    """Files under source with one of these suffixes, build trees pruned.
+
+    Walks rather than asking git: a checkout is not always a repository the
+    action can query. Build trees are pruned -- the configured one, and any
+    stale sibling a developer left behind -- since nothing generated into one
+    is the project's own source, and a tree that pulled in a dependency has
+    that dependency's headers under it.
+    """
+    stack = [source]
+    while stack:
+        directory = stack.pop()
+        if directory.name == ".git" or any((directory / m).exists()
+                                           for m in BUILD_MARKERS):
+            continue
+        for path in sorted(directory.iterdir()):
+            if path.is_dir():
+                stack.append(path)
+            elif path.suffix in wanted:
+                yield path
 
 
 def files_for(lang: dict, source: Path) -> list[Path]:
-    patterns = [f"*{s}" for s in (*lang["suffixes"], *HEADER_SUFFIXES)]
+    wanted = (*lang["suffixes"], *HEADER_SUFFIXES)
     found = []
-    for rel in tracked(source, patterns):
-        path = source / rel
+    for path in iter_sources(source, wanted):
         if path.suffix in lang["suffixes"]:
             found.append(path)
         elif lang["content"].search(path.read_text(errors="ignore")):
