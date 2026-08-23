@@ -156,8 +156,15 @@ jobs:
               fi
             done
             coord=$(yq -r ".projects[$i] | [.recipe, .version, .os, .arch] | @tsv" projects.yaml)
-            if ! yq -r '.cells[] | [.recipe, .version, .os, .arch] | @tsv' cells.yaml \
-                 | grep -qxF "$coord"; then
+            # Materialise the cell list before matching. `grep -q` exits on
+            # the first match, which SIGPIPEs yq, and `set -o pipefail` then
+            # reports the whole pipeline as failed -- so a cell that IS
+            # present reads as absent whenever it appears early enough for
+            # grep to bail before yq finishes writing. That made the check
+            # position-dependent: the last cell in the file always passed,
+            # anything nearer the top failed.
+            cells=$(yq -r '.cells[] | [.recipe, .version, .os, .arch] | @tsv' cells.yaml)
+            if ! grep -qxF "$coord" <<<"$cells"; then
               echo "::error file=projects.yaml::$name names a cell absent from cells.yaml: $coord"
               fail=1
             fi
