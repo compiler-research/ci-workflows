@@ -24,10 +24,8 @@ REDIST = "https://developer.download.nvidia.com/compute/cuda/redist"
 # __clang_cuda_runtime_wrapper.h reaches; cccl adds Thrust/CUB/libcu++.
 COMPONENTS = ("cuda_cudart", "cuda_nvcc", "cuda_cccl", "libcurand")
 
-# NVIDIA's platform keys, which are not the runner-image slugs. Linux only:
-# the recipe never sees the cell's OS (setup-recipe exports the arch but not
-# the slug), so a non-Linux cell would be served these silently. cells.yaml
-# is what keeps that from happening.
+# NVIDIA's platform keys, which are not the runner-image slugs. Linux only;
+# main() refuses a cell for anything else.
 ARCH_KEY = {"x86_64": "linux-x86_64", "arm64": "linux-sbsa"}
 
 
@@ -64,6 +62,15 @@ def main() -> int:
     plat = ARCH_KEY.get(arch)
     if plat is None:
         print(f"error: unsupported arch {arch!r}", file=sys.stderr)
+        return 1
+
+    # Only Linux components are mapped above, and NVIDIA ships Windows ones
+    # too, so a cell for another OS would otherwise be served Linux headers
+    # without complaint.
+    os_slug = os.environ.get("RECIPE_OS", "")
+    if os_slug and not os_slug.startswith("ubuntu"):
+        print(f"error: {os_slug} is not supported; this recipe is Linux only",
+              file=sys.stderr)
         return 1
     work.mkdir(parents=True, exist_ok=True)
     manifest_path = work / f"redistrib_{version}.json"

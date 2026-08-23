@@ -241,6 +241,7 @@ runs:
       env:
         RECIPE_VERSION: ${{ inputs.version }}
         RECIPE_ARCH: ${{ steps.slugs.outputs.arch }}
+        RECIPE_OS: ${{ steps.slugs.outputs.os }}
         WORK_DIR: ${{ github.workspace }}/_recipe_work
         OUT_DIR: ${{ github.workspace }}/_recipe_out
         CMAKE_C_COMPILER_LAUNCHER: ccache
