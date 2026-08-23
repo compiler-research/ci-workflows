@@ -71,6 +71,9 @@ cells:
   # When LLVM 23 ships, bump the version on these rows; the LLVM 22
   # cells age out via prune-cache after grace_days.
   - { recipe: llvm-release, version: '22',         os: ubuntu-24.04,     arch: x86_64 }
+  # cuda-headers: 12.8 is the newest CUDA clang 21 recognises, which keeps
+  # -Wunknown-cuda-version out of consumers' findings.
+  - { recipe: cuda-headers, version: '12.8.1',     os: ubuntu-24.04,     arch: x86_64 }
   - { recipe: llvm-release, version: '22',         os: ubuntu-24.04-arm, arch: arm64  }
   - { recipe: llvm-release, version: '22',         os: macos-26,         arch: arm64  }
   - { recipe: llvm-release, version: '22',         os: macos-26-intel,   arch: x86_64 }

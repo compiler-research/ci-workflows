@@ -1,0 +1,131 @@
+name: 'Setup CUDA headers'
+description: |
+  Resolves a headers-only CUDA prefix via the `cuda-headers` recipe, for jobs
+  that need clang's CUDA mode but never compile for a device -- running
+  clang-tidy over .cu/.cuh is the motivating case. ~19 MB, no nvcc, no device
+  libraries, no GPU.
+
+  The prefix lands at $GITHUB_WORKSPACE/cuda and CUDA_PATH is exported. Any
+  pre-existing install/ is preserved, so ordering against setup-llvm does not
+  matter.
+
+  Pass the prefix to clang as `--cuda-path`, with `--cuda-host-only` and
+  `-nocudalib`: there are no device libraries here to compile against.
+
+inputs:
+  version:
+    required: false
+    default: '12.8.1'
+    description: |
+      CUDA release to assemble, as it appears in NVIDIA's
+      redistrib_<version>.json. Prefer one the analysing clang recognises;
+      a newer one parses fine but draws -Wunknown-cuda-version.
+  os:
+    required: true
+    description: |
+      OS slug for the recipe cache key -- a runner-image name like
+      "ubuntu-24.04". Must match a cells.yaml entry warmed for the
+      cuda-headers recipe.
+  arch:
+    required: false
+    default: ''
+    description: |
+      Architecture slug (x86_64 / arm64). Derived from the os slug when
+      empty (ubuntu-*-arm -> arm64, else x86_64).
+  build-on-miss:
+    required: false
+    default: 'false'
+    description: 'Forwarded to setup-recipe: assemble inline on a cache miss instead of failing fast.'
+  ref:
+    required: false
+    default: 'main'
+    description: 'ci-workflows ref for setup-recipe to read recipes/ from.'
+  cache-base:
+    required: false
+    default: ''
+    description: 'Forwarded to setup-recipe: override the recipe cache backend.'
+
+outputs:
+  prefix:
+    description: 'CUDA prefix ($GITHUB_WORKSPACE/cuda); pass to clang as --cuda-path.'
+    value: ${{ steps.finalize.outputs.prefix }}
+  cache-hit:
+    description: '"true" when the recipe came from the cache, "false" when assembled inline.'
+    value: ${{ steps.recipe.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve arch
+      id: resolve
+      shell: bash
+      env:
+        OS: ${{ inputs.os }}
+        ARCH_IN: ${{ inputs.arch }}
+      run: |
+        set -euo pipefail
+        if [[ -n "${ARCH_IN}" ]]; then
+          arch="${ARCH_IN}"
+        else
+          case "${OS}" in
+            *-arm) arch=arm64 ;;
+            *)     arch=x86_64 ;;
+          esac
+        fi
+        echo "arch=${arch}" >> "$GITHUB_OUTPUT"
+
+    # setup-recipe places the recipe at $GITHUB_WORKSPACE/install and
+    # `rm -rf`s that path first. Move any pre-existing install/ (e.g.
+    # setup-llvm's) aside so setup-cuda is order-independent.
+    - name: Preserve existing install prefix
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ -d "${GITHUB_WORKSPACE}/install" ]]; then
+          rm -rf "${GITHUB_WORKSPACE}/.install.pre-cuda"
+          mv "${GITHUB_WORKSPACE}/install" "${GITHUB_WORKSPACE}/.install.pre-cuda"
+        fi
+
+    - name: CUDA headers recipe (cache or inline assembly)
+      id: recipe
+      uses: compiler-research/ci-workflows/actions/setup-recipe@main
+      with:
+        recipe:        cuda-headers
+        version:       ${{ inputs.version }}
+        os:            ${{ inputs.os }}
+        arch:          ${{ steps.resolve.outputs.arch }}
+        build-on-miss: ${{ inputs.build-on-miss }}
+        ref:           ${{ inputs.ref }}
+        cache-base:    ${{ inputs.cache-base }}
+
+    - name: Relocate CUDA and restore install prefix
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -rf "${GITHUB_WORKSPACE}/cuda"
+        mv "${GITHUB_WORKSPACE}/install" "${GITHUB_WORKSPACE}/cuda"
+        if [[ -d "${GITHUB_WORKSPACE}/.install.pre-cuda" ]]; then
+          mv "${GITHUB_WORKSPACE}/.install.pre-cuda" "${GITHUB_WORKSPACE}/install"
+        fi
+
+    - name: Finalize outputs
+      id: finalize
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        RECIPE_HIT: ${{ steps.recipe.outputs.cache-hit }}
+      run: |
+        set -euo pipefail
+        prefix="${GITHUB_WORKSPACE}/cuda"
+        # Fail here rather than let a consumer hit clang's much vaguer
+        # "cannot find CUDA installation" later.
+        for required in include/cuda.h include/crt bin nvvm/libdevice; do
+          if [[ ! -e "${prefix}/${required}" ]]; then
+            echo "::error title=setup-cuda::prefix is missing ${required}"
+            exit 1
+          fi
+        done
+        echo "prefix=${prefix}"    >> "$GITHUB_OUTPUT"
+        echo "CUDA_PATH=${prefix}" >> "$GITHUB_ENV"
+        src=$([[ "${RECIPE_HIT}" == "true" ]] && echo recipe-cache || echo inline-build)
+        echo "::notice title=setup-cuda::version=${VERSION} source=${src} prefix=${prefix}"
