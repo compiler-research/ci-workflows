@@ -69,10 +69,14 @@ class TestAddCommands(unittest.TestCase):
     def setUp(self):
         self.root = Path(__file__).resolve().parent / "_r"
         self.root.mkdir(exist_ok=True)
-        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
         (self.root / "k.cu").write_text("__global__ void k() {}\n")
         (self.root / "plain.h").write_text("int f();\n")
-        subprocess.run(["git", "add", "-A"], cwd=self.root, check=True)
+        # Both must be ignored: a build tree is anything with a
+        # CMakeCache.txt, configured or left over.
+        for stale in ("b", "build-old"):
+            (self.root / stale).mkdir(exist_ok=True)
+            (self.root / stale / "CMakeCache.txt").write_text("")
+            (self.root / stale / "generated.cu").write_text("__global__ void g(){}\n")
 
     def tearDown(self):
         subprocess.run(["rm", "-rf", str(self.root)], check=True)
@@ -83,7 +87,7 @@ class TestAddCommands(unittest.TestCase):
 
     def test_adds_cuda_and_leaves_plain_headers_alone(self):
         db = self._db()
-        added = alc.add_commands(db, Path("/b"), self.root,
+        added = alc.add_commands(db, self.root / "b", self.root,
                                  {"CUDA_PATH": "/cuda"}, [])
         self.assertEqual(added["cuda"], 1)
         entry = db[-1]
@@ -95,7 +99,8 @@ class TestAddCommands(unittest.TestCase):
 
     def test_without_the_env_the_language_is_skipped(self):
         db = self._db()
-        self.assertEqual(alc.add_commands(db, Path("/b"), self.root, {}, []), {})
+        self.assertEqual(
+            alc.add_commands(db, self.root / "b", self.root, {}, []), {})
         self.assertEqual(len(db), 1)
 
 
