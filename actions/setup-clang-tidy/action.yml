@@ -1,0 +1,133 @@
+name: 'Setup clang-tidy build'
+description: |
+  Provisions a toolchain and produces the compilation database clang-tidy
+  needs, so a consumer's review step only has to review.
+
+  Everything a compile command names has to sit under the workspace: the
+  review action runs in a container mounting only that, and rewrites paths
+  beneath `base_dir` to match. Hence the LLVM recipe flavor rather than
+  flavor=system, which symlinks the prefix at /usr/lib/llvm-NN.
+
+  Requires cmake on the runner, as GitHub-hosted images provide.
+
+inputs:
+  version:
+    required: true
+    description: 'LLVM major version to build and analyse against.'
+  os:
+    required: true
+    description: 'Runner-image slug for the recipe cache key, e.g. "ubuntu-24.04".'
+  arch:
+    required: false
+    default: ''
+    description: 'Architecture slug; derived from the os slug when empty.'
+  cuda-version:
+    required: false
+    default: ''
+    description: |
+      CUDA release to provision headers for, e.g. "12.8.1". Empty skips CUDA
+      entirely, and no CUDA compile commands are added.
+  source-dir:
+    required: false
+    default: '.'
+    description: 'Project source directory to configure.'
+  build-dir:
+    required: false
+    default: 'build'
+    description: 'Build directory to write, relative to the workspace.'
+  force-include:
+    required: false
+    default: ''
+    description: |
+      Header to prepend to every generated command, for sources that are not
+      self-contained -- a header written to be included after something else.
+  cmake-args:
+    required: false
+    default: ''
+    description: 'Extra arguments for the configure step.'
+  build-on-miss:
+    required: false
+    default: 'false'
+    description: 'Forwarded to the recipe actions.'
+  ref:
+    required: false
+    default: 'main'
+    description: 'ci-workflows ref the recipe actions read recipes/ from.'
+
+outputs:
+  build-dir:
+    description: 'Absolute path of the configured build directory.'
+    value: ${{ steps.configure.outputs.build-dir }}
+  llvm-prefix:
+    description: 'LLVM install prefix, under the workspace.'
+    value: ${{ steps.llvm.outputs.prefix }}
+
+runs:
+  using: composite
+  steps:
+    # flavor: '' is the recipe, a self-contained tree under the workspace.
+    # flavor=system would symlink it outside, where the review container
+    # cannot follow.
+    - name: Setup LLVM
+      id: llvm
+      uses: compiler-research/ci-workflows/actions/setup-llvm@main
+      with:
+        version:       ${{ inputs.version }}
+        os:            ${{ inputs.os }}
+        arch:          ${{ inputs.arch }}
+        flavor:        ''
+        build-on-miss: ${{ inputs.build-on-miss }}
+        ref:           ${{ inputs.ref }}
+
+    - name: Setup CUDA headers
+      if: inputs.cuda-version != ''
+      uses: compiler-research/ci-workflows/actions/setup-cuda@main
+      with:
+        version:       ${{ inputs.cuda-version }}
+        os:            ${{ inputs.os }}
+        arch:          ${{ inputs.arch }}
+        build-on-miss: ${{ inputs.build-on-miss }}
+        ref:           ${{ inputs.ref }}
+
+    - name: Configure
+      id: configure
+      shell: bash
+      env:
+        SOURCE_DIR: ${{ inputs.source-dir }}
+        BUILD_DIR: ${{ inputs.build-dir }}
+        CMAKE_ARGS: ${{ inputs.cmake-args }}
+        LLVM_PREFIX: ${{ steps.llvm.outputs.prefix }}
+        LLVM_CMAKE_DIR: ${{ steps.llvm.outputs.llvm-dir }}
+        CLANG_CMAKE_DIR: ${{ steps.llvm.outputs.clang-dir }}
+      run: |
+        set -euo pipefail
+        if ! command -v cmake >/dev/null; then
+          echo "::error title=setup-clang-tidy::cmake is not on PATH"
+          exit 1
+        fi
+        build="${GITHUB_WORKSPACE}/${BUILD_DIR}"
+        # Analyse with the toolchain we provisioned, not the runner's.
+        CC="${LLVM_PREFIX}/bin/clang" CXX="${LLVM_PREFIX}/bin/clang++" \
+        cmake -S "${SOURCE_DIR}" -B "${build}" \
+              -DCMAKE_EXPORT_COMPILE_COMMANDS=On \
+              -DLLVM_DIR="${LLVM_CMAKE_DIR}" \
+              -DClang_DIR="${CLANG_CMAKE_DIR}" \
+              ${CMAKE_ARGS}
+        echo "build-dir=${build}" >> "$GITHUB_OUTPUT"
+
+    # CMake emits nothing for a header, or for a language the project does
+    # not compile itself -- which is every CUDA source here. Without these
+    # clang-tidy reads them in the wrong language.
+    - name: Add compile commands CMake does not emit
+      shell: bash
+      env:
+        BUILD: ${{ steps.configure.outputs.build-dir }}
+        SOURCE_DIR: ${{ inputs.source-dir }}
+        FORCE_INCLUDE: ${{ inputs.force-include }}
+      run: |
+        set -euo pipefail
+        args=("${BUILD}" "${SOURCE_DIR}")
+        if [[ -n "${FORCE_INCLUDE}" ]]; then
+          args+=(--force-include "${FORCE_INCLUDE}")
+        fi
+        python3 "${GITHUB_ACTION_PATH}/add_language_commands.py" "${args[@]}"
