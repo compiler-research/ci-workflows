@@ -1,0 +1,24 @@
+recipe: cuda-headers
+description: |
+  The CUDA headers clang needs to parse CUDA, and nothing else: no nvcc, no
+  device libraries, no driver, ~19 MB extracted.
+
+  Analysis-only consumers -- clang-tidy over .cu/.cuh -- never compile for a
+  device and never link, but they still need clang's CUDA installation probe
+  to succeed, and that probe wants an install layout rather than a working
+  toolkit. Four of NVIDIA's per-component redistributables supply it:
+  cuda_cudart, cuda_nvcc and libcurand cover everything clang's
+  force-included wrapper header reaches, and cuda_cccl adds Thrust, CUB and
+  libcu++.
+
+  Prefer a version the analysing clang recognises. A newer CUDA still parses
+  correctly, but draws -Wunknown-cuda-version, which a consumer enabling
+  clang-diagnostic-* reports as a finding.
+
+  Linux only, and the recipe cannot enforce that itself; see build.py.
+
+# Not a git source. `repo` is provenance; the components and their versions
+# come from redistrib_{version}.json.
+source:
+  repo: https://developer.download.nvidia.com/compute/cuda/redist
+  branch_template: '{version}'
