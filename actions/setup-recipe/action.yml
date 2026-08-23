@@ -209,6 +209,7 @@ runs:
       shell: bash
       env:
         RECIPE_VERSION: ${{ inputs.version }}
+        RECIPE_ARCH: ${{ steps.slugs.outputs.arch }}
         WORK_DIR: ${{ github.workspace }}/_recipe_work
         OUT_DIR: ${{ github.workspace }}/_recipe_out
       run: |
