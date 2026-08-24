@@ -271,14 +271,49 @@ jobs:
       dependent_empty:  ${{ steps.compute.outputs.dependent_empty }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # to diff against the base
       - id: compute
+        env:
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
+          # Whether a cached cell may be skipped depends on what changed.
+          # The key covers a recipe's own files, so a pull request that only
+          # edits recipes moves the key of everything it could have broken,
+          # and an unmoved key is genuinely still valid. The actions and this
+          # workflow are different: they drive every recipe and move no key,
+          # so a change there has to be proven against all of them -- which
+          # is what they are in the trigger paths for.
+          changed=$(git diff --name-only "origin/${BASE_REF}...HEAD")
+          # Non-empty means something outside recipes/ and cells.yaml
+          # changed. Tested by output rather than by `grep -qv`, whose exit
+          # status is not consistent across greps.
+          other=$(printf '%s\n' "${changed}" \
+                  | grep -vE '^(recipes/.*|cells\.yaml)$' || true)
+          if [ -n "${other}" ]; then
+            probe=false
+            echo "::notice::build machinery changed; validating every cell"
+          else
+            probe=true
+          fi
           bootstraps=()
           dependents=()
           while IFS= read -r cell; do
             [ -z "$cell" ] && continue
             recipe=$(echo "$cell" | jq -r .recipe)
+            version=$(echo "$cell" | jq -r .version)
+            os=$(echo "$cell"     | jq -r .os)
+            arch=$(echo "$cell"   | jq -r .arch)
+            key=$(python3 actions/setup-recipe/compute_key.py \
+                    "$recipe" "$version" "$os" "$arch" | sed 's/^key=//')
+            url="https://github.com/${REPO}/releases/download/cache/${key}.tar.zst"
+            if [ "${probe}" = true ] && curl -fsLI "$url" >/dev/null 2>&1; then
+              echo "::notice::cache hit, skipping: ${key}"
+              continue
+            fi
+            echo "::notice::needs build: ${key}"
             if yq -e '.bootstrap' "recipes/$recipe/recipe.yaml" >/dev/null 2>&1; then
               dependents+=("$cell")
             else
