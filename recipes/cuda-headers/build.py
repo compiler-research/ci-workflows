@@ -24,15 +24,15 @@ REDIST = "https://developer.download.nvidia.com/compute/cuda/redist"
 # __clang_cuda_runtime_wrapper.h reaches; cccl adds Thrust/CUB/libcu++.
 COMPONENTS = ("cuda_cudart", "cuda_nvcc", "cuda_cccl", "libcurand")
 
-# Present only in some releases. CUDA 12 ships the crt/ headers inside
-# cuda_nvcc; CUDA 13 split them into a component of their own. Take them
-# from wherever this release keeps them rather than pinning to one layout.
-OPTIONAL_COMPONENTS = ("cuda_crt",)
+# Present only in some releases. CUDA 12 keeps the crt/ headers and
+# nvvm/libdevice inside cuda_nvcc; CUDA 13 split them into components of
+# their own. Take them from wherever this release keeps them.
+OPTIONAL_COMPONENTS = ("cuda_crt", "libnvvm")
 
 # What clang's probe and its force-included wrapper actually open. Checked
 # after assembly so a release that moves things fails here, naming what is
 # missing, rather than downstream as "cannot find CUDA installation".
-REQUIRED_PATHS = ("include/cuda.h", "include/crt", "bin")
+REQUIRED_PATHS = ("include/cuda.h", "include/crt", "bin", "nvvm/libdevice")
 
 # NVIDIA's platform keys, which are not the runner-image slugs. Linux only;
 # main() refuses a cell for anything else.
@@ -111,6 +111,10 @@ def main() -> int:
 
         if (root / "include").is_dir():
             copy_tree(root / "include", out / "include")
+        # Needed as soon as a device architecture is named, which every CUDA
+        # test does: clang looks for libdevice before it will parse at all.
+        if (root / "nvvm" / "libdevice").is_dir():
+            copy_tree(root / "nvvm" / "libdevice", out / "nvvm" / "libdevice")
 
     # clang itself reads CUDA_VERSION from cuda.h; this is for tooling that
     # expects the file.
