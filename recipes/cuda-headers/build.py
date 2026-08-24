@@ -24,6 +24,16 @@ REDIST = "https://developer.download.nvidia.com/compute/cuda/redist"
 # __clang_cuda_runtime_wrapper.h reaches; cccl adds Thrust/CUB/libcu++.
 COMPONENTS = ("cuda_cudart", "cuda_nvcc", "cuda_cccl", "libcurand")
 
+# Present only in some releases. CUDA 12 ships the crt/ headers inside
+# cuda_nvcc; CUDA 13 split them into a component of their own. Take them
+# from wherever this release keeps them rather than pinning to one layout.
+OPTIONAL_COMPONENTS = ("cuda_crt",)
+
+# What clang's probe and its force-included wrapper actually open. Checked
+# after assembly so a release that moves things fails here, naming what is
+# missing, rather than downstream as "cannot find CUDA installation".
+REQUIRED_PATHS = ("include/cuda.h", "include/crt", "bin")
+
 # NVIDIA's platform keys, which are not the runner-image slugs. Linux only;
 # main() refuses a cell for anything else.
 ARCH_KEY = {"x86_64": "linux-x86_64", "arm64": "linux-sbsa"}
@@ -82,9 +92,11 @@ def main() -> int:
     # inside it for a host-only parse.
     out.joinpath("bin").mkdir(parents=True, exist_ok=True)
 
-    for name in COMPONENTS:
+    for name in COMPONENTS + OPTIONAL_COMPONENTS:
         comp = manifest.get(name)
         if comp is None or plat not in comp:
+            if name in OPTIONAL_COMPONENTS:
+                continue
             print(f"error: {name} has no {plat} in {version}", file=sys.stderr)
             return 1
         entry = comp[plat]
@@ -99,14 +111,17 @@ def main() -> int:
 
         if (root / "include").is_dir():
             copy_tree(root / "include", out / "include")
-        # The one non-header the probe checks for. Never read by a host-only
-        # parse.
-        if (root / "nvvm" / "libdevice").is_dir():
-            copy_tree(root / "nvvm" / "libdevice", out / "nvvm" / "libdevice")
 
     # clang itself reads CUDA_VERSION from cuda.h; this is for tooling that
     # expects the file.
     (out / "version.txt").write_text(f"CUDA Version {version}\n")
+
+    missing = [r for r in REQUIRED_PATHS if not (out / r).exists()]
+    if missing:
+        print(f"error: {version} produced no {', '.join(missing)}; the "
+              "release may have moved them to another component",
+              file=sys.stderr)
+        return 1
 
     total = sum(p.stat().st_size for p in out.rglob("*") if p.is_file())
     print(f"cuda-headers {version} ({arch}): {total / 1e6:.1f} MB", flush=True)

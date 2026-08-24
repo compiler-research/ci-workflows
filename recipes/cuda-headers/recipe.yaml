@@ -15,7 +15,8 @@ description: |
   correctly, but draws -Wunknown-cuda-version, which a consumer enabling
   clang-diagnostic-* reports as a finding.
 
-  Linux only, and the recipe cannot enforce that itself; see build.py.
+  Linux only; build.py refuses a cell for anything else, and checks that the
+  release put the headers where clang looks before declaring success.
 
 # Not a git source. `repo` is provenance; the components and their versions
 # come from redistrib_{version}.json.
