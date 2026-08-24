@@ -21,8 +21,8 @@ on:
       cppinterop-ref:
         type: string
         description: |
-          CppInterOp ref to build against (passed to ExternalProject).
-          Callers supply their own pinned commit/tag
+          CppInterOp ref to build against: branch, tag, or commit SHA (PR
+          heads included). Empty uses CppJIT's pinned CPPINTEROP_GIT_TAG.
       os:
         type: string
         required: true
