@@ -24,8 +24,8 @@ inputs:
     required: true
     description: |
       OS slug for the recipe cache key -- a runner-image name like
-      "ubuntu-24.04". Must match a cells.yaml entry warmed for the
-      cuda-headers recipe.
+      "ubuntu-24.04". A cells.yaml entry for the version being asked for
+      makes it a download instead of an assembly, but is not required.
   arch:
     required: false
     default: ''
@@ -34,8 +34,13 @@ inputs:
       empty (ubuntu-*-arm -> arm64, else x86_64).
   build-on-miss:
     required: false
-    default: 'false'
-    description: 'Forwarded to setup-recipe: assemble inline on a cache miss instead of failing fast.'
+    default: 'true'
+    description: |
+      Assemble inline on a cache miss rather than failing fast. On by
+      default here, unlike the LLVM recipes: this one downloads and unpacks
+      headers in well under a minute, so a cell is an optimisation rather
+      than a precondition, and a consumer can ask for any CUDA release
+      without one having to be declared for it first.
   ref:
     required: false
     default: 'main'
