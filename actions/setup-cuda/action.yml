@@ -124,7 +124,7 @@ runs:
         prefix="${GITHUB_WORKSPACE}/cuda"
         # Fail here rather than let a consumer hit clang's much vaguer
         # "cannot find CUDA installation" later.
-        for required in include/cuda.h include/crt bin nvvm/libdevice; do
+        for required in include/cuda.h include/crt bin; do
           if [[ ! -e "${prefix}/${required}" ]]; then
             echo "::error title=setup-cuda::prefix is missing ${required}"
             exit 1
