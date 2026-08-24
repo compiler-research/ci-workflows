@@ -234,11 +234,14 @@ actions/
   setup-kokkos/        consumer-side: setup-recipe wrapper that installs Kokkos and exports Kokkos_ROOT
   publish-recipe/      producer-side: build under ccache + tar/zstd + upload
   wake-on-lan/         send a magic packet to wake a self-hosted runner; no-op under act
-  lib/cache-io.sh      scheme-aware probe/download/upload helpers; sourced by both actions and the CLI
-  install-build-deps/  thin composite action installing host packages
+  lib/                 python helpers: cache_io.py (scheme-aware probe/download/upload), llvm_build.py (shared LLVM build flow)
+
+docker/
+  manylinux-llvm-wheel/  bakes the llvm-wheel artifact onto the pypa manylinux base for cibuildwheel consumers
 
 bin/recipe-cache       CLI wrapping the same scripts the actions use
 
 .github/workflows/
   publish-recipe.yml   workflow_dispatch + push-on-main publisher
+  wheel-image.yml      dispatch-only: build + push the GHCR wheel-toolchain image
 ```
