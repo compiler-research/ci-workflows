@@ -106,3 +106,74 @@ class TestAddCommands(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMultipleLanguages(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(__file__).resolve().parent / "_m"
+        self.root.mkdir(exist_ok=True)
+        # One header in both languages, as Differentiator.h is.
+        (self.root / "both.h").write_text(
+            '#include "own.h"\n__device__ void d();\n#pragma omp parallel for\n')
+        (self.root / "own.h").write_text("int f();\n")
+
+    def tearDown(self):
+        subprocess.run(["rm", "-rf", str(self.root)], check=True)
+
+    def test_one_entry_carrying_both_sets_of_flags(self):
+        db = [{"file": "/p/b.cpp",
+               "command": "/bin/clang++ -I/p -std=c++17 -c /p/b.cpp"}]
+        added = alc.add_commands(db, self.root / "b", self.root,
+                                 {"CUDA_PATH": "/cuda", "CLANG_TIDY_OPENMP": "1"},
+                                 [])
+        self.assertEqual(added, {"cuda": 1, "openmp": 1})
+        entries = [e for e in db if e["file"].endswith("both.h")]
+        # One entry, not one per language: clang-tidy reads only the first.
+        self.assertEqual(len(entries), 1)
+        self.assertIn("-xcuda", entries[0]["arguments"])
+        self.assertIn("-fopenmp", entries[0]["arguments"])
+
+    def test_openmp_alone_does_not_pull_in_cuda_flags(self):
+        db = [{"file": "/p/b.cpp",
+               "command": "/bin/clang++ -c /p/b.cpp"}]
+        alc.add_commands(db, self.root / "b", self.root,
+                         {"CLANG_TIDY_OPENMP": "1"}, [])
+        args = [e for e in db if e["file"].endswith("both.h")][0]["arguments"]
+        self.assertIn("-fopenmp", args)
+        self.assertNotIn("-xcuda", args)
+
+    def test_a_header_without_a_language_flag_is_told_it_is_cxx(self):
+        # clang reads a bare .h as C; without -xc++ every include fails.
+        db = [{"file": "/p/b.cpp", "command": "/bin/clang++ -c /p/b.cpp"}]
+        alc.add_commands(db, self.root / "b", self.root,
+                         {"CLANG_TIDY_OPENMP": "1"}, [])
+        args = [e for e in db if e["file"].endswith("both.h")][0]["arguments"]
+        self.assertIn("-xc++", args)
+
+    def test_cuda_supplies_its_own_language_and_is_not_overridden(self):
+        db = [{"file": "/p/b.cpp", "command": "/bin/clang++ -c /p/b.cpp"}]
+        alc.add_commands(db, self.root / "b", self.root,
+                         {"CUDA_PATH": "/cuda"}, [])
+        args = [e for e in db if e["file"].endswith("both.h")][0]["arguments"]
+        self.assertIn("-xcuda", args)
+        self.assertNotIn("-xc++", args)
+
+    def test_a_file_the_build_already_compiles_is_left_alone(self):
+        # CMake's own command is the right one; a second entry for the same
+        # file would shadow it, since clang-tidy reads only the first.
+        src = str((self.root / "both.h").resolve())
+        db = [{"file": "/p/b.cpp", "command": "/bin/clang++ -c /p/b.cpp"},
+              {"file": src, "command": "/bin/clang++ -DFROM_CMAKE -c " + src}]
+        added = alc.add_commands(db, self.root / "b", self.root,
+                                 {"CLANG_TIDY_OPENMP": "1"}, [])
+        self.assertEqual(added["openmp"], 0)
+        self.assertEqual([e for e in db if e["file"] == src][0]["command"],
+                         "/bin/clang++ -DFROM_CMAKE -c " + src)
+
+    def test_a_header_that_only_avoids_openmp_is_not_selected(self):
+        (self.root / "avoids.h").write_text(
+            '#include "own.h"\n#ifndef _OPENMP\nint serial();\n#endif\n')
+        db = [{"file": "/p/b.cpp", "command": "/bin/clang++ -c /p/b.cpp"}]
+        alc.add_commands(db, self.root / "b", self.root,
+                         {"CLANG_TIDY_OPENMP": "1"}, [])
+        self.assertEqual([e for e in db if e["file"].endswith("avoids.h")], [])

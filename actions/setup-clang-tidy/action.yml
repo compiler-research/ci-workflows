@@ -27,6 +27,13 @@ inputs:
     description: |
       CUDA release to provision headers for, e.g. "12.8.1". Empty skips CUDA
       entirely, and no CUDA compile commands are added.
+  openmp:
+    required: false
+    default: 'false'
+    description: |
+      Add -fopenmp to the commands for sources that use OpenMP, so the code
+      behind _OPENMP is parsed rather than skipped. The review container
+      needs the libomp headers matching the clang-tidy that parses.
   source-dir:
     required: false
     default: '.'
@@ -124,6 +131,7 @@ runs:
         BUILD: ${{ steps.configure.outputs.build-dir }}
         SOURCE_DIR: ${{ inputs.source-dir }}
         FORCE_INCLUDE: ${{ inputs.force-include }}
+        CLANG_TIDY_OPENMP: ${{ inputs.openmp == 'true' && '1' || '' }}
       run: |
         set -euo pipefail
         args=("${BUILD}" "${SOURCE_DIR}")

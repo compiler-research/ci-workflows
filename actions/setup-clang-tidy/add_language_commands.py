@@ -35,9 +35,10 @@ VALUE_FLAGS = frozenset({
 })
 CXX_SUFFIXES = (".cpp", ".cc", ".cxx", ".C")
 
-# suffixes: files this language owns by name. content: what marks a header as
-# belonging to it, since a name does not. env: the variable naming the
-# toolchain root; unset means the consumer did not ask for this language.
+# suffixes: files this language owns by name, if any. content: what marks a
+# header as belonging to it, since a name does not. env: the variable that
+# has to be set for the language to be considered at all -- a toolchain root
+# where one is needed, a bare marker where the language is only a flag.
 LANGUAGES = {
     "cuda": {
         "suffixes": (".cu", ".cuh"),
@@ -49,6 +50,22 @@ LANGUAGES = {
         "flags": lambda root: ["-xcuda", "--cuda-host-only", "-nocudalib",
                                f"--cuda-path={root}",
                                "-Wno-unknown-cuda-version"],
+    },
+    "openmp": {
+        # No suffix of its own: OpenMP is a flag, and the code it hides is
+        # in ordinary headers behind _OPENMP.
+        "suffixes": (),
+        # Only the forms that mean "there is OpenMP code here". A bare
+        # _OPENMP would also match `#ifndef _OPENMP`, whose branch -fopenmp
+        # would hide rather than reveal.
+        "content": re.compile(r"#\s*pragma\s+omp"
+                              r"|#\s*include\s*<omp\.h>"
+                              r"|#\s*ifdef\s+_OPENMP"
+                              r"|defined\s*\(\s*_OPENMP"),
+        "env": "CLANG_TIDY_OPENMP",
+        # Needs the libomp headers matching the clang-tidy that parses, not
+        # the compiler the commands name.
+        "flags": lambda _: ["-fopenmp"],
     },
 }
 
@@ -125,24 +142,42 @@ def add_commands(db: list[dict], build: Path, source: Path, environ: dict,
                  prelude: list[str]) -> dict[str, int]:
     base = base_command(db)
     known = {e["file"] for e in db}
-    added = {}
-    for name, lang in LANGUAGES.items():
-        root = environ.get(lang["env"])
-        if not root:
-            continue
-        count = 0
+    enabled = {n: l for n, l in LANGUAGES.items() if environ.get(l["env"])}
+
+    # A file can belong to more than one language -- a header with both a
+    # CUDA and an OpenMP region -- and needs one command carrying both.
+    # clang-tidy reads the first entry it finds for a file and ignores the
+    # rest, so a command per language would silently drop all but one.
+    #
+    # One command still means one set of macros, so a header guarding two
+    # ways on the same macro has only the branch that command selects
+    # analysed. That is why a language is recognised by the code it holds
+    # rather than by the macro it guards on: a header merely mentioning
+    # __CUDACC__ keeps its ordinary branch, and the CUDA code it reaches for
+    # is analysed where that code actually lives.
+    per_file: dict[Path, list[str]] = {}
+    for name, lang in enabled.items():
         for src in files_for(lang, source):
-            if str(src) in known:
-                continue
-            extra = prelude if prelude and needs_prelude(src) else []
-            db.append({
-                "directory": str(build),
-                "file": str(src),
-                "arguments": [*base, *lang["flags"](root), *extra,
-                              "-c", str(src)],
-            })
-            count += 1
-        added[name] = count
+            if str(src) not in known:
+                per_file.setdefault(src, []).append(name)
+
+    added = dict.fromkeys(enabled, 0)
+    for src, names in sorted(per_file.items()):
+        flags: list[str] = []
+        for name in names:
+            flags += enabled[name]["flags"](environ[enabled[name]["env"]])
+            added[name] += 1
+        # A header carries no language in its name, and clang assumes C.
+        # A language that sets one (CUDA) has already said so; otherwise say
+        # C++, or the file is parsed as C and every include fails.
+        if not any(f.startswith("-x") for f in flags):
+            flags.insert(0, "-xc++")
+        extra = prelude if prelude and needs_prelude(src) else []
+        db.append({
+            "directory": str(build),
+            "file": str(src),
+            "arguments": [*base, *flags, *extra, "-c", str(src)],
+        })
     return added
 
 
