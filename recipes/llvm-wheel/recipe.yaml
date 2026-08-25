@@ -1,0 +1,32 @@
+recipe: llvm-wheel
+description: |
+  Wheel-toolchain LLVM/Clang: the build that Python wheels link
+  against, static-only and floor-pinned so the resulting wheel
+  installs on any supported machine.
+
+  Linux cells run the whole build inside the
+  quay.io/pypa/manylinux_2_28_x86_64 container with its own devtoolset
+  compiler, so archives statically linked into a wheel stay within the
+  manylinux_2_28 glibc policy (the llvmlite/Triton approach). macOS
+  cells build at CMAKE_OSX_DEPLOYMENT_TARGET=14.0: the oldest
+  Apple-supported major, and every Apple Silicon machine can run it.
+
+  Config deltas vs llvm-release, all deliberate:
+    - assertions OFF: an LLVM assertion inside a shipped wheel aborts
+      the end user's Python process.
+    - no LLVM/clang dylibs: wheel consumers link the static archives
+      and must not ship a second LLVM.
+    - RTTI ON: the cppyy-lineage bindings require it.
+    - zstd/libxml2/libedit OFF, zlib FORCE_ON: libz.so.1 is on the
+      manylinux whitelist; every other dependency would have to be
+      grafted into the consumer's wheel.
+    - lld ships: consumers linking the static archives may need
+      -fuse-ld=lld (BFD's GOTPCRELX relaxation has corrupted such
+      links before).
+
+  Versions must be exact release tags ('21.1.8'), never bare majors:
+  a wheel toolchain names exactly what it holds.
+
+source:
+  repo: https://github.com/llvm/llvm-project
+  branch_template: llvmorg-{version}

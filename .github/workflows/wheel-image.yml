@@ -1,0 +1,73 @@
+name: wheel-image
+
+# Bakes the llvm-wheel recipe artifact into the manylinux toolchain
+# image (docker/manylinux-llvm-wheel/Dockerfile) and pushes it to
+# GHCR. Dispatch-only: the llvm-wheel cell must already be published
+# (publish-recipe warms it on merge), so run this after the cell
+# exists rather than racing the warm-up on push. The setup-recipe
+# os/arch below must match the linux llvm-wheel row in cells.yaml.
+#
+# Tags: the exact LLVM version and its major, e.g.
+#   ghcr.io/<owner>/manylinux_2_28_x86_64-llvm:21.1.8
+#   ghcr.io/<owner>/manylinux_2_28_x86_64-llvm:21
+# Consumers pin the exact-version tag (or its digest) in pyproject.
+#
+# One-time after the first push: the new GHCR package starts private;
+# make it public so consumer repos' cibuildwheel can pull it without
+# credentials.
+
+on:
+  workflow_dispatch:
+    inputs:
+      llvm-version:
+        description: "llvm-wheel recipe version (exact tag, e.g. '21.1.8')."
+        type: string
+        required: true
+        default: '21.1.8'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fetch the llvm-wheel artifact
+        id: recipe
+        uses: ./actions/setup-recipe
+        with:
+          recipe: llvm-wheel
+          version: ${{ inputs.llvm-version }}
+          os: ubuntu-24.04
+          arch: x86_64
+
+      - name: Stage the docker build context
+        env:
+          RECIPE_PATH: ${{ steps.recipe.outputs.path }}
+        run: |
+          set -euo pipefail
+          test -x "$RECIPE_PATH/bin/clang" || {
+            echo "::error::no clang under $RECIPE_PATH"; exit 1; }
+          mv "$RECIPE_PATH" docker/manylinux-llvm-wheel/install
+
+      - name: Build and push
+        env:
+          VERSION: ${{ inputs.llvm-version }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${OWNER}/manylinux_2_28_x86_64-llvm"
+          major="${VERSION%%.*}"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$OWNER" --password-stdin
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/${REPO}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            -t "$image:$VERSION" -t "$image:$major" \
+            docker/manylinux-llvm-wheel
+          docker push "$image:$VERSION"
+          docker push "$image:$major"
