@@ -42,11 +42,33 @@ on:
       python-version:
         type: string
         required: true
-        description: 'Python version for actions/setup-python.'
+        description: |
+          Python version. A python-flavor cell needs the exact M.N.P of a
+          warmed cpython-<flavor> cell (e.g. 3.14.3); otherwise any
+          actions/setup-python spec works.
+      python-flavor:
+        type: string
+        default: ''
+        description: |
+          '' (default) installs via actions/setup-python; 'asan' / 'debug'
+          install the sanitized or Py_DEBUG CPython recipe via
+          setup-cpython (warmed ubuntu-24.04 x86_64 cells only).
       cxx-standard:
         type: string
         default: '20'
         description: 'Runtime C++ standard ("17"/"20").'
+      build-type:
+        type: string
+        default: Release
+        description: 'CMAKE_BUILD_TYPE for the CppJIT build.'
+      sanitizer:
+        type: string
+        default: ''
+        description: |
+          CPPJIT_SANITIZERS value: '' (default) or "Address;Undefined".
+          Pair with a recipe llvm-flavor ('asan') — the cell compiles with
+          that recipe's clang and preloads its asan runtime. Mutually
+          exclusive with valgrind.
       valgrind:
         type: boolean
         default: false
@@ -55,6 +77,12 @@ on:
         type: boolean
         default: false
         description: 'Run the xfail-crash and xfail->skipif sweeps.'
+      extra-cmake-defines:
+        type: string
+        default: ''
+        description: |
+          Whitespace-separated KEY=VALUE list, each forwarded to the
+          CppJIT build as a CMake cache define.
       ci-workflows-ref:
         type: string
         default: main
@@ -74,16 +102,44 @@ jobs:
     outputs:
       summary: ${{ steps.summary.outputs.line }}
     steps:
+      # valgrind and asan instrument the same process; a cell picks one.
+      - name: Refuse a valgrind and sanitizer combination
+        if: ${{ inputs.valgrind && inputs.sanitizer != '' }}
+        shell: bash
+        run: |
+          echo "::error::valgrind and sanitizer are mutually exclusive; pick one per cell"
+          exit 1
+
+      # Only the asan recipe flavor ships clang's sanitizer runtimes;
+      # other toolchains fail at link time deep in the build.
+      - name: Refuse a sanitizer without the asan LLVM flavor
+        if: ${{ inputs.sanitizer != '' && inputs.llvm-flavor != 'asan' }}
+        shell: bash
+        run: |
+          echo "::error::sanitizer requires llvm-flavor 'asan'; other flavors carry no sanitizer runtimes"
+          exit 1
+
       - name: Checkout CppJIT
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ inputs.cppjit-repo }}
           ref: ${{ inputs.cppjit-ref }}
 
       - name: Setup Python ${{ inputs.python-version }}
-        uses: actions/setup-python@v5
+        if: ${{ inputs.python-flavor == '' }}
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ inputs.python-version }}
+
+      # Flavored interpreters come from the cpython-<flavor> recipe
+      # cells; setup-cpython exports PYTHON_EXECUTABLE.
+      - name: Setup CPython ${{ inputs.python-version }} [${{ inputs.python-flavor }}]
+        if: ${{ inputs.python-flavor != '' }}
+        uses: compiler-research/ci-workflows/actions/setup-cpython@main
+        with:
+          version: ${{ inputs.python-version }}
+          os: ${{ inputs.os }}
+          flavor: ${{ inputs.python-flavor }}
 
       - name: Install dependencies
         shell: bash
@@ -132,6 +188,10 @@ jobs:
         with:
           cppinterop-ref: ${{ inputs.cppinterop-ref }}
           cxx-standard: ${{ inputs.cxx-standard }}
+          build-type: ${{ inputs.build-type }}
+          sanitizer: ${{ inputs.sanitizer }}
+          python-flavor: ${{ inputs.python-flavor }}
+          extra-cmake-defines: ${{ inputs.extra-cmake-defines }}
           llvm-version: ${{ inputs.llvm-version }}
           valgrind: ${{ inputs.valgrind }}
           run-xfail-crashing-tests: ${{ inputs.run-xfail-crashing-tests }}
@@ -148,10 +208,37 @@ jobs:
           printf '%s\n' "${line}" > "${GITHUB_WORKSPACE}/pytest-summary.txt"
           echo "line=${line}" >> "$GITHUB_OUTPUT"
 
+      # upload-artifact@v4 refuses duplicate names: every axis that can
+      # differ between rows must appear in the slug.
+      - name: Compose the result artifact name
+        id: cell
+        if: always()
+        shell: bash
+        env:
+          OS: ${{ inputs.os }}
+          LLVM_VERSION: ${{ inputs.llvm-version }}
+          LLVM_FLAVOR: ${{ inputs.llvm-flavor }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
+          PYTHON_FLAVOR: ${{ inputs.python-flavor }}
+          CXX_STANDARD: ${{ inputs.cxx-standard }}
+          BUILD_TYPE: ${{ inputs.build-type }}
+          SANITIZER: ${{ inputs.sanitizer }}
+          VALGRIND: ${{ inputs.valgrind }}
+        run: |
+          set -euo pipefail
+          slug="${OS}-llvm${LLVM_VERSION}-py${PYTHON_VERSION}-cxx${CXX_STANDARD}"
+          if [[ "${VALGRIND}" == "true" ]]; then slug+="-vg"; fi
+          if [[ "${LLVM_FLAVOR}" == "cling" ]]; then slug+="-cling"; fi
+          if [[ "${LLVM_FLAVOR}" == "asan" || "${LLVM_FLAVOR}" == "debug" ]]; then slug+="-llvm${LLVM_FLAVOR}"; fi
+          if [[ "${BUILD_TYPE}" != "Release" ]]; then slug+="-${BUILD_TYPE}"; fi
+          if [[ -n "${SANITIZER}" ]]; then slug+="-asan"; fi
+          if [[ -n "${PYTHON_FLAVOR}" ]]; then slug+="-py${PYTHON_FLAVOR}"; fi
+          echo "slug=${slug}" >> "${GITHUB_OUTPUT}"
+
       - name: Upload result
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: result-${{ inputs.os }}-llvm${{ inputs.llvm-version }}-py${{ inputs.python-version }}-cxx${{ inputs.cxx-standard }}${{ inputs.valgrind && '-vg' || '' }}${{ inputs.llvm-flavor == 'cling' && '-cling' || '' }}
+          name: result-${{ steps.cell.outputs.slug }}
           path: ${{ github.workspace }}/pytest-summary.txt
           if-no-files-found: warn
