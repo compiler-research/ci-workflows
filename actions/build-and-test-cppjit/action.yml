@@ -107,8 +107,11 @@ runs:
 
         echo "::group::Full test suite"
         # -p no:cacheprovider prevents writing .pytest_cache into the upstream-identical tree
+        # Nothing here should kill a worker, so cap xdist's restarts; the
+        # conftest keeps each file's tests together on one of them.
         set -o pipefail
         python -m pytest -ra --tb=short -p no:cacheprovider --durations=25 \
+          -n auto --max-worker-restart 2 \
           | tee "${RUNNER_TEMP}/complete_testrun.log" 2>&1 || RETCODE=$?
         set +o pipefail
         tail -n1 "${RUNNER_TEMP}/complete_testrun.log" > "${GITHUB_WORKSPACE}/pytest-summary.txt" || true
