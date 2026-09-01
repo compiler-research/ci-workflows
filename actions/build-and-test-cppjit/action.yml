@@ -30,7 +30,9 @@ inputs:
   run-xfail-crashing-tests:
     required: false
     default: 'false'
-    description: 'Also run the disabled xfail crash/skipif tests'
+    description: |
+      Also run the xfail(run=False) crash-class tests; a test that passes
+      (a strict xpass — its marker went stale) fails the job.
 
 runs:
   using: composite
@@ -101,32 +103,23 @@ runs:
         make -j4 PYTHON=python || { echo "::error::dictionary build (make) failed"; exit 1; }
         export CPPINTEROP_EXTRA_INTERPRETER_ARGS="-std=c++${CXX_STD}"
 
-        SED=sed
-        [[ "${RUNNER_OS}" == "macOS" ]] && SED=gsed
-
         RETCODE=0
 
         echo "::group::Full test suite"
         # -p no:cacheprovider prevents writing .pytest_cache into the upstream-identical tree
+        # Nothing here should kill a worker, so cap xdist's restarts; the
+        # conftest keeps each file's tests together on one of them.
         set -o pipefail
         python -m pytest -ra --tb=short -p no:cacheprovider --durations=25 \
-          | tee complete_testrun.log 2>&1 || RETCODE=$?
+          -n auto --max-worker-restart 2 \
+          | tee "${RUNNER_TEMP}/complete_testrun.log" 2>&1 || RETCODE=$?
         set +o pipefail
-        tail -n1 complete_testrun.log > "${GITHUB_WORKSPACE}/pytest-summary.txt" || true
+        tail -n1 "${RUNNER_TEMP}/complete_testrun.log" > "${GITHUB_WORKSPACE}/pytest-summary.txt" || true
         echo "::endgroup::"
 
         if [[ "${RUN_XFAIL_CRASHING_TESTS}" == "true" ]]; then
-          # A crash here = an xfail that stopped crashing and should drop its marker.
-          echo "::group::xfail-crash sweep"
-          find . -name "*.py" -exec "${SED}" -i '/run=False/!s/^ *@mark.xfail\(.*\)/#&/' {} \;
-          python -m pytest -n 1 -m "xfail" --runxfail -ra --max-worker-restart 512 | tee test_crashed.log 2>&1 || true
-          git checkout .
-          echo "::endgroup::"
-
-          echo "::group::xfail->skipif sweep"
-          find . -name "*.py" -exec "${SED}" -i -E 's/(^ *)@mark.xfail\(run=(.*)/\1@mark.skipif(condition=not \2/g' {} \;
-          python -m pytest --runxfail -ra | tee test_xfailed.log 2>&1 || true
-          git checkout .
+          echo "::group::xfail crash sweep"
+          python "${GITHUB_ACTION_PATH}/crash_sweep.py" || RETCODE=$?
           echo "::endgroup::"
         fi
 
@@ -149,7 +142,8 @@ runs:
           export IS_VALGRIND=true
           valgrind --show-error-list=yes --error-exitcode=1 --track-origins=yes \
             --gen-suppressions=all ${SUPP_ARGS[@]+"${SUPP_ARGS[@]}"} \
-            python -m pytest -m "not xfail" -ra --ignore=test_leakcheck.py || RETCODE=$?
+            python -m pytest -m "not xfail" -ra -p no:cacheprovider \
+            --ignore=test_leakcheck.py || RETCODE=$?
           unset IS_VALGRIND
           echo "::endgroup::"
         fi
