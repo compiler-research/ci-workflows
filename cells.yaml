@@ -54,6 +54,7 @@ cells:
   - { recipe: llvm-wasm,  version: '22',            os: ubuntu-24.04,    arch: x86_64 }
   - { recipe: llvm-wasm,  version: '22',            os: ubuntu-24.04-arm, arch: arm64  }
   - { recipe: llvm-wasm,  version: '22',            os: macos-26,        arch: arm64  }
+  - { recipe: llvm-wasm,  version: '22',            os: windows-2025,        arch: x86_64  }
   # llvm-wheel: the wheel-building toolchain (static-only, assertions
   # off; see the recipe). The linux cell builds inside the manylinux
   # container for the glibc 2.28 floor; the macOS cell builds at
