@@ -57,6 +57,20 @@ class LinkJobsTests(unittest.TestCase):
             self.assertEqual(build._link_jobs(), "2")
 
 
+class ManylinuxImageTests(unittest.TestCase):
+    """The cell's arch picks the container the linux build runs in."""
+
+    def test_default_is_x86_64(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(build._manylinux_image(),
+                             "quay.io/pypa/manylinux_2_28_x86_64")
+
+    def test_aarch64_selects_the_arm_image(self):
+        with mock.patch.dict(os.environ, {"RECIPE_ARCH": "aarch64"}):
+            self.assertEqual(build._manylinux_image(),
+                             "quay.io/pypa/manylinux_2_28_aarch64")
+
+
 class ReexecTests(unittest.TestCase):
     """The docker command must carry the runner-side contract into the
     container: required env always, ccache and GITHUB_ENV only when
@@ -94,6 +108,11 @@ class ReexecTests(unittest.TestCase):
         cmd = self._docker_cmd({"GITHUB_ENV": "/tmp/ge"})
         self.assertIn("/tmp/ge:/github_env", cmd)
         self.assertIn("GITHUB_ENV=/github_env", cmd)
+
+    def test_aarch64_cell_runs_the_arm_image(self):
+        cmd = self._docker_cmd({"RECIPE_ARCH": "aarch64"})
+        self.assertIn("quay.io/pypa/manylinux_2_28_aarch64", cmd)
+        self.assertIn("RECIPE_ARCH=aarch64", cmd)
 
 
 class StaticOnlyTests(unittest.TestCase):

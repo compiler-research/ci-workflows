@@ -26,9 +26,16 @@ sys.path.insert(0, str(SCRIPT_DIR / ".." / ".." / "actions" / "lib"))
 
 import llvm_build  # noqa: E402
 
-# Must match the FROM in docker/manylinux-llvm-wheel/Dockerfile.
-_MANYLINUX_IMAGE = "quay.io/pypa/manylinux_2_28_x86_64"
+# The pypa image generation consumer wheels build in; the cell's arch
+# picks the per-arch image.
+_MANYLINUX_IMAGE_TEMPLATE = "quay.io/pypa/manylinux_2_28_{arch}"
+_LINUX_ARCHS = ("x86_64", "aarch64")
 _MACOS_DEPLOYMENT_TARGET = "14.0"
+
+
+def _manylinux_image() -> str:
+    arch = os.environ.get("RECIPE_ARCH", "x86_64")
+    return _MANYLINUX_IMAGE_TEMPLATE.format(arch=arch)
 
 
 def _source_ref(version: str) -> str:
@@ -97,8 +104,9 @@ def _reexec_in_container() -> int:
         "unset CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER; "
         "exec $py /ciwf/recipes/llvm-wheel/build.py"
     )
-    cmd += [_MANYLINUX_IMAGE, "bash", "-c", inner]
-    print(f"build.py: re-executing in {_MANYLINUX_IMAGE}", flush=True)
+    image = _manylinux_image()
+    cmd += [image, "bash", "-c", inner]
+    print(f"build.py: re-executing in {image}", flush=True)
     return subprocess.run(cmd, check=False).returncode
 
 
@@ -122,9 +130,10 @@ def main() -> int:
 
     if sys.platform.startswith("linux") and \
             not os.environ.get("LLVM_WHEEL_INNER"):
-        if os.environ.get("RECIPE_ARCH", "x86_64") != "x86_64":
-            print("::error::llvm-wheel linux cells are x86_64-only "
-                  "(the recipe wires only the x86_64 manylinux image)",
+        if os.environ.get("RECIPE_ARCH", "x86_64") not in _LINUX_ARCHS:
+            print("::error::llvm-wheel linux cells support "
+                  f"{' and '.join(_LINUX_ARCHS)} only (the archs the "
+                  "consumer wheel matrix builds)",
                   file=sys.stderr)
             return 1
         if not shutil.which("docker"):
