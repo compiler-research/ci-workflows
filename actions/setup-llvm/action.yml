@@ -8,7 +8,8 @@ description: |
               Releases cache. Binary-identical to what `bin/recipe-cache`
               produces locally; pick this for the latest LLVM major
               where the cache cell exists (today: LLVM 22 on every
-              supported platform).
+              supported platform, LLVM 23 on ubuntu-24.04 / x86_64 --
+              cells.yaml is the source of truth).
 
     'system'  Platform package manager — apt-llvm.org on Linux,
               `brew llvm@N` on macOS. Pick this for older LLVM majors
@@ -42,7 +43,7 @@ description: |
 inputs:
   version:
     required: true
-    description: 'LLVM major version, e.g. "20", "21", "22".'
+    description: 'LLVM major version, e.g. "20", "21", "22", "23".'
   os:
     required: true
     description: |

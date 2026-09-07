@@ -55,9 +55,20 @@ source:
 
 # Cross-recipe dependency. publish-recipe's fetch_bootstrap step
 # downloads this cell into the build env and exports its bin/ as
-# BOOTSTRAP_CLANG_BIN before invoking build.py. Pin the version here
-# (not derived from RECIPE_VERSION) so the bootstrap clang is always
-# the same major as this msan build.
+# BOOTSTRAP_CLANG_BIN before invoking build.py.
+#
+# `{version}` substitutes this cell's own RECIPE_VERSION, the same way
+# source.branch_template does, so every msan cell bootstraps from the
+# llvm-release cell carrying the identical version string: msan 22 ->
+# llvm-release 22, msan 23 -> llvm-release 23. A single hardcoded
+# version cannot serve two majors -- libc++ from release/N.x needs a
+# Clang >= N, so the 22 bootstrap that the 22 cell wants is exactly the
+# compiler that fails to build the 23 one.
+#
+# The paired llvm-release cell must be in cells.yaml at the same os and
+# arch; verify.yml's bootstrap-cells-exist check enforces that, because
+# the alternative is fetch_bootstrap failing the publish after the
+# bootstrap phase has already run.
 bootstrap:
   recipe: llvm-release
-  version: '22'
+  version: '{version}'

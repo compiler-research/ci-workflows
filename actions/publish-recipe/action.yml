@@ -199,6 +199,11 @@ runs:
     # named cell and exports its bin/ as BOOTSTRAP_CLANG_BIN. Recipes
     # without a bootstrap block: fetch_bootstrap.py exits silently and
     # the env var stays empty.
+    #
+    # VERSION is passed so a bootstrap block declaring the `{version}`
+    # placeholder resolves against the cell being built -- that is what
+    # lets one recipe publish at several majors and pull the matching
+    # bootstrap for each.
     - name: Fetch bootstrap compiler if recipe declares one
       if: steps.skip.outputs.exists != 'true'
       shell: bash
@@ -206,11 +211,12 @@ runs:
         OS: ${{ inputs.os }}
         ARCH: ${{ inputs.arch }}
         RECIPE: ${{ inputs.recipe }}
+        VERSION: ${{ inputs.version }}
         WORK_DIR: ${{ github.workspace }}/_recipe_work
       run: |
         mkdir -p "$WORK_DIR"
         bin=$(python3 actions/publish-recipe/fetch_bootstrap.py \
-                "recipes/$RECIPE" "$OS" "$ARCH" \
+                "recipes/$RECIPE" "$VERSION" "$OS" "$ARCH" \
                 "$WORK_DIR/_bootstrap")
         if [ -n "$bin" ]; then
           echo "BOOTSTRAP_CLANG_BIN=$bin" >> "$GITHUB_ENV"

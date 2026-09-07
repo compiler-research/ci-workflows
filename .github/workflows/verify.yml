@@ -136,6 +136,43 @@ jobs:
             fi
           done
           exit $fail
+      - name: Bootstrap blocks resolve to a declared cell
+        # A recipe carrying a `bootstrap:` block (llvm-msan today) is
+        # built against another recipe's *published* cell, downloaded by
+        # publish-recipe's fetch_bootstrap step. Its `version` may be the
+        # '{version}' placeholder, which resolves to the version of the
+        # cell being built -- so a recipe published at two majors needs
+        # its provider published at both, at the same os/arch.
+        #
+        # Nothing else checks that pairing. An absent provider surfaces
+        # as a fetch_bootstrap miss during the publish, after the
+        # bootstrap phase has already spent its runners, and only for
+        # whichever cells happen to be missing.
+        run: |
+          set -euo pipefail
+          fail=0
+          # Materialise the cell list once, for the same reason the
+          # projects.yaml check below does: `grep -q` exits on the first
+          # match, SIGPIPEs yq, and `set -o pipefail` then reports the
+          # whole pipeline as failed.
+          cells=$(yq -r '.cells[] | [.recipe, .version, .os, .arch] | @tsv' cells.yaml)
+          for r in $(yq '.cells[].recipe' cells.yaml | sort -u); do
+            y="recipes/$r/recipe.yaml"
+            yq -e '.bootstrap' "$y" >/dev/null 2>&1 || continue
+            brecipe=$(yq -r '.bootstrap.recipe' "$y")
+            btpl=$(yq -r '.bootstrap.version' "$y")
+            # `< <(...)` rather than a pipe: the loop body has to run in
+            # this shell for `fail` to outlive it.
+            while IFS=$'\t' read -r ver os arch; do
+              bver=${btpl//"{version}"/$ver}
+              coord=$(printf '%s\t%s\t%s\t%s' "$brecipe" "$bver" "$os" "$arch")
+              if ! grep -qxF "$coord" <<<"$cells"; then
+                echo "::error file=$y::cell $r $ver ($os/$arch) bootstraps from $brecipe $bver ($os/$arch), which is not in cells.yaml"
+                fail=1
+              fi
+            done < <(yq -r ".cells[] | select(.recipe == \"$r\") | [.version, .os, .arch] | @tsv" cells.yaml)
+          done
+          exit $fail
       - name: projects.yaml entries name a real cell
         # bin/start renders this catalog before anything is cloned, so a
         # coord here that no cell serves shows a student a project they
