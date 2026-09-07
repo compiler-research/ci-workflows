@@ -70,7 +70,7 @@ permissions:
 jobs:
   build-test:
     runs-on: ${{ inputs.os }}
-    name: Build & Test
+    name: run
     outputs:
       summary: ${{ steps.summary.outputs.line }}
     steps:
