@@ -64,6 +64,7 @@ runs:
       env:
         CPPINTEROP_REF: ${{ inputs.cppinterop-ref }}
         CLING: ${{ inputs.cling }}
+        VALGRIND: ${{ inputs.valgrind }}
       run: |
         set -euo pipefail
         if [[ "${RUNNER_OS}" == "macOS" ]]; then
@@ -78,6 +79,7 @@ runs:
         EXTRA_ARGS=()
         [[ "${CLING}" == "true" ]] && EXTRA_ARGS+=(--config-settings=cmake.define.CPPJIT_USE_CLING=ON)
         [[ -n "${CPPINTEROP_REF}" ]] && EXTRA_ARGS+=(--config-settings=cmake.define.CPPINTEROP_SOURCE_DIR="${GITHUB_WORKSPACE}/cppinterop-src")
+        [[ "${VALGRIND}" == "true" ]] && EXTRA_ARGS+=(--config-settings=cmake.build-type=RelWithDebInfo --config-settings=install.strip=false)
         python -m pip install . -v \
           --config-settings=cmake.define.LLVM_DIR="${LLVM_DIR}" \
           ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
