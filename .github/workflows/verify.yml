@@ -261,6 +261,11 @@ jobs:
           # would have caught the original breakage.
           check "recipe build tree configured" \
             '[ -f "$DEVSHELL_BUILD/CMakeCache.txt" ]'
+          # This script runs as dev, like the shell; repro-config runs as
+          # root and must leave the build tree and ccache usable by dev.
+          check "build tree writable"   'touch "$DEVSHELL_BUILD/.smoke"'
+          check "ccache compiles" \
+            'echo "int x;" > /tmp/smoke.c && ccache "$CC" -c /tmp/smoke.c -o /tmp/smoke.o'
           # The "claude-ready" half of the promise.
           check "claude on PATH"        "command -v claude"
           exit $fail

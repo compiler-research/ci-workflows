@@ -97,9 +97,11 @@ if [[ -d "${DEVSHELL_PATCHES_MOUNT:-/patches}" ]]; then
   chown "$dev_uid:$dev_gid" "${DEVSHELL_PATCHES_MOUNT}"
 fi
 
-# Top-level stat gates the recursive walk: after first-run the
-# workspace tree (multi-GB once built) is already dev-owned, and
-# re-entry skips this entirely.
+# A few stats gate the recursive walk: after first-run the workspace
+# tree (multi-GB once built) is already dev-owned, and re-entry skips
+# this entirely. The build tree and the ccache log are among them
+# because repro-config used to write both as root, under a dev-owned
+# workspace.
 ws=""
 if [[ -n "${DEVSHELL_BUILD:-}" ]]; then
   ws="${DEVSHELL_BUILD%/_recipe_work*}"
@@ -122,8 +124,9 @@ if [[ -n "${DEVSHELL_BUILD:-}" ]]; then
              "already mapped, skipping chown."
         ;;
       *)
-        cur_uid=$(stat -c %u "$ws" 2>/dev/null || echo "")
-        if [[ "$cur_uid" != "$dev_uid" ]]; then
+        owners=$(stat -c %u "$ws" "$DEVSHELL_BUILD" "${CCACHE_LOGFILE:-}" \
+                 2>/dev/null || true)
+        if grep -qvx "$dev_uid" <<<"$owners"; then
           chown -R "$dev_uid:$dev_gid" "$ws"
         fi
         ;;

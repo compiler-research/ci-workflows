@@ -126,14 +126,19 @@ if diffs:
         print(f"  ... +{len(diffs)-10} more", file=sys.stderr)
 PY
 
-ccache --max-size=5G
+# The shell and --devshell-script run as dev, so everything from here on
+# that writes into the workspace does too: a build tree or a ccache log
+# that root created locks dev out of both.
+as_dev() { setpriv --reuid=dev --regid=dev --init-groups "$@"; }
+
+as_dev ccache --max-size=5G
 # Mirror publish-recipe's compiler_check. When the manifest records
 # the producer's value, apply it verbatim (consumer's $CC --version
 # may differ in package metadata even with matching binaries) and
 # warn if the version line genuinely diverges.
 cc_version=$("$CC" --version | head -1)
 if [[ -n "${DEVSHELL_PRODUCER_COMPILER_CHECK:-}" ]]; then
-  ccache --set-config="compiler_check=$DEVSHELL_PRODUCER_COMPILER_CHECK"
+  as_dev ccache --set-config="compiler_check=$DEVSHELL_PRODUCER_COMPILER_CHECK"
   recorded="${DEVSHELL_PRODUCER_COMPILER_CHECK#string:}"
   if [[ "$recorded" != "$cc_version" ]]; then
     echo "warning: compiler version differs from recipe; ccache will miss." >&2
@@ -141,7 +146,7 @@ if [[ -n "${DEVSHELL_PRODUCER_COMPILER_CHECK:-}" ]]; then
     echo "  here:   $cc_version" >&2
   fi
 else
-  ccache --set-config="compiler_check=string:$cc_version"
+  as_dev ccache --set-config="compiler_check=string:$cc_version"
 fi
 
 build="${DEVSHELL_BUILD:?env not set; bin/repro --devshell exports it}"
@@ -174,7 +179,7 @@ if [[ -n "$recipe_name" && -f "$hook" ]]; then
 fi
 
 if [[ ! -f "$build/CMakeCache.txt" ]]; then
-  mkdir -p "$build"
+  as_dev mkdir -p "$build"
   cd "$build"
   # Replay the recipe's own cmake invocation from the manifest's cmake_args
   # field (post-#53), rewriting the two things that are producer-specific: the
@@ -212,7 +217,7 @@ PY
     # entirely. Leave it to the dev, who can see the manifest.
     echo "::warning title=devshell::manifest has no cmake_args; skipping the" \
          "cmake configure. Configure \$DEVSHELL_BUILD by hand."
-  elif ! eval cmake "$exec_cmake_args"; then
+  elif ! eval as_dev cmake "$exec_cmake_args"; then
     # Not fatal. This configure is a convenience for devs who intend to
     # rebuild the recipe's own source; the install tree, the ccache and
     # the AI CLI are all in place without it, so failing here would cost
@@ -244,9 +249,9 @@ fi
 sanity_tu="lib/Support/CMakeFiles/LLVMSupport.dir/Allocator.cpp.o"
 if [[ -f "$build/build.ninja" ]] \
    && (cd "$build" && ninja -t commands "$sanity_tu" >/dev/null 2>&1); then
-  ccache --zero-stats
+  as_dev ccache --zero-stats
   rm -f "$build/$sanity_tu"
-  if (cd "$build" && ninja "$sanity_tu" >/dev/null 2>&1); then
+  if (cd "$build" && as_dev ninja "$sanity_tu" >/dev/null 2>&1); then
     sanity_hits=$(ccache --show-stats \
       | awk '/^[[:space:]]*Hits:[[:space:]]+[0-9]/ { print $2; exit }')
     : "${sanity_hits:=0}"
