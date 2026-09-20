@@ -536,6 +536,33 @@ Inside the container the workspace is bind-mounted at the recipe's
 runner workspace path (read from `manifest.build_env.ccache.base_dir`),
 so ccache's recorded paths match the producer.
 
+### Reaching the rest of the host
+
+`--devshell-docker-options` hands a string to the container's
+`docker run` unchanged, for the host resources the hermetic default
+leaves out. GPUs are what this is usually for:
+
+```bash
+bin/repro --devshell --devshell-docker-options='--gpus all' <cell>
+```
+
+Spell it with the `=`, as above: an option value that starts with a
+dash reads as another flag when it is passed as a separate word.
+
+`--gpus all` needs the NVIDIA driver plus `nvidia-container-toolkit`
+on the host, registered with the daemon (`nvidia-ctk runtime
+configure --runtime=docker`); check it with `docker run --rm --gpus
+all ubuntu nvidia-smi` before blaming the devshell. Where the daemon
+speaks CDI instead, the spelling is `--device nvidia.com/gpu=all`.
+Only the driver comes in this way -- `libcuda.so`, `nvidia-smi` -- so
+a cell that compiles CUDA still needs a toolkit installed inside.
+Not available on macOS: Docker Desktop's VM has no GPU to pass on.
+
+The options come last on the command line, so they beat what
+`bin/repro` chose, and they are recorded as a container label:
+asking for different ones re-creates the container, because docker
+fixes them at creation just like the mounts.
+
 ### Trust model
 
 - No git identity is injected. The container has no `user.name`,

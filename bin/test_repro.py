@@ -1691,10 +1691,11 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
 
     def _args(self, **kw):
         kw.setdefault("devshell_as_root", False)
+        kw.setdefault("devshell_docker_options", "")
         return argparse.Namespace(**kw)
 
     def _run_ensure(self, *, volume_name, work_host_bind, host_cache,
-                    patches_out):
+                    patches_out, docker_options=""):
         manifest = {"build_env": {"ccache": {
             "base_dir": "/home/runner/work/x/x", "hash_dir": "false",
         }}}
@@ -1704,7 +1705,8 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
              mock.patch.object(self.repro, "_devshell_host_uid_gid",
                                return_value=(1000, 1000)):
             self.repro._devshell_ensure_container(
-                self._args(), "devshell-x", "img:tag",
+                self._args(devshell_docker_options=docker_options),
+                "devshell-x", "img:tag",
                 "/home/runner/work/x/x", manifest,
                 volume_name=volume_name,
                 work_host_bind=work_host_bind,
@@ -1765,6 +1767,7 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
         kw.setdefault("host_cache", None)
         kw.setdefault("patches_out", Path("/tmp/proj"))
         kw.setdefault("docker_platform", "linux/amd64")
+        options = kw.pop("devshell_docker_options", "")
         with mock.patch.object(self.repro, "_devshell_container_exists",
                                return_value=True), \
              mock.patch.object(self.repro, "_devshell_container_running",
@@ -1774,12 +1777,15 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
              mock.patch.object(self.repro, "_devshell_container_arch",
                                return_value=kw.pop("actual_arch",
                                                    "amd64")), \
+             mock.patch.object(self.repro, "_devshell_container_options",
+                               return_value=kw.pop("actual_options", "")), \
              mock.patch.object(self.repro.subprocess, "run") as run, \
              mock.patch.object(self.repro, "_devshell_host_uid_gid",
                                return_value=(1000, 1000)), \
              redirect_stderr(io.StringIO()):
             self.repro._devshell_ensure_container(
-                self._args(), "devshell-x", "img:tag",
+                self._args(devshell_docker_options=options),
+                "devshell-x", "img:tag",
                 "/home/runner/work/x/x", manifest, **kw)
         return [c[0][0] for c in run.call_args_list]
 
@@ -1796,6 +1802,38 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
     def test_matching_container_is_reused_not_recreated(self):
         # Already running with the mounts this run wants: do nothing.
         self.assertEqual(self._ensure_existing(self._fresh_binds()), [])
+
+    def test_docker_options_reach_docker_run_and_are_recorded(self):
+        # The caller's options are what a GPU (or any other host
+        # resource) reaches the shell through, and they must come after
+        # repro's own so that they win a conflict.
+        argv = self._run_ensure(
+            volume_name="devshell-x", work_host_bind=None,
+            host_cache=None, patches_out=Path("/tmp/proj"),
+            docker_options="--gpus all --ipc=host",
+        )
+        self.assertEqual(argv[-4:-3], ["--ipc=host"])
+        self.assertIn("--gpus", argv)
+        self.assertIn(
+            f"{self.repro.DEVSHELL_OPTIONS_LABEL}=--gpus all --ipc=host",
+            argv)
+        # Still before the image and its command, which end the argv.
+        self.assertEqual(argv[-3:], ["img:tag", "sleep", "infinity"])
+
+    def test_container_created_without_the_options_is_recreated(self):
+        # docker fixes these at creation, so a shell that was started
+        # without `--gpus` never grows one: recreate rather than hand
+        # back a container that silently cannot see the GPU.
+        argvs = self._ensure_existing(self._fresh_binds(),
+                                      devshell_docker_options="--gpus all")
+        self.assertEqual(argvs[0][:3], ["docker", "rm", "-f"])
+
+    def test_container_with_the_same_options_is_reused(self):
+        self.assertEqual(
+            self._ensure_existing(self._fresh_binds(),
+                                  devshell_docker_options="--gpus all",
+                                  actual_options="--gpus all"),
+            [])
 
     def test_container_with_stale_workspace_bind_is_recreated(self):
         # The real-world case: a container created against an older

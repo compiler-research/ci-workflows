@@ -94,6 +94,11 @@ Examples
     bin/repro -j test --no-shell                  # scripted: act, then rm
     bin/repro -j test --save-temps                # keep container around
     bin/repro -j test -- --verbose                # passthrough to act
+
+    bin/repro --devshell llvm-root/cling-llvm22/ubuntu-24.04/x86_64
+                                                  # hermetic dev shell
+    bin/repro --devshell --devshell-docker-options='--gpus all' <cell>
+                                                  # ... that sees the GPUs
 """
 
 from __future__ import annotations
@@ -200,6 +205,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="with --devshell: container image (digest "
                         "preferred). Defaults to the cell's OS-matched "
                         "catthehacker tag.")
+    p.add_argument("--devshell-docker-options", metavar="OPTS", default="",
+                   help="with --devshell: extra options for the "
+                        "container's `docker run`, as one shell-quoted "
+                        "string -- e.g. --devshell-docker-options="
+                        "'--gpus all' to let the shell see the host's "
+                        "GPUs (needs nvidia-container-toolkit on the "
+                        "host). Spell it with the `=`: a value starting "
+                        "with a dash reads as another flag otherwise. "
+                        "The options come last, so they win over the "
+                        "ones repro sets itself, and changing them "
+                        "re-creates the container.")
     p.add_argument("--devshell-as-root", action="store_true",
                    help="with --devshell: run as root inside the "
                         "container. Escape hatch; files written to "
@@ -972,6 +988,15 @@ def remove_container(cid: str) -> None:
 #
 # Distinct from the act-driven repro path: no workflow runs, no
 # nektos/act involvement, no GHA cache emulation.
+#
+# Nothing else of the host reaches in. What the shell needs beyond
+# that -- the GPUs, most often -- is asked for with
+# --devshell-docker-options=<string>, which hands the string to
+# `docker run` as-is: '--gpus all' on a host with
+# nvidia-container-toolkit installed, '--device nvidia.com/gpu=all'
+# where the daemon speaks CDI. The driver comes in with the flag; a
+# CUDA toolkit does not, so a cell that needs nvcc still installs it
+# inside.
 
 # Default location for --devshell-host-cache (bare flag). Layout:
 #   cells/<cell-id>/{src,build,ccache}
@@ -987,6 +1012,7 @@ DEVSHELL_CCACHE_SUBDIR    = ".ccache"
 DEVSHELL_INSTALL_SUBDIR   = "_recipe_out/install"
 
 DEVSHELL_PATCHES_MOUNT = "/patches"
+DEVSHELL_OPTIONS_LABEL = "ci-workflows.devshell.docker-options"
 DEVSHELL_CACHE_MOUNT   = "/cache"
 DEVSHELL_DEV_HOME      = "/home/dev"
 
@@ -1410,6 +1436,25 @@ def _devshell_container_binds(name: str) -> Dict[str, str]:
     return binds
 
 
+def _devshell_container_options(name: str) -> str:
+    """The --devshell-docker-options an existing container carries.
+
+    Recorded as a label at creation: docker cannot report back the
+    options it was given, and a container created without `--gpus`
+    does not grow one on re-entry.
+    """
+    r = subprocess.run(
+        ["docker", "inspect", name, "--format",
+         '{{index .Config.Labels "' + DEVSHELL_OPTIONS_LABEL + '"}}'],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return ""
+    out = r.stdout.strip()
+    # A container from before this label existed prints Go's placeholder.
+    return "" if out == "<no value>" else out
+
+
 def _devshell_container_arch(name: str) -> str:
     """Architecture of the image an existing container was created
     from ("amd64" / "arm64"), or "" when it can't be determined.
@@ -1463,6 +1508,7 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
         ws, volume_name=volume_name, work_host_bind=work_host_bind,
         host_cache=host_cache, patches_out=patches_out,
     )
+    docker_options = args.devshell_docker_options or ""
     if _devshell_container_exists(name):
         # Mounts are fixed at creation: docker cannot remount a
         # container that already exists. So a container left over from
@@ -1485,6 +1531,10 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
         got_arch = _devshell_container_arch(name)
         if got_arch and got_arch != want_arch:
             stale.append(f"architecture ({got_arch}, want {want_arch})")
+        # And for the caller's own options, which are as fixed at
+        # creation as the mounts are.
+        if _devshell_container_options(name) != docker_options:
+            stale.append("docker options")
         if stale:
             _log(f"repro: devshell container {name} was created with a "
                  f"different {', '.join(stale)}; re-creating it against "
@@ -1563,6 +1613,9 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
              *mount_args,
              "-w", ws,
              *env_args,
+             "--label", f"{DEVSHELL_OPTIONS_LABEL}={docker_options}",
+             # Last, so a caller can override what repro chose.
+             *shlex.split(docker_options),
              image, "sleep", "infinity"],
             check=True, stdout=subprocess.DEVNULL,
         )
