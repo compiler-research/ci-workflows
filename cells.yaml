@@ -20,9 +20,11 @@
 support_window:
   - 20
   - 22
-  # 23 is pre-release: release/23.x is cut and tagging candidates, no
-  # final yet. It is in the window because consumers test against it
-  # early; the cell that serves it is pinned to a tag, see below.
+  # 23.1.0 was tagged upstream on 2026-08-25, so release/23.x is now a
+  # maintained point-release line and 23 cells track the bare major
+  # like 22 does. The tag-pinned 23.1.0-rc2 llvm-release cell below
+  # stays for consumers that still pass it as setup-llvm's
+  # flavor-version; drop that row once they move to the bare major.
   - 23
 
 caps:
@@ -36,6 +38,10 @@ caps:
 
 cells:
   - { recipe: llvm-asan, version: '22',            os: ubuntu-24.04,    arch: x86_64 }
+  # asan on 23: one Linux cell per major, matching 22. The recipe has no
+  # version-conditional flags -- it discovers the orc_rt target names from
+  # the configured build -- so a new major needs only this row.
+  - { recipe: llvm-asan, version: '23',            os: ubuntu-24.04,    arch: x86_64 }
   # llvm-debug: Debug (-O0 -g) + asserts LLVM/Clang, carrying FileCheck
   # and `not` in the install. Serves downstream debug_build rows (clad's
   # ubu24-clang20-runtime22-debug) that previously built LLVM inline on
@@ -45,6 +51,14 @@ cells:
   # MSan-instrumented libc++ stage build cleanly (libcxxabi-on-Mach-O
   # uses Apple's libunwind), and Windows lacks MSan support upstream.
   - { recipe: llvm-msan,  version: '22',            os: ubuntu-24.04,    arch: x86_64 }
+  # Every llvm-msan row needs the llvm-release row of the *same version
+  # string, os and arch*: recipe.yaml's `bootstrap.version` is the
+  # '{version}' template, so fetch_bootstrap resolves msan 23 ->
+  # llvm-release 23 and fails the build if that cell is absent (libc++
+  # from release/N.x needs a Clang >= N, which is why the bootstrap
+  # exists at all). verify.yml's bootstrap-cells-exist check enforces
+  # the pairing at PR time rather than 30 minutes into a publish.
+  - { recipe: llvm-msan,  version: '23',            os: ubuntu-24.04,    arch: x86_64 }
   # llvm-wasm: cells cover CppInterOp's Unix emscripten rows.
   # build.py's emsdk install/activate goes through `subprocess.run`
   # against the extensionless `emsdk` script, which only resolves
@@ -54,6 +68,16 @@ cells:
   - { recipe: llvm-wasm,  version: '22',            os: ubuntu-24.04,    arch: x86_64 }
   - { recipe: llvm-wasm,  version: '22',            os: ubuntu-24.04-arm, arch: arm64  }
   - { recipe: llvm-wasm,  version: '22',            os: macos-26,        arch: arm64  }
+  # wasm on 23: same three rows as 22 (CppInterOp's Unix emscripten
+  # matrix). The per-major patch glob picks up
+  # patches/emscripten-clang23-*.patch, which carries only the
+  # parseLLVMArgs/-mllvm patch -- the WebAssemblyTargetMachine
+  # initAsmInfo/basicCheckForEHAndSjLj reordering the clang22 set needs
+  # landed upstream in release/23.x, and re-applying it would abort the
+  # build on a failed `git apply`.
+  - { recipe: llvm-wasm,  version: '23',            os: ubuntu-24.04,    arch: x86_64 }
+  - { recipe: llvm-wasm,  version: '23',            os: ubuntu-24.04-arm, arch: arm64  }
+  - { recipe: llvm-wasm,  version: '23',            os: macos-26,        arch: arm64  }
   # llvm-wheel: the wheel-building toolchain (static-only, assertions
   # off; see the recipe). Linux cells build inside the per-arch manylinux
   # container for the glibc 2.28 floor; macOS cells build at deployment
@@ -104,7 +128,20 @@ cells:
   # clang-runtime '23' and pass the tag as setup-llvm's flavor-version.
   # Linux x86_64 only; every other platform is a full LLVM build, so
   # add rows when a consumer needs one.
+  #
+  # 23.1.0 is final as of 2026-08-25, so this row's original reason has
+  # expired: the bare-major row below is the one new consumers should
+  # pull. Kept only until the consumers still passing the tag as
+  # flavor-version move off it -- removing it earlier drops their cell
+  # after grace_days and sends them to a 30-minute inline build.
   - { recipe: llvm-release, version: '23.1.0-rc2', os: ubuntu-24.04,     arch: x86_64 }
+  # Bare-major 23, tracking release/23.x. Added as llvm-msan 23's
+  # bootstrap clang -- fetch_bootstrap looks up llvm-release at the msan
+  # cell's own version string -- and it doubles as the default-flavor
+  # cell for consumers that want the released 23 line without pinning a
+  # tag. Linux x86_64 only, like the rc row: every other platform is a
+  # full LLVM build, so add rows when a consumer needs one.
+  - { recipe: llvm-release, version: '23',         os: ubuntu-24.04,     arch: x86_64 }
   # llvm-root: `version` doubles as a flavor selector and substitutes
   # into recipes/llvm-root/recipe.yaml's branch_template. Two flavors
   # track root-project/llvm-project's paired branches:

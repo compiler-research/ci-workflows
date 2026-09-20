@@ -6,7 +6,7 @@ top-level `bootstrap:` block to its recipe.yaml:
 
     bootstrap:
       recipe: llvm-release
-      version: '22'
+      version: '{version}'
 
 This script reads that block, computes the bootstrap cell's cache key
 (via setup-recipe/compute_key.py), downloads it via cache_io to a
@@ -14,13 +14,22 @@ known location, and prints the install bin/ on stdout. The publish-
 recipe action exports that path as BOOTSTRAP_CLANG_BIN, which the
 recipe's build.py picks up to drive its compile.
 
+`version` may be a literal ('22') or the `{version}` placeholder, which
+substitutes the consuming cell's own version — the same convention
+source.branch_template uses. A recipe published at more than one major
+needs the placeholder: its bootstrap has to move with it (llvm-msan 23
+cannot be built by the clang-22 bootstrap that llvm-msan 22 wants).
+
 Recipes without a bootstrap block: this script exits 0 silently and
 prints nothing — publish-recipe treats an empty BOOTSTRAP_CLANG_BIN
 as "no bootstrap required" (the asan and release recipes use that).
 
-Args: RECIPE_DIR OS ARCH [DOWNLOAD_DIR]
+Args: RECIPE_DIR VERSION OS ARCH [DOWNLOAD_DIR]
+      (argument order mirrors compute_key.py's RECIPE VERSION OS ARCH)
 
   RECIPE_DIR     Path to the recipe directory (contains recipe.yaml).
+  VERSION        The consuming cell's version, substituted into a
+                 `{version}` placeholder in the bootstrap block.
   OS, ARCH       Target OS/arch slugs for the cache key (must match
                  what publish-recipe used when warming the bootstrap
                  cell — same os/arch as the consuming recipe).
@@ -73,15 +82,25 @@ def _grep_yaml_block_field(yaml_path: Path, block: str,
     return None
 
 
+def _resolve_bootstrap_version(declared: str, recipe_version: str) -> str:
+    """Substitute the consuming cell's version into `declared`.
+
+    A literal ('22') passes through untouched, so recipes pinning one
+    bootstrap regardless of their own version keep working.
+    """
+    return declared.replace("{version}", recipe_version)
+
+
 def main() -> int:
-    if len(sys.argv) < 4 or len(sys.argv) > 5:
-        print("usage: fetch_bootstrap.py RECIPE_DIR OS ARCH [DOWNLOAD_DIR]",
-              file=sys.stderr)
+    if len(sys.argv) < 5 or len(sys.argv) > 6:
+        print("usage: fetch_bootstrap.py RECIPE_DIR VERSION OS ARCH "
+              "[DOWNLOAD_DIR]", file=sys.stderr)
         return 2
 
     recipe_dir = Path(sys.argv[1]).resolve()
-    os_slug, arch = sys.argv[2], sys.argv[3]
-    download_dir = (Path(sys.argv[4]) if len(sys.argv) == 5
+    recipe_version = sys.argv[2]
+    os_slug, arch = sys.argv[3], sys.argv[4]
+    download_dir = (Path(sys.argv[5]) if len(sys.argv) == 6
                     else recipe_dir / "_bootstrap").resolve()
 
     yaml_path = recipe_dir / "recipe.yaml"
@@ -102,6 +121,10 @@ def main() -> int:
         print(f"fetch_bootstrap: incomplete bootstrap block in {yaml_path}: "
               f"need both 'recipe' and 'version'", file=sys.stderr)
         return 1
+
+    bootstrap_version = _resolve_bootstrap_version(
+        bootstrap_version, recipe_version,
+    )
 
     # Compute the bootstrap cell's cache key off the local recipes/
     # tree -- same content-hash setup-recipe uses on consumers.

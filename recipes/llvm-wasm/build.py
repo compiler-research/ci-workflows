@@ -60,15 +60,36 @@ COMMON_FLAGS: list[str] = [
     "-DLLVM_INCLUDE_BENCHMARKS=OFF",
     "-DLLVM_INCLUDE_EXAMPLES=OFF",
     "-DLLVM_INCLUDE_TESTS=OFF",
+    "-DLLVM_INCLUDE_DOCS=OFF",
+    # The *_BUILD_* switches all mean "generate the targets but keep them
+    # out of the default build"; none of these binaries ship in the cell,
+    # which installs libraries, headers and cmake exports only. UTILS and
+    # LLD_BUILD_TOOLS complete the set emscripten-forge's llvm recipe
+    # uses -- lld's libraries (lldCommon, lldWasm) are unaffected, which
+    # is why that recipe keeps them in its distribution list while
+    # switching the tools off.
     "-DLLVM_BUILD_TOOLS=OFF",
+    "-DLLVM_BUILD_UTILS=OFF",
     "-DCLANG_BUILD_TOOLS=OFF",
+    "-DLLD_BUILD_TOOLS=OFF",
     "-DCLANG_ENABLE_STATIC_ANALYZER=OFF",
     # CLANG_ENABLE_ARCMT was deprecated in clang 22 (ARCMigrate removed);
     # CLANG_ENABLE_OBJC_REWRITER is the supported successor.
     "-DCLANG_ENABLE_OBJC_REWRITER=OFF",
     "-DCLANG_ENABLE_BOOTSTRAP=OFF",
-    # emscripten libc lacks wait4; redirect to the syscall wrapper.
-    "-DCMAKE_CXX_FLAGS=-Dwait4=__syscall_wait4",
+    # Not about position independence: the emscripten toolchain passes
+    # -fPIC itself, and wasm objects are relocatable regardless. This is
+    # the switch llvm/tools/CMakeLists.txt reads to decide whether to
+    # configure tools/lto ("if(CYGWIN OR NOT LLVM_ENABLE_PIC) set(
+    # LLVM_TOOL_LTO_BUILD Off)"), and that tool declares libLTO as a
+    # SHARED library, which a wasm target cannot produce. Through LLVM 22
+    # cmake only warned and silently built it STATIC; from LLVM 23 the
+    # same call is a hard error ("ADD_LIBRARY called with SHARED option
+    # but the target platform does not support dynamic linking") and the
+    # configure step dies. Turning the switch off is how upstream expects
+    # a shared-library-less target to opt out; emscripten-forge's llvm
+    # recipe does the same.
+    "-DLLVM_ENABLE_PIC=OFF",
     "-DCMAKE_C_FLAGS_RELEASE=-Oz -g0 -DNDEBUG",
     "-DCMAKE_CXX_FLAGS_RELEASE=-Oz -g0 -DNDEBUG",
     "-DLLVM_ENABLE_LTO=Full",
@@ -84,6 +105,49 @@ COMMON_FLAGS: list[str] = [
 # Build_LLVM_WASM non-cling path. cling rows (clang/cling/lld/
 # gtest_main) are not built today; see recipe.yaml.
 WASM_TARGETS: list[str] = ["libclang", "clangInterpreter", "clangStaticAnalyzerCore"]
+
+
+def _major(version: str) -> int:
+    """LLVM major from a cell version.
+
+    Cells carry a bare major ('23') today, but llvm-release already
+    publishes tag-shaped versions ('23.1.0-rc2') and a wasm cell could be
+    pinned the same way. Everything version-conditional here keys off the
+    major, so both spellings select the same patches and flags.
+    """
+    head = version.split(".")[0]
+    try:
+        return int(head)
+    except ValueError:
+        raise SystemExit(
+            f"build.py: RECIPE_VERSION={version!r} does not start with an "
+            f"LLVM major; expected '23' or '23.1.0-rc2'"
+        )
+
+
+def _lang_flags(major: int) -> list[str]:
+    """-DCMAKE_C_FLAGS / -DCMAKE_CXX_FLAGS for the wasm stage.
+
+    -Dwait4: emscripten libc lacks wait4; redirect to the syscall wrapper.
+
+    -mtail-call (LLVM >= 23 only): the wasm tail-call feature. Consumers
+    of the 23 cell -- CppInterOp's emscripten build and llvm's own
+    emscripten tests -- do not link against a toolchain built without it.
+    It is deliberately not applied to 22: that cell's consumers compile
+    their own objects without the feature today, and wasm-ld rejects a
+    link whose objects disagree about the enabled feature set, so adding
+    it there would break working rows to no purpose.
+    """
+    cflags = []
+    cxxflags = ["-Dwait4=__syscall_wait4"]
+    if major >= 23:
+        cflags.append("-mtail-call")
+        cxxflags.insert(0, "-mtail-call")
+    flags = []
+    if cflags:
+        flags.append("-DCMAKE_C_FLAGS=" + " ".join(cflags))
+    flags.append("-DCMAKE_CXX_FLAGS=" + " ".join(cxxflags))
+    return flags
 
 
 def install_emsdk(work_dir: Path, version: str) -> Path:
@@ -105,14 +169,17 @@ def install_emsdk(work_dir: Path, version: str) -> Path:
     return emsdk_dir
 
 
-def apply_patches(repo: Path, version: str) -> None:
-    """Apply patches/emscripten-clang{version}-*.patch in lexical order.
+def apply_patches(repo: Path, major: int) -> None:
+    """Apply patches/emscripten-clang{major}-*.patch in lexical order.
 
     No-op when the major has no matching patches (LLVM 19 today). Skip
     is a notice, not an error -- adding a new major without patches is
-    a valid state.
+    a valid state. Note that the sets are not cumulative: 23 needs only
+    the -mllvm/parseLLVMArgs patch, because the WebAssemblyTargetMachine
+    reordering the 22 set carries landed upstream in release/23.x and
+    re-applying it would abort the build.
     """
-    pattern = str(SCRIPT_DIR / "patches" / f"emscripten-clang{version}-*.patch")
+    pattern = str(SCRIPT_DIR / "patches" / f"emscripten-clang{major}-*.patch")
     patches = sorted(glob.glob(pattern))
     if not patches:
         print(f"build.py: no patches matched {pattern}; "
@@ -206,6 +273,7 @@ def main() -> int:
     work_dir = Path(os.environ["WORK_DIR"])
     out_dir = Path(os.environ["OUT_DIR"])
     version = os.environ["RECIPE_VERSION"]
+    major = _major(version)
     ncpus = os.environ["NCPUS"]
     # Default mirrors recipe.yaml's emsdk_version; publish-recipe could
     # also set it from a cell-level override later if needed.
@@ -222,7 +290,7 @@ def main() -> int:
     src_commit = llvm_build.record_src_commit(work_dir / "llvm-project")
 
     repo = work_dir / "llvm-project"
-    apply_patches(repo, version)
+    apply_patches(repo, major)
 
     install_root = out_dir / "install"
     native_install = install_root / "native_build"
@@ -238,6 +306,18 @@ def main() -> int:
          "-DLLVM_TARGETS_TO_BUILD=host",
          "-DCMAKE_BUILD_TYPE=Release",
          f"-DCMAKE_INSTALL_PREFIX={native_install}",
+         # tblgen links none of these, and letting cmake find them breaks
+         # the macOS leg: LLVM 22 turns each hit into a global -isystem,
+         # so the SDK (zlib, libedit) and Homebrew (zstd) include dirs
+         # land ahead of libc++'s own headers and Xcode 26's <cstddef>
+         # refuses to compile ("tried including <stddef.h> but didn't
+         # find libc++'s <stddef.h>"). LLVM 23 no longer leaks them,
+         # which is why only the 22 macOS cell failed. The wasm stage
+         # below already switches the same set off.
+         "-DLLVM_ENABLE_ZLIB=OFF",
+         "-DLLVM_ENABLE_ZSTD=OFF",
+         "-DLLVM_ENABLE_LIBXML2=OFF",
+         "-DLLVM_ENABLE_LIBEDIT=OFF",
          "-G", "Ninja",
          "../llvm"],
         check=True, cwd=native_build,
@@ -266,7 +346,7 @@ def main() -> int:
     # the issue CMAKE_BUILD_WITH_INSTALL_RPATH=ON fixes for the outer
     # build). CROSS_TOOLCHAIN_FLAGS_NATIVE forwards the same RPATH flag
     # as a defensive measure if any other nested configure still fires.
-    cmake_args = list(COMMON_FLAGS) + [
+    cmake_args = list(COMMON_FLAGS) + _lang_flags(major) + [
         f"-DCMAKE_INSTALL_PREFIX={wasm_install}",
         f"-DLLVM_TABLEGEN={native_install / 'bin' / 'llvm-tblgen'}",
         f"-DCLANG_TABLEGEN={native_install / 'bin' / 'clang-tblgen'}",

@@ -13,9 +13,12 @@ import fetch_bootstrap
 
 
 def _write_recipe_yaml(d: Path, *, with_bootstrap: bool = False,
-                       partial: bool = False) -> Path:
+                       partial: bool = False,
+                       bootstrap_version: str = "22") -> Path:
     """Write a minimal recipe.yaml. with_bootstrap adds a complete
     block; partial omits one of the two required subkeys.
+    bootstrap_version is written verbatim, so pass '{version}' to
+    exercise the placeholder path.
     """
     body = (
         "recipe: testrec\n"
@@ -27,7 +30,7 @@ def _write_recipe_yaml(d: Path, *, with_bootstrap: bool = False,
     if with_bootstrap:
         body += "bootstrap:\n  recipe: llvm-release\n"
         if not partial:
-            body += "  version: '22'\n"
+            body += f"  version: '{bootstrap_version}'\n"
     elif partial:
         # partial without with_bootstrap: only `version`, no `recipe`.
         body += "bootstrap:\n  version: '22'\n"
@@ -64,6 +67,34 @@ class GrepYamlBlockFieldTests(unittest.TestCase):
             )
 
 
+class ResolveBootstrapVersionTests(unittest.TestCase):
+    """The `{version}` placeholder in a bootstrap block.
+
+    A recipe published at more than one major has to bootstrap from a
+    different provider cell per major (llvm-msan 23 cannot be built by
+    the clang-22 bootstrap that llvm-msan 22 wants). A literal must
+    still pass through untouched so recipes pinning one bootstrap
+    regardless of their own version keep resolving.
+    """
+
+    def test_literal_passes_through(self):
+        self.assertEqual(
+            fetch_bootstrap._resolve_bootstrap_version("22", "23"), "22")
+
+    def test_placeholder_substitutes_recipe_version(self):
+        self.assertEqual(
+            fetch_bootstrap._resolve_bootstrap_version("{version}", "23"),
+            "23")
+
+    def test_placeholder_keeps_non_major_version_strings(self):
+        # Versions aren't always bare majors (llvm-release publishes
+        # '23.1.0-rc2'), so the substitution must be textual, not numeric.
+        self.assertEqual(
+            fetch_bootstrap._resolve_bootstrap_version(
+                "{version}", "23.1.0-rc2"),
+            "23.1.0-rc2")
+
+
 class MainTests(unittest.TestCase):
     """End-to-end tests of main() with cache_io and compute_key mocked.
 
@@ -91,7 +122,7 @@ class MainTests(unittest.TestCase):
             recipe_dir.mkdir()
             _write_recipe_yaml(recipe_dir)  # no bootstrap
             rc, out, err = self._run_main(
-                ["fetch_bootstrap.py", str(recipe_dir),
+                ["fetch_bootstrap.py", str(recipe_dir), "22",
                  "ubuntu-24.04", "x86_64"],
             )
             self.assertEqual(rc, 0)
@@ -104,7 +135,7 @@ class MainTests(unittest.TestCase):
             recipe_dir.mkdir()
             _write_recipe_yaml(recipe_dir, partial=True)  # version only
             rc, out, err = self._run_main(
-                ["fetch_bootstrap.py", str(recipe_dir),
+                ["fetch_bootstrap.py", str(recipe_dir), "22",
                  "ubuntu-24.04", "x86_64"],
             )
             self.assertEqual(rc, 1)
@@ -115,7 +146,7 @@ class MainTests(unittest.TestCase):
             recipe_dir = Path(d) / "rec"
             recipe_dir.mkdir()  # no recipe.yaml inside
             rc, out, err = self._run_main(
-                ["fetch_bootstrap.py", str(recipe_dir),
+                ["fetch_bootstrap.py", str(recipe_dir), "22",
                  "ubuntu-24.04", "x86_64"],
             )
             self.assertEqual(rc, 1)
@@ -123,6 +154,20 @@ class MainTests(unittest.TestCase):
 
     def test_bad_argv_returns_2(self):
         rc, _, err = self._run_main(["fetch_bootstrap.py", "only-one-arg"])
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+
+    def test_pre_version_argv_form_rejected(self):
+        """The old RECIPE_DIR OS ARCH [DOWNLOAD_DIR] form must not parse.
+
+        Four arguments used to be the full call. Under the current
+        signature they are RECIPE_DIR VERSION OS ARCH minus the arch,
+        so a caller left un-migrated has to fail here rather than
+        silently treat the os slug as the version.
+        """
+        rc, _, err = self._run_main(
+            ["fetch_bootstrap.py", "rec", "ubuntu-24.04", "x86_64"],
+        )
         self.assertEqual(rc, 2)
         self.assertIn("usage:", err)
 
@@ -141,7 +186,7 @@ class MainTests(unittest.TestCase):
             recipe_dir.mkdir()
             _write_recipe_yaml(recipe_dir, with_bootstrap=True)
             rc, _, err = self._run_main(
-                ["fetch_bootstrap.py", str(recipe_dir),
+                ["fetch_bootstrap.py", str(recipe_dir), "22",
                  "ubuntu-24.04", "x86_64"],
             )
             self.assertEqual(rc, 1)
@@ -175,7 +220,7 @@ class MainTests(unittest.TestCase):
             mock_dl.side_effect = _materialise
 
             rc, out, err = self._run_main(
-                ["fetch_bootstrap.py", str(recipe_dir),
+                ["fetch_bootstrap.py", str(recipe_dir), "22",
                  "ubuntu-24.04", "x86_64", str(download_dir)],
             )
             self.assertEqual(rc, 0, msg=err)
@@ -199,10 +244,49 @@ class MainTests(unittest.TestCase):
     @mock.patch("fetch_bootstrap.cache_io.cache_download")
     @mock.patch("fetch_bootstrap.cache_io.cache_probe")
     @mock.patch("fetch_bootstrap.cache_io.resolve_cache_base")
+    def test_templated_version_reaches_compute_key(
+        self, mock_resolve, mock_probe, mock_dl, mock_run,
+    ):
+        """`version: '{version}'` keys off the cell being built.
+
+        The failure this guards is silent rather than loud: an
+        unsubstituted '{version}' still produces a well-formed cache
+        key, so the publish would fetch-miss on a cell nobody has ever
+        published instead of naming the real provider.
+        """
+        mock_resolve.return_value = "file:///fake/cache"
+        mock_probe.return_value = True
+        mock_run.return_value = mock.Mock(stdout="key=fake-key\n")
+
+        def _materialise(base, key, out_dir):
+            bin_dir = Path(out_dir) / "install" / "bin"
+            bin_dir.mkdir(parents=True)
+            (bin_dir / "clang").write_text("#!/bin/false\n")
+            (bin_dir / "clang").chmod(0o755)
+        mock_dl.side_effect = _materialise
+
+        with tempfile.TemporaryDirectory() as d:
+            recipe_dir = Path(d) / "rec"
+            recipe_dir.mkdir()
+            _write_recipe_yaml(recipe_dir, with_bootstrap=True,
+                               bootstrap_version="{version}")
+            rc, _, err = self._run_main(
+                ["fetch_bootstrap.py", str(recipe_dir), "23",
+                 "ubuntu-24.04", "x86_64"],
+            )
+            self.assertEqual(rc, 0, msg=err)
+            args = mock_run.call_args.args[0]
+            self.assertIn("23", args)
+            self.assertNotIn("{version}", args)
+
+    @mock.patch("fetch_bootstrap.subprocess.run")
+    @mock.patch("fetch_bootstrap.cache_io.cache_download")
+    @mock.patch("fetch_bootstrap.cache_io.cache_probe")
+    @mock.patch("fetch_bootstrap.cache_io.resolve_cache_base")
     def test_default_download_dir_is_recipe_sibling(
         self, mock_resolve, mock_probe, mock_dl, mock_run,
     ):
-        """4-arg form: download lands at <recipe_dir>/_bootstrap.
+        """No-DOWNLOAD_DIR form: download lands at <recipe_dir>/_bootstrap.
 
         This is the path publish-recipe.yml's pre-build step uses by
         default; covered explicitly so a future refactor of that
@@ -225,7 +309,7 @@ class MainTests(unittest.TestCase):
             mock_dl.side_effect = _materialise
 
             rc, out, err = self._run_main(
-                ["fetch_bootstrap.py", str(recipe_dir),
+                ["fetch_bootstrap.py", str(recipe_dir), "22",
                  "ubuntu-24.04", "x86_64"],
             )
             self.assertEqual(rc, 0, msg=err)
@@ -259,7 +343,7 @@ class MainTests(unittest.TestCase):
             recipe_dir.mkdir()
             _write_recipe_yaml(recipe_dir, with_bootstrap=True)
             rc, _, err = self._run_main(
-                ["fetch_bootstrap.py", str(recipe_dir),
+                ["fetch_bootstrap.py", str(recipe_dir), "22",
                  "ubuntu-24.04", "x86_64"],
             )
             self.assertEqual(rc, 1)
