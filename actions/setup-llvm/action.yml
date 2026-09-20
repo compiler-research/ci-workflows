@@ -213,11 +213,15 @@ runs:
           exit 1
         fi
         sudo apt-get update -qq
-        # Try the ubuntu archive directly. `apt-cache show` is a
-        # release-data lookup (no install side effects, no sudo
-        # password prompt under set -e), so we can probe whether the
-        # archive has llvm-N-dev before deciding to add apt-llvm.org.
-        if ! apt-cache show "llvm-${VERSION}-dev" >/dev/null 2>&1; then
+        # Whether a configured source offers a package. `apt-cache show`
+        # and `apt-cache policy` answer from the dpkg status too, so a
+        # runner with a hand-installed llvm-N reads as an archive that
+        # serves that major: the source below is never added and the rest
+        # of the major stays uninstallable. madison reads the lists alone.
+        offered() { apt-cache madison "$1" 2>/dev/null | grep -q .; }
+        # Try the ubuntu archive directly, before deciding to add
+        # apt-llvm.org.
+        if ! offered "llvm-${VERSION}-dev"; then
           echo "::notice::llvm-${VERSION}-dev not in ${codename} archive; adding apt-llvm.org"
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
             | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
@@ -231,7 +235,7 @@ runs:
         # libpolly-N-dev: missing from some (codename, major) combos
         # (e.g. jammy/llvm-13); apt-llvm.org carries it. Probe-and-skip
         # so old-jammy rows don't fail on a Polly-less archive.
-        if apt-cache show "libpolly-${VERSION}-dev" >/dev/null 2>&1; then
+        if offered "libpolly-${VERSION}-dev"; then
           sudo apt-get install -y "libpolly-${VERSION}-dev"
         else
           echo "::notice::libpolly-${VERSION}-dev not packaged for ${codename}; skipping (harmless unless the consumer links Polly)"

@@ -275,6 +275,77 @@ jobs:
               --devshell-script "$RUNNER_TEMP/smoke.sh" \
               "$COORD"
 
+  # setup-llvm's system flavor adds apt-llvm.org only when the distro
+  # archive does not serve the major. Ask that with the installed
+  # packages counted in and a runner already carrying llvm-N reads as an
+  # archive that serves it: the source is never added, and the rest of
+  # that major cannot be installed -- which is how clad's coverage runner
+  # came to run no OpenMP test at all. Seed that state, then ask for a
+  # package of the major the runner does not have.
+  setup-llvm-adds-the-source-it-needs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pick a major the image does not serve itself
+        id: pick
+        run: |
+          set -euo pipefail
+          codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-}")"
+          sudo apt-get update -qq
+          # The state exists only for a major the archive lacks, and which
+          # majors those are moves with every release, so read it off the
+          # runner rather than pinning it. Lowest first: the newest majors
+          # are the ones apt-llvm.org is still filling in.
+          for v in $(seq 14 40); do
+            apt-cache madison "llvm-$v-dev" 2>/dev/null | grep -q . && continue
+            curl -sfIL -o /dev/null \
+              "https://apt.llvm.org/$codename/dists/llvm-toolchain-$codename-$v/Release" \
+              || continue
+            echo "major=$v" >> "$GITHUB_OUTPUT"
+            echo "codename=$codename" >> "$GITHUB_OUTPUT"
+            echo "::notice::seeding with llvm-$v on $codename"
+            exit 0
+          done
+          echo "::error::no major that apt-llvm.org serves for $codename and the archive does not"
+          exit 1
+      - name: Install it by hand, then take its source away
+        env:
+          V: ${{ steps.pick.outputs.major }}
+          CODENAME: ${{ steps.pick.outputs.codename }}
+        run: |
+          set -euo pipefail
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/$CODENAME/ llvm-toolchain-$CODENAME-$V main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "llvm-$V-dev" "libclang-$V-dev" "clang-$V"
+          sudo rm -f /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          if apt-cache madison "libomp-$V-dev" 2>/dev/null | grep -q .; then
+            echo "::error::seeding failed: libomp-$V-dev still has a source"
+            exit 1
+          fi
+      - uses: ./actions/setup-llvm
+        with:
+          version: ${{ steps.pick.outputs.major }}
+          os: ubuntu-24.04
+          flavor: system
+      - name: The rest of the major is installable again
+        env:
+          V: ${{ steps.pick.outputs.major }}
+        run: |
+          set -euo pipefail
+          if ! apt-cache madison "libomp-$V-dev" 2>/dev/null | grep -q .; then
+            echo "::error::setup-llvm left llvm-$V without an apt source, so" \
+                 "anything of that major the runner lacks cannot be installed"
+            exit 1
+          fi
+          sudo apt-get install -y -qq "libomp-$V-dev"
+          printf '#include <omp.h>\nint main(){return omp_get_max_threads();}\n' > /tmp/t.cpp
+          "/usr/lib/llvm-$V/bin/clang++" -fopenmp -fsyntax-only /tmp/t.cpp
+
   # Cross-OS unit tests for every Python module in the recipe pipeline.
   # Each function has minimal-effective tests (happy path + targeted
   # edge cases) — the publish-dryrun matrix is the broader integration
