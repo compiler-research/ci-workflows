@@ -439,6 +439,15 @@ manifest, shallow-clones the recipe's source at the manifest's
 pinned `SRC_COMMIT`, and drops you into a long-lived container
 ready for incremental rebuilds against the producer's ccache.
 
+The sibling ccache has a second consumer, in CI rather than at a
+prompt: `setup-llvm`'s `fetch-ccache` restores it into a workflow, for
+a row that has to compile the recipe's sources again in a
+configuration the install tree cannot express. It mirrors the
+producer's `hash_dir`/`base_dir` settings the way `repro-config` does,
+and leaves the two things it cannot control -- the source's relative
+path and the configure flags -- to the consumer. See the README
+section for what a row has to match.
+
 This works for **any** recipe, not only the LLVM ones. The source
 directory is derived from the recipe's `source.repo` (so
 `llvm-*` land in `_recipe_work/llvm-project`, `kokkos` in

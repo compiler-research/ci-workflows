@@ -109,6 +109,16 @@ inputs:
     required: false
     default: 'main'
     description: 'ci-workflows ref for setup-recipe to read recipes/ from.'
+  fetch-ccache:
+    required: false
+    default: 'false'
+    description: |
+      Forwarded to setup-recipe. 'true' also restores the recipe
+      build's ccache and points ccache at it, for a consumer that has
+      to compile LLVM again in a configuration the install tree cannot
+      express -- clad in tree, or a multi-config generator. Requires
+      ccache on PATH, and the source at the same path relative to the
+      workspace as the recipe put it. No-op on Windows cells.
   cache-base:
     required: false
     default: ''
@@ -130,6 +140,23 @@ outputs:
   clang-dir:
     description: 'ClangConfig.cmake directory ($prefix/lib/cmake/clang).'
     value: ${{ steps.finalize.outputs.clang-dir }}
+  ccache-dir:
+    description: |
+      Restored ccache directory, empty unless fetch-ccache was asked
+      for and a sibling existed.
+    value: ${{ steps.recipe.outputs.ccache-dir }}
+  manifest:
+    description: |
+      Path to the restored artifact's manifest, empty unless
+      fetch-ccache was asked for. Carries the cmake_args a consumer
+      replays and the source commit it builds.
+    value: ${{ steps.recipe.outputs.manifest }}
+  src-commit:
+    description: |
+      The LLVM commit the artifact was built from, which a consumer
+      rebuilding those sources has to check out. Set when fetch-ccache
+      restored one.
+    value: ${{ steps.recipe.outputs.src-commit }}
 
 runs:
   using: composite
@@ -305,6 +332,7 @@ runs:
         build-on-miss: ${{ inputs.build-on-miss }}
         ref:           ${{ inputs.ref }}
         cache-base:    ${{ inputs.cache-base }}
+        fetch-ccache:  ${{ inputs.fetch-ccache }}
 
     # Cling-on-top: only for flavor=cling. Builds root-project/cling
     # against the LLVM tree the recipe step produced and installs
