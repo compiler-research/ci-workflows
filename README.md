@@ -221,6 +221,48 @@ devshell starts cold and without a checkout -- see
 Linux-only for now (Ubuntu cells); macOS hosts work via the bundled
 Linux container, with the platform-mismatch overhead under Rosetta.
 
+## Reusing that ccache from a workflow: `fetch-ccache`
+
+The same sibling snapshot is what `setup-llvm`'s `fetch-ccache` input
+restores, for a consumer that cannot use the install tree because it
+has to compile LLVM's own sources again -- built in tree beside the
+consumer (`LLVM_EXTERNAL_PROJECTS`), or with a generator the artifact
+was not produced with. The rebuild then costs minutes rather than the
+half-hour a cold one does.
+
+```yaml
+- uses: compiler-research/ci-workflows/actions/setup-llvm@main
+  with:
+    version: '21'
+    os: ubuntu-24.04
+    fetch-ccache: 'true'
+```
+
+Three things have to hold or the lookups miss, and a miss is silent --
+the build simply takes half an hour:
+
+* **ccache on PATH** before the action runs. It says so and restores
+  nothing otherwise.
+* **The source at the producer's relative path.** `publish-recipe`
+  hashes with `hash_dir=false` and `base_dir` at its workspace root,
+  so an entry is keyed on the path relative to that root. The recipes
+  clone to `_recipe_work/<name>`, so a consumer wants
+  `$GITHUB_WORKSPACE/_recipe_work/<name>` too. The action reads the
+  producer's own ccache settings from the manifest and applies them;
+  the layout is the consumer's to match.
+* **The producer's compile flags.** ccache hashes the whole command
+  line, so replay the manifest's `cmake_args` and add to them rather
+  than writing a configure of your own -- the same rule
+  `scripts/repro-config` follows for the devshell.
+
+Worth copying the devshell's check too: compile one TU every LLVM
+build has (`lib/Support/CMakeFiles/LLVMSupport.dir/Allocator.cpp.o`)
+and fail if `ccache --show-stats` reports no hits. Otherwise the row
+still passes and only the clock says something is wrong.
+
+No sibling is published for Windows cells, so `fetch-ccache` is a
+no-op with a notice there.
+
 ## Layout
 
 ```

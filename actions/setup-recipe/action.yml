@@ -55,6 +55,17 @@ inputs:
       Ref of compiler-research/ci-workflows to read recipes/ from
       when computing the key. Pin to a sha while iterating; bump to
       a tag once the contract is stable.
+  fetch-ccache:
+    required: false
+    default: 'false'
+    description: |
+      'true' also restores the sibling ccache snapshot published
+      beside the install tree, and points ccache at it. For a
+      consumer that has to build the recipe's own sources again in
+      a configuration the install cannot express -- an in-tree
+      build, another generator -- which is otherwise a cold
+      half-hour. Requires ccache on PATH. No sibling is published
+      for Windows cells, where this is a no-op with a notice.
 
 outputs:
   path:
@@ -67,8 +78,22 @@ outputs:
     description: 'Computed cache key'
     value: ${{ steps.compute-key.outputs.key }}
   src-commit:
-    description: 'Source HEAD sha (only set on inline build path)'
+    description: |
+      Source HEAD sha. Set by an inline build, and by fetch-ccache from
+      the manifest of the artifact it restored -- which is the commit a
+      consumer has to check out to reuse those objects.
     value: ${{ env.SRC_COMMIT }}
+  ccache-dir:
+    description: |
+      Restored ccache directory, empty unless fetch-ccache was asked
+      for and a sibling existed.
+    value: ${{ steps.ccache.outputs.dir }}
+  manifest:
+    description: |
+      Path to the restored artifact's manifest, empty unless
+      fetch-ccache was asked for. Carries the cmake_args a consumer
+      replays and the source commit it builds.
+    value: ${{ steps.ccache.outputs.manifest }}
 
 runs:
   using: composite
@@ -153,6 +178,91 @@ runs:
         else
           echo "hit=false" >> "$GITHUB_OUTPUT"
         fi
+
+    # The recipe build's own ccache, published beside the install tree under
+    # the same key. A consumer that has to compile the recipe's sources again
+    # -- in a configuration an install tree cannot express -- reads it instead
+    # of paying for the build a second time.
+    #
+    # publish-recipe hashed its entries with hash_dir off and base_dir at its
+    # workspace root, so an entry is keyed on the path relative to that root.
+    # What is left for the consumer is the source's own place in that root: it
+    # has to sit where the recipe put it, or every lookup misses.
+    - name: Restore the recipe's ccache
+      id: ccache
+      if: inputs.fetch-ccache == 'true' && steps.probe.outputs.hit == 'true'
+      shell: bash
+      env:
+        KEY: ${{ steps.compute-key.outputs.key }}
+        BASE: ${{ steps.probe.outputs.base }}
+      run: |
+        set -euo pipefail
+        # Every path answers, so a consumer reading the output can tell
+        # "restored" from "asked for and not there".
+        nothing() { echo "dir=" >> "$GITHUB_OUTPUT"; exit 0; }
+        if [ "$RUNNER_OS" = Windows ]; then
+          echo "::notice title=setup-recipe::no ccache sibling is published for Windows cells; nothing restored."
+          nothing
+        fi
+        if ! command -v ccache >/dev/null 2>&1; then
+          echo "::warning title=setup-recipe::fetch-ccache asked for but ccache is not on PATH; nothing restored."
+          nothing
+        fi
+        cd __ci_workflows__
+        if ! python3 actions/lib/cache_io.py probe "$BASE" "${KEY}.ccache"; then
+          echo "::warning title=setup-recipe::no ccache sibling for ${KEY}; a rebuild starts cold."
+          nothing
+        fi
+        rm -rf _ccache_dl
+        mkdir -p _ccache_dl
+        python3 actions/lib/cache_io.py download "$BASE" "${KEY}.ccache" _ccache_dl
+        dir="${GITHUB_WORKSPACE}/.ccache"
+        rm -rf "$dir"
+        mv _ccache_dl/.ccache "$dir"
+        rm -rf _ccache_dl
+        # The producer's own settings, read from the manifest published beside
+        # the asset. compiler_check is the version string of whatever compiler
+        # the recipe was built with, which this runner cannot be asked for: get
+        # it wrong and every lookup misses without saying so. base_dir is the
+        # exception -- the producer's is its workspace, ours is ours.
+        manifest="${GITHUB_WORKSPACE}/.recipe-manifest.json"
+        url="${BASE%/}/${KEY}.manifest.json"
+        case "$url" in
+          file://*) cp "${url#file://}" "$manifest" ;;
+          *)        curl -fsSL "$url" -o "$manifest" ;;
+        esac
+        mf() {
+          python3 -c 'import json,sys,functools; print(functools.reduce(lambda a,k:(a or {}).get(k) or "", sys.argv[2].split("."), json.load(open(sys.argv[1]))) or "")' "$manifest" "$1"
+        }
+        cc_check="$(mf build_env.ccache.compiler_check)"
+        hash_dir="$(mf build_env.ccache.hash_dir)"
+        # The commit the objects were produced from. A consumer building those
+        # sources again has to check out this one: ccache keys on preprocessed
+        # output, so another commit of the same branch is another cache.
+        src_commit="$(mf source.commit)"
+        if [ -n "$src_commit" ] && [ "$src_commit" != unknown ]; then
+          echo "SRC_COMMIT=$src_commit" >> "$GITHUB_ENV"
+        fi
+        export CCACHE_DIR="$dir"
+        ccache --set-config="base_dir=${GITHUB_WORKSPACE}"
+        ccache --set-config="hash_dir=${hash_dir:-false}"
+        if [ -n "$cc_check" ] && [ "$cc_check" != unknown ]; then
+          ccache --set-config="compiler_check=$cc_check"
+        else
+          echo "::warning title=setup-recipe::the manifest records no compiler_check; lookups miss unless this runner's compiler matches the recipe's."
+        fi
+        if [ "${hash_dir:-false}" != false ]; then
+          echo "::warning title=setup-recipe::the recipe hashed with hash_dir on, so its entries are bound to its own paths; expect misses."
+        fi
+        {
+          echo "CCACHE_DIR=$dir"
+          echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+        } >> "$GITHUB_ENV"
+        {
+          echo "dir=$dir"
+          echo "manifest=$manifest"
+        } >> "$GITHUB_OUTPUT"
+        echo "::notice title=setup-recipe::restored $(du -sh "$dir" | cut -f1) of the recipe build's ccache."
 
     - name: Ensure zstd (Windows)
       if: steps.probe.outputs.hit == 'true' && runner.os == 'Windows'
