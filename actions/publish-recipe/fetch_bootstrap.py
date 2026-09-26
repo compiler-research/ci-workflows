@@ -40,7 +40,6 @@ Args: RECIPE_DIR VERSION OS ARCH [DOWNLOAD_DIR]
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -50,45 +49,15 @@ from typing import Optional
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "actions" / "lib"))
+sys.path.insert(0, str(REPO_ROOT / "actions" / "setup-recipe"))
 import cache_io  # noqa: E402
-
-
-def _grep_yaml_block_field(yaml_path: Path, block: str,
-                           field: str) -> Optional[str]:
-    """Return `<block>.<field>` value from a YAML file (no parser).
-
-    Tolerates two-space indented field lines under a top-level block
-    that ends with ':'. Same shape as build_manifest.py's
-    _grep_yaml_value, extended to one level of nesting.
-    """
-    try:
-        text = yaml_path.read_text()
-    except OSError:
-        return None
-    in_block = False
-    block_re = re.compile(rf"^\s*{re.escape(block)}\s*:\s*$")
-    field_re = re.compile(rf"^\s+{re.escape(field)}\s*:\s*(.*?)\s*$")
-    top_re = re.compile(r"^[A-Za-z_]+\s*:")
-    for line in text.splitlines():
-        if in_block and top_re.match(line):
-            in_block = False
-        if block_re.match(line):
-            in_block = True
-            continue
-        if in_block:
-            m = field_re.match(line)
-            if m:
-                return m.group(1).strip().strip('"').strip("'")
-    return None
-
-
-def _resolve_bootstrap_version(declared: str, recipe_version: str) -> str:
-    """Substitute the consuming cell's version into `declared`.
-
-    A literal ('22') passes through untouched, so recipes pinning one
-    bootstrap regardless of their own version keep working.
-    """
-    return declared.replace("{version}", recipe_version)
+# compute_key folds the bootstrap into a dependent's key and reads the
+# same block. One parser for both: read by two, they drift, and what
+# drifts is a key that stops moving when what it was built with does.
+from bootstrap_block import (  # noqa: E402
+    grep_yaml_block_field as _grep_yaml_block_field,
+    resolve_bootstrap_version as _resolve_bootstrap_version,
+)
 
 
 def main() -> int:
@@ -144,7 +113,14 @@ def main() -> int:
         return 1
     key = key_line[len("key="):]
 
-    base = cache_io.resolve_cache_base(os.environ.get("RECIPE_CACHE_BASE"))
+    # Asked for separately, because a pull request reads its bootstrap from
+    # the copy it just staged while the recipe being built still belongs to
+    # the cache. One variable for both aimed publish-recipe's "already
+    # published?" probe at the staging directory, where a recipe's own asset
+    # is never found.
+    base = cache_io.resolve_cache_base(
+        os.environ.get("BOOTSTRAP_CACHE_BASE")
+        or os.environ.get("RECIPE_CACHE_BASE"))
     if not cache_io.cache_probe(base, key):
         print(f"fetch_bootstrap: bootstrap cell not in cache: "
               f"{bootstrap_recipe} {bootstrap_version} {os_slug} {arch} "

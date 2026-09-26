@@ -15,6 +15,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import bootstrap_block
 import compute_key
 
 
@@ -238,3 +239,96 @@ class BashParityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BootstrapTests(unittest.TestCase):
+    """A recipe built on another is keyed on that one too.
+
+    Without it a dependent's key stands still while the bootstrap it is
+    linked against changes: the published artifact keeps answering "already
+    built" for content it was not built from, and a pull request editing only
+    the bootstrap never rebuilds anything on top of it.
+    """
+
+    def _tree(self, d: Path, *, bootstrap_version: str = "{version}",
+              lr_build: str = "#!/usr/bin/env bash\nexit 0\n") -> Path:
+        recipes = d / "recipes"
+        _make_recipe(recipes, "llvm-release", build_sh=lr_build)
+        _make_recipe(
+            recipes, "dep",
+            yaml=("recipe: dep\n"
+                  "bootstrap:\n"
+                  "  recipe: llvm-release\n"
+                  f"  version: '{bootstrap_version}'\n"))
+        (d / "lib").mkdir()
+        return recipes
+
+    def _key(self, recipes: Path, d: Path, recipe: str = "dep") -> str:
+        return compute_key.compute_key(
+            recipe, "22", "ubuntu-24.04", "x86_64",
+            recipe_root=str(recipes), lib_root=str(d / "lib"))
+
+    def test_bootstrap_edit_moves_the_dependent_key(self):
+        with tempfile.TemporaryDirectory() as raw:
+            d = Path(raw)
+            recipes = self._tree(d)
+            before = self._key(recipes, d)
+            (recipes / "llvm-release" / "build.sh").write_text(
+                "#!/usr/bin/env bash\nexit 1\n")
+            self.assertNotEqual(before, self._key(recipes, d))
+
+    def test_recipe_without_bootstrap_is_unaffected(self):
+        """The hash of a recipe that declares none must not shift."""
+        with tempfile.TemporaryDirectory() as raw:
+            d = Path(raw)
+            recipes = self._tree(d)
+            before = self._key(recipes, d, "llvm-release")
+            (recipes / "dep" / "recipe.yaml").write_text("recipe: dep\n")
+            self.assertEqual(before, self._key(recipes, d, "llvm-release"))
+
+    def test_placeholder_resolves_against_the_dependent_version(self):
+        """The cell folded in is the one the build will actually fetch.
+
+        Asserted on the resolution rather than on two keys: recipe.yaml is
+        itself hashed, so two recipes declaring the bootstrap differently
+        have different keys whatever the placeholder does.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            d = Path(raw)
+            recipes = self._tree(d)
+            self.assertEqual(
+                bootstrap_block.bootstrap_cell(recipes / "dep", "23"),
+                ("llvm-release", "23"))
+            self.assertEqual(
+                bootstrap_block.bootstrap_cell(recipes / "llvm-release", "23"),
+                None)
+
+    def test_cycle_is_reported_not_recursed(self):
+        with tempfile.TemporaryDirectory() as raw:
+            d = Path(raw)
+            recipes = d / "recipes"
+            _make_recipe(recipes, "a",
+                         yaml=("recipe: a\nbootstrap:\n"
+                               "  recipe: b\n  version: '22'\n"))
+            _make_recipe(recipes, "b",
+                         yaml=("recipe: b\nbootstrap:\n"
+                               "  recipe: a\n  version: '22'\n"))
+            (d / "lib").mkdir()
+            with self.assertRaises(ValueError) as cm:
+                compute_key.compute_key(
+                    "a", "22", "ubuntu-24.04", "x86_64",
+                    recipe_root=str(recipes), lib_root=str(d / "lib"))
+            self.assertIn("bootstrap cycle", str(cm.exception))
+
+    def test_half_written_block_is_an_error(self):
+        with tempfile.TemporaryDirectory() as raw:
+            d = Path(raw)
+            recipes = d / "recipes"
+            _make_recipe(recipes, "dep",
+                         yaml="recipe: dep\nbootstrap:\n  recipe: llvm-release\n")
+            (d / "lib").mkdir()
+            with self.assertRaises(ValueError):
+                compute_key.compute_key(
+                    "dep", "22", "ubuntu-24.04", "x86_64",
+                    recipe_root=str(recipes), lib_root=str(d / "lib"))
+

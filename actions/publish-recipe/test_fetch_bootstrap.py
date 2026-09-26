@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
 import tempfile
 import unittest
@@ -193,6 +194,65 @@ class MainTests(unittest.TestCase):
             self.assertIn("not in cache", err)
             self.assertIn("Publish that cell first", err)
             mock_dl.assert_not_called()
+
+    @mock.patch("fetch_bootstrap.subprocess.run")
+    @mock.patch("fetch_bootstrap.cache_io.cache_download")
+    @mock.patch("fetch_bootstrap.cache_io.cache_probe")
+    @mock.patch("fetch_bootstrap.cache_io.resolve_cache_base")
+    def test_bootstrap_base_wins_over_recipe_base(
+        self, mock_resolve, mock_probe, mock_dl, mock_run,
+    ):
+        """Where the bootstrap is read from is asked for separately.
+
+        A pull request stages the bootstrap it just built locally, while the
+        recipe being built still belongs to the real cache. Reading both from
+        RECIPE_CACHE_BASE aimed publish-recipe's "already published?" probe
+        at the staging directory, where the recipe's own asset is never
+        found, so every dependent rebuilt on every pull request.
+        """
+        mock_resolve.return_value = "file:///fake/cache"
+        mock_probe.return_value = True
+        mock_run.return_value = mock.Mock(stdout="key=fake-key\n")
+
+        with tempfile.TemporaryDirectory() as d:
+            recipe_dir = Path(d) / "rec"
+            recipe_dir.mkdir()
+            _write_recipe_yaml(recipe_dir, with_bootstrap=True)
+
+            def _materialise(base, key, out_dir):
+                bin_dir = Path(out_dir) / "install" / "bin"
+                bin_dir.mkdir(parents=True)
+                (bin_dir / "clang").write_text("#!/bin/false\n")
+                (bin_dir / "clang").chmod(0o755)
+            mock_dl.side_effect = _materialise
+
+            env = {"RECIPE_CACHE_BASE": "file:///the/cache",
+                   "BOOTSTRAP_CACHE_BASE": "file:///staged/bootstrap"}
+            with mock.patch.dict(os.environ, env):
+                rc, out, err = self._run_main(
+                    ["fetch_bootstrap.py", str(recipe_dir), "22",
+                     "ubuntu-24.04", "x86_64", str(Path(d) / "dl")],
+                )
+            self.assertEqual(rc, 0, msg=err)
+            mock_resolve.assert_called_once_with("file:///staged/bootstrap")
+
+        # With only the one variable set it still answers, so a caller that
+        # needs no staging directory is unaffected.
+        mock_resolve.reset_mock()
+        with tempfile.TemporaryDirectory() as d:
+            recipe_dir = Path(d) / "rec"
+            recipe_dir.mkdir()
+            _write_recipe_yaml(recipe_dir, with_bootstrap=True)
+            with mock.patch.dict(os.environ,
+                                 {"RECIPE_CACHE_BASE": "file:///the/cache"},
+                                 clear=False):
+                os.environ.pop("BOOTSTRAP_CACHE_BASE", None)
+                rc, out, err = self._run_main(
+                    ["fetch_bootstrap.py", str(recipe_dir), "22",
+                     "ubuntu-24.04", "x86_64", str(Path(d) / "dl")],
+                )
+            self.assertEqual(rc, 0, msg=err)
+            mock_resolve.assert_called_once_with("file:///the/cache")
 
     @mock.patch("fetch_bootstrap.subprocess.run")
     @mock.patch("fetch_bootstrap.cache_io.cache_download")

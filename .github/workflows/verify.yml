@@ -498,6 +498,28 @@ jobs:
   # llvm-release recipe. publish-recipe.yml's validate-on-pr-* already
   # builds + caches the recipe end-to-end at PR time, which covers
   # the recipe path indirectly.
+  # One line of YAML decides whether a dependent cell is ever skipped, and no
+  # test that runs a build can see it. The dependent leg stages the bootstrap
+  # it just built and points fetch_bootstrap at it; pointing RECIPE_CACHE_BASE
+  # there instead also aims publish-recipe's "already published?" probe at a
+  # directory holding only a bootstrap, so it never hits and every dependent
+  # rebuilds on every pull request -- half an hour of msan, silently.
+  dependent-leg-probes-the-real-cache:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: The staging directory is named to fetch_bootstrap alone
+        run: |
+          set -euo pipefail
+          fail() { echo "::error file=$w::$1"; exit 1; }
+          w=.github/workflows/publish-recipe.yml
+          leg='.jobs["validate-on-pr-dependent"].steps[]'
+          yq -e "$leg | select(.env.BOOTSTRAP_CACHE_BASE)" "$w" >/dev/null \
+            || fail "the dependent leg does not point fetch_bootstrap at the staged bootstrap"
+          if yq -e "$leg | select(.env.RECIPE_CACHE_BASE)" "$w" >/dev/null 2>&1; then
+            fail "the dependent leg sets RECIPE_CACHE_BASE, which also redirects the skip probe"
+          fi
+
   setup-llvm-system-smoke:
     runs-on: ubuntu-24.04
     strategy:
