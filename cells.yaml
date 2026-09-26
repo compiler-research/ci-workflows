@@ -74,10 +74,10 @@ cells:
   # target 14.0. Versions are exact release tags — bump every row
   # together; the wheel-image workflow bakes the linux x86_64 artifact
   # into the GHCR toolchain image afterwards.
-  - { recipe: llvm-wheel, version: '21.1.8',        os: ubuntu-24.04,     arch: x86_64  }
-  - { recipe: llvm-wheel, version: '21.1.8',        os: ubuntu-24.04-arm, arch: aarch64 }
-  - { recipe: llvm-wheel, version: '21.1.8',        os: macos-26,         arch: arm64   }
-  - { recipe: llvm-wheel, version: '21.1.8',        os: macos-26-intel,   arch: x86_64  }
+  - { recipe: llvm-wheel, version: '22.1.8',        os: ubuntu-24.04,     arch: x86_64  }
+  - { recipe: llvm-wheel, version: '22.1.8',        os: ubuntu-24.04-arm, arch: aarch64 }
+  - { recipe: llvm-wheel, version: '22.1.8',        os: macos-26,         arch: arm64   }
+  - { recipe: llvm-wheel, version: '22.1.8',        os: macos-26-intel,   arch: x86_64  }
   # cpython-debug: --with-pydebug + --with-trace-refs + --with-assertions.
   # Linux x86_64 only -- macOS / Windows have stock CPython via the
   # platform package manager; the CI cost of building debug Python on
