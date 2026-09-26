@@ -189,7 +189,7 @@ runs:
         if ! gh release view "$tag" -R "$owner_repo" >/dev/null 2>&1; then
           gh release create "$tag" -R "$owner_repo" \
             --title "Recipe cache" \
-            --notes "Rolling cache of prebuilt recipe artifacts. Each asset is keyed by sha256 of (recipe.yaml, build.{sh,py}, patches, version, os, arch). See <key>.manifest.json for the inputs that produced any given <key>.tar.zst."
+            --notes "Rolling cache of prebuilt recipe artifacts. Each asset is keyed by sha256 of (recipe.yaml, build.{sh,py}, patches, version, os, arch, and the key of the cell a recipe bootstraps from). See <key>.manifest.json for the inputs that produced any given <key>.tar.zst."
         fi
 
     # Cross-recipe build-time dependency. Recipes that need a

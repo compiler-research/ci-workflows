@@ -18,6 +18,9 @@ Hash inputs that *should* invalidate when changed:
     component list, smoke checks. Reshape these and the published
     artifact reshapes too; the key must move so old cells stop
     shadowing new code. Test files and __pycache__ are excluded.)
+  - the key of the cell named by `bootstrap:`, for a recipe built on top
+    of another. An artifact linked against a different bootstrap clang is
+    a different artifact, and nothing in this recipe's own files says so.
   - the literal version/os/arch tuple
 
 What we deliberately do NOT include:
@@ -36,6 +39,8 @@ from __future__ import annotations
 import hashlib
 import sys
 from pathlib import Path
+
+import bootstrap_block
 from typing import Optional
 
 
@@ -87,8 +92,13 @@ def _lib_hash_lines(lib_root: Path) -> list[str]:
 
 def compute_key(recipe: str, version: str, os_: str, arch: str,
                 recipe_root: str = "recipes",
-                lib_root: str = "actions/lib") -> str:
-    """Return the full cache key for the given (recipe, version, os, arch)."""
+                lib_root: str = "actions/lib",
+                _chain: tuple = ()) -> str:
+    """Return the full cache key for the given (recipe, version, os, arch).
+
+    `_chain` is the cells already being keyed, so a bootstrap that points
+    back into its own chain is reported rather than recursed forever.
+    """
     recipe_dir = Path(recipe_root) / recipe
     if not recipe_dir.is_dir():
         raise FileNotFoundError(
@@ -113,6 +123,22 @@ def compute_key(recipe: str, version: str, os_: str, arch: str,
             parts.append(f"{rel} {_file_hash(path)}\n")
 
     parts.extend(_lib_hash_lines(Path(lib_root)))
+
+    # A recipe built on top of another is a different artifact once that other
+    # one changes, and hashing this recipe's own files cannot see that. Fold
+    # the bootstrap's key in, so every "is this already published?" answers
+    # correctly without anything having to know what a bootstrap is.
+    cell = bootstrap_block.bootstrap_cell(recipe_dir, version)
+    if cell is not None:
+        here = (recipe, version, os_, arch)
+        chain = _chain + (here,)
+        if cell + (os_, arch) in chain:
+            raise ValueError(
+                "compute_key: bootstrap cycle: "
+                + " -> ".join(f"{r}/{v}" for r, v, _o, _a in chain)
+                + f" -> {cell[0]}/{cell[1]}")
+        parts.append("BOOTSTRAP=" + compute_key(
+            cell[0], cell[1], os_, arch, recipe_root, lib_root, chain) + "\n")
 
     parts.append(f"V={version} OS={os_} ARCH={arch}\n")
 

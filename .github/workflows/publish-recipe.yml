@@ -421,4 +421,4 @@ jobs:
           dry-run: 'true'
         env:
           # Point fetch_bootstrap at the staged artifacts.
-          RECIPE_CACHE_BASE: file://${{ github.workspace }}/_pr_bootstrap_cache
+          BOOTSTRAP_CACHE_BASE: file://${{ github.workspace }}/_pr_bootstrap_cache
