@@ -82,7 +82,7 @@ outputs:
       Source HEAD sha. Set by an inline build, and by fetch-ccache from
       the manifest of the artifact it restored -- which is the commit a
       consumer has to check out to reuse those objects.
-    value: ${{ env.SRC_COMMIT }}
+    value: ${{ steps.ccache.outputs.src-commit || env.SRC_COMMIT }}
   ccache-dir:
     description: |
       Restored ccache directory, empty unless fetch-ccache was asked
@@ -199,7 +199,10 @@ runs:
         set -euo pipefail
         # Every path answers, so a consumer reading the output can tell
         # "restored" from "asked for and not there".
-        nothing() { echo "dir=" >> "$GITHUB_OUTPUT"; exit 0; }
+        nothing() {
+          { echo "dir="; echo "src-commit="; } >> "$GITHUB_OUTPUT"
+          exit 0
+        }
         if [ "$RUNNER_OS" = Windows ]; then
           echo "::notice title=setup-recipe::no ccache sibling is published for Windows cells; nothing restored."
           nothing
@@ -240,9 +243,17 @@ runs:
         # sources again has to check out this one: ccache keys on preprocessed
         # output, so another commit of the same branch is another cache.
         src_commit="$(mf source.commit)"
-        if [ -n "$src_commit" ] && [ "$src_commit" != unknown ]; then
+        if [ "$src_commit" = unknown ]; then
+          src_commit=""
+        fi
+        # Both: the env for anything downstream that reads it, and a step
+        # output because that is what an action's `outputs:` can actually see.
+        # A composite action's outputs are evaluated in its own context, where
+        # env is what it was handed, not what its steps have since written.
+        if [ -n "$src_commit" ]; then
           echo "SRC_COMMIT=$src_commit" >> "$GITHUB_ENV"
         fi
+        echo "src-commit=$src_commit" >> "$GITHUB_OUTPUT"
         export CCACHE_DIR="$dir"
         ccache --set-config="base_dir=${GITHUB_WORKSPACE}"
         ccache --set-config="hash_dir=${hash_dir:-false}"
