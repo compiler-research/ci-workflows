@@ -1789,7 +1789,15 @@ def cmd_devshell(args: argparse.Namespace) -> int:
         skills, _settings, memory = _devshell_ai_paths(host_cache, patches_out)
         for d in (stage, skills, memory):
             _devshell_refuse_symlinks(d, host_cache)
-            d.mkdir(parents=True, exist_ok=True)
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                # Earlier versions let the container create these, as
+                # root; on a native Linux host that leaves them root-owned.
+                sys.exit(f"error: cannot create {d}: a parent directory is "
+                         f"not yours (left root-owned by an older devshell). "
+                         f"Fix with: sudo chown -R \"$(id -u):$(id -g)\" "
+                         f"{host_cache}")
         manifest = _devshell_fetch(
             base, key, stage, args.devshell_refetch,
             trusted=host_cache / "manifests" / f"{key}.json")

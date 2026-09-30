@@ -63,6 +63,35 @@ class ArgvTest(unittest.TestCase):
             "-v", "v:/w", "img", "true"])
 
 
+class CleanOutputTest(unittest.TestCase):
+    def test_keeps_text_and_colour(self):
+        s = "\x1b[31mred\x1b[0m plain\ttab\n"
+        self.assertEqual(sandbox.clean_terminal_output(s), s)
+
+    def test_drops_everything_else(self):
+        c = sandbox.clean_terminal_output
+        self.assertEqual(c("a\x1b]0;title\x07b"), "ab")          # OSC, BEL
+        self.assertEqual(c("a\x1b]52;c;ZGF0YQ==\x1b\\b"), "ab")  # OSC, ST
+        self.assertEqual(c("a\x1bP1$r\x1b\\b"), "ab")            # DCS
+        self.assertEqual(c("a\x1b[2J\x1b[?1049hb"), "ab")          # CSI non-SGR
+        self.assertEqual(c("a\x1bcb"), "ab")                        # RIS
+        self.assertEqual(c("a\x07\x08\x9bb"), "ab")                  # C0/C1
+
+    def test_streamed_exec_output_is_cleaned(self):
+        class P:
+            def __init__(self, *a, **k):
+                import io
+                self.stdout = io.BytesIO(b"ok\x1b]0;x\x07\n")
+            def wait(self):
+                return 0
+        import io
+        from contextlib import redirect_stdout
+        with mock.patch.object(sandbox.subprocess, "Popen", P), \
+                redirect_stdout(io.StringIO()) as out:
+            rc = sandbox.exec_("c", ["echo"]).returncode
+        self.assertEqual((rc, out.getvalue()), (0, "ok\n"))
+
+
 class NothingElseBuildsDockerCommandsTest(unittest.TestCase):
     def test_repro_has_no_docker_argv_of_its_own(self):
         # The audit surface is sandbox.py; a `["docker", ...]` list

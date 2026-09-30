@@ -18,8 +18,10 @@ Stdlib-only, like the rest of bin/.
 
 from __future__ import annotations
 
+import re
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -110,16 +112,57 @@ def exec_argv(name: str, command: Sequence[str], *,
     return argv + [name, *command]
 
 
+#: Terminal control sequences a container's output may carry. Colour
+#: (CSI ... m) is kept; everything else -- OSC (window title, clipboard,
+#: hyperlinks), DCS and friends, cursor and mode control, bare C0/C1
+#: controls -- is dropped before it reaches the user's terminal, which
+#: would otherwise act on it.
+_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?")
+_STRING = re.compile(r"\x1b[P^_X].*?(?:\x1b\\|$)", re.S)
+_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*([@-~])")
+#: Any other escape: ESC, optional intermediates, a final byte (ESC c,
+#: ESC 7, ESC ( B, ...). Kept colour CSI is excluded by the lookahead.
+_ESC = re.compile(r"\x1b(?!\[[0-?]*[ -/]*m)(?:[ -/]*[0-~])?")
+_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f\x80-\x9f]")
+
+
+def clean_terminal_output(text: str) -> str:
+    """`text` with every control sequence but colour removed."""
+    text = _OSC.sub("", text)
+    text = _STRING.sub("", text)
+    text = _CSI.sub(lambda m: m.group(0) if m.group(1) == "m" else "", text)
+    text = _ESC.sub("", text)
+    return _CTRL.sub("", text)
+
+
 def exec_(name: str, command: Sequence[str], **kw) -> subprocess.CompletedProcess:
     """Run `command` in a running container. `capture`/`check`/`quiet`
-    control the subprocess; the rest go to exec_argv."""
+    control the subprocess; the rest go to exec_argv.
+
+    Output that is neither captured nor discarded is streamed to this
+    process's stdout through clean_terminal_output: what the container
+    prints is not the container's to put on the user's terminal as-is.
+    """
     capture = kw.pop("capture", False)
     check = kw.pop("check", False)
     quiet = kw.pop("quiet", False)
-    return subprocess.run(
-        exec_argv(name, command, **kw), check=check, text=True,
-        capture_output=capture,
-        stdout=subprocess.DEVNULL if quiet and not capture else None)
+    argv = exec_argv(name, command, **kw)
+    if capture or quiet:
+        return subprocess.run(
+            argv, check=check, text=True, capture_output=capture,
+            stdout=subprocess.DEVNULL if quiet and not capture else None)
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT)
+    assert proc.stdout is not None
+    for raw in iter(proc.stdout.readline, b""):
+        sys.stdout.write(clean_terminal_output(
+            raw.decode("utf-8", errors="replace")))
+        sys.stdout.flush()
+    proc.stdout.close()
+    rc = proc.wait()
+    if check and rc != 0:
+        raise subprocess.CalledProcessError(rc, argv)
+    return subprocess.CompletedProcess(argv, rc)
 
 
 def cp_in(src: str, name: str, dest: str) -> None:

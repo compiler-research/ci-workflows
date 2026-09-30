@@ -629,6 +629,11 @@ inside (verify.yml's devshell-smoke job runs it):
 - No Docker socket, and the mounts above, nothing else.
 - Changing any of these re-creates the container; the restrictions it
   was created with are recorded in a label.
+- Output of the non-interactive steps (`repro-config`, the init
+  self-check, `--devshell-script`) reaches your terminal with every
+  control sequence but colour removed, so nothing in the container can
+  retitle, reprogram or write the clipboard of the terminal it runs in.
+  The interactive shell is a real terminal session and is not filtered.
 
 Not covered: the network is open (the AI needs its API, git and package
 mirrors), so the container can reach what the machine can. Put the
