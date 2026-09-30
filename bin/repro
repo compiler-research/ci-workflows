@@ -128,6 +128,9 @@ CELLS_YAML = REPO_ROOT / "cells.yaml"
 # with bin/start; this file only asks it questions.
 sys.path.insert(0, str(REPO_ROOT / "bin"))
 import cells  # noqa: E402
+# Every docker command line is built in bin/sandbox.py, so what a
+# container may see and do is reviewable in one file.
+import sandbox  # noqa: E402
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -940,22 +943,16 @@ def check_job_ambiguous(args: argparse.Namespace) -> None:
 
 def find_recent_act_container() -> Optional[str]:
     """Most recent act-* container ID (running or stopped), or None."""
-    r = subprocess.run(
-        ["docker", "ps", "-aq", "--filter", "name=act-", "--latest"],
-        capture_output=True, text=True, check=False)
-    cid = r.stdout.strip()
-    return cid if cid else None
+    return sandbox.latest_container("act-")
 
 
 def shell_into(cid: str) -> int:
-    subprocess.run(["docker", "start", cid], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return _run_interactive(["docker", "exec", "-it", cid, "bash"])
+    sandbox.start(cid, check=False, quiet_errors=True)
+    return _run_interactive(sandbox.exec_argv(cid, ["bash"], tty=True))
 
 
 def remove_container(cid: str) -> None:
-    subprocess.run(["docker", "rm", "-f", cid], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    sandbox.rm(cid, check=False, quiet_errors=True)
 
 
 # --- devshell mode -------------------------------------------------------
@@ -1282,40 +1279,18 @@ def _devshell_volume_name(cell_id: str) -> str:
     return f"devshell-{cell_id}"
 
 
-def _devshell_container_running(name: str) -> bool:
-    r = subprocess.run(
-        ["docker", "container", "inspect", "-f", "{{.State.Running}}", name],
-        capture_output=True, text=True,
-    )
-    return r.returncode == 0 and r.stdout.strip() == "true"
-
-
-def _devshell_container_exists(name: str) -> bool:
-    r = subprocess.run(
-        ["docker", "container", "inspect", name],
-        capture_output=True, text=True,
-    )
-    return r.returncode == 0
-
-
-def _devshell_volume_exists(name: str) -> bool:
-    r = subprocess.run(
-        ["docker", "volume", "inspect", name],
-        capture_output=True, text=True,
-    )
-    return r.returncode == 0
+_devshell_container_running = sandbox.container_running
+_devshell_container_exists = sandbox.container_exists
+_devshell_volume_exists = sandbox.volume_exists
 
 
 def _devshell_volume_has_manifest(volume: str, image: str, ws: str) -> bool:
     """True iff a populated volume already carries the producer
     manifest -- the gate for skipping the host-side fetch on re-entry.
     """
-    r = subprocess.run(
-        ["docker", "run", "--rm", "-v", f"{volume}:{ws}",
-         image, "test", "-f", f"{ws}/manifest.json"],
-        capture_output=True,
-    )
-    return r.returncode == 0
+    return sandbox.oneshot(image, ["test", "-f", f"{ws}/manifest.json"],
+                           mounts=[sandbox.Mount(volume, ws)],
+                           capture=True).returncode == 0
 
 
 def _devshell_host_uid_gid() -> Tuple[int, int]:
@@ -1377,8 +1352,7 @@ def _devshell_ai_repo_key(patches_out: PurePath) -> Tuple[str, str]:
 
 def _devshell_ensure_volume(name: str) -> None:
     if not _devshell_volume_exists(name):
-        subprocess.run(["docker", "volume", "create", name],
-                       check=True, stdout=subprocess.DEVNULL)
+        sandbox.volume_create(name)
 
 
 def _devshell_seed_volume(volume: str, image: str, ws: str,
@@ -1390,37 +1364,13 @@ def _devshell_seed_volume(volume: str, image: str, ws: str,
     will see -- a host `cp` would tag everything with the host UID
     and trip dev-user reads later.
     """
-    subprocess.run(
-        ["docker", "run", "--rm",
-         "--platform", docker_platform,
-         "-v", f"{volume}:{ws}",
-         "-v", f"{src}:/seed:ro",
-         image,
-         "bash", "-c",
-         f"mkdir -p {ws} && cp -a /seed/. {ws}/"],
-        check=True, stdout=subprocess.DEVNULL,
-    )
+    sandbox.oneshot(image, ["bash", "-c", f"mkdir -p {ws} && cp -a /seed/. {ws}/"],
+                    mounts=[sandbox.Mount(volume, ws),
+                            sandbox.Mount(str(src), "/seed", readonly=True)],
+                    platform=docker_platform, check=True)
 
 
-def _devshell_container_binds(name: str) -> Dict[str, str]:
-    """Map destination -> source for an existing container's mounts.
-    A volume reports its name as the source; a bind, its host path.
-    """
-    r = subprocess.run(
-        ["docker", "inspect", name, "--format",
-         '{{range .Mounts}}{{.Destination}}\t'
-         '{{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}'
-         '\n{{end}}'],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        return {}
-    binds = {}
-    for line in r.stdout.splitlines():
-        dst, _, src = line.partition("\t")
-        if dst:
-            binds[dst] = src
-    return binds
+_devshell_container_binds = sandbox.container_binds
 
 
 def _devshell_container_options(name: str) -> str:
@@ -1430,34 +1380,10 @@ def _devshell_container_options(name: str) -> str:
     options it was given, and a container created without `--gpus`
     does not grow one on re-entry.
     """
-    r = subprocess.run(
-        ["docker", "inspect", name, "--format",
-         '{{index .Config.Labels "' + DEVSHELL_OPTIONS_LABEL + '"}}'],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        return ""
-    out = r.stdout.strip()
-    # A container from before this label existed prints Go's placeholder.
-    return "" if out == "<no value>" else out
+    return sandbox.container_label(name, DEVSHELL_OPTIONS_LABEL)
 
 
-def _devshell_container_arch(name: str) -> str:
-    """Architecture of the image an existing container was created
-    from ("amd64" / "arm64"), or "" when it can't be determined.
-    """
-    r = subprocess.run(
-        ["docker", "inspect", name, "--format", "{{.Image}}"],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0 or not r.stdout.strip():
-        return ""
-    r = subprocess.run(
-        ["docker", "image", "inspect", r.stdout.strip(),
-         "--format", "{{.Architecture}}"],
-        capture_output=True, text=True,
-    )
-    return r.stdout.strip() if r.returncode == 0 else ""
+_devshell_container_arch = sandbox.container_arch
 
 
 def _devshell_desired_binds(ws: str, *, volume_name: Optional[str],
@@ -1526,57 +1452,55 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
             _log(f"repro: devshell container {name} was created with a "
                  f"different {', '.join(stale)}; re-creating it against "
                  f"this run's configuration")
-            subprocess.run(["docker", "rm", "-f", name], check=True,
-                           stdout=subprocess.DEVNULL)
+            sandbox.rm(name)
         else:
             if not _devshell_container_running(name):
-                subprocess.run(["docker", "start", name], check=True,
-                               stdout=subprocess.DEVNULL)
+                sandbox.start(name)
             return
     cfg = _devshell_ccache_cfg(manifest)
     uid, gid = _devshell_host_uid_gid()
     repo, encoded = _devshell_ai_repo_key(patches_out)
-    env_args: list[str] = [
-        "-e", "CC=clang",
-        "-e", "CXX=clang++",
-        "-e", f"CCACHE_DIR={ws}/{DEVSHELL_CCACHE_SUBDIR}",
-        "-e", f"CCACHE_BASEDIR={ws}",
+    env: list[Tuple[str, str]] = [
+        ("CC", "clang"),
+        ("CXX", "clang++"),
+        ("CCACHE_DIR", f"{ws}/{DEVSHELL_CCACHE_SUBDIR}"),
+        ("CCACHE_BASEDIR", f"{ws}"),
         # ccache's boolean environment variables are presence-based: any value
         # enables them and an explicit "false" is rejected outright ("invalid
         # boolean environment variable value"), so the off case has to omit the
         # variable rather than set it. Manifests predating #51, and the mockups
         # `recipe-cache pack` writes, carry no ccache block at all -- which is
         # where this fired.
-        *(["-e", "CCACHE_NOHASHDIR=true"]
+        *([("CCACHE_NOHASHDIR", "true")]
           if cfg.get("hash_dir") == "false" else []),
-        "-e", "CMAKE_C_COMPILER_LAUNCHER=ccache",
-        "-e", "CMAKE_CXX_COMPILER_LAUNCHER=ccache",
-        "-e", f"DEVSHELL_INSTALL={ws}/{DEVSHELL_INSTALL_SUBDIR}",
+        ("CMAKE_C_COMPILER_LAUNCHER", "ccache"),
+        ("CMAKE_CXX_COMPILER_LAUNCHER", "ccache"),
+        ("DEVSHELL_INSTALL", f"{ws}/{DEVSHELL_INSTALL_SUBDIR}"),
         # LLVM_PREFIX is the old name for DEVSHELL_INSTALL, kept because muscle
         # memory and out-of-tree scripts still reach for it. Deprecated: drop
         # once nothing in-tree references it and the old name has been out of
         # the docs long enough that nobody is following a stale README.
-        "-e", f"LLVM_PREFIX={ws}/{DEVSHELL_INSTALL_SUBDIR}",
-        "-e", f"DEVSHELL_SRC={ws}/{_devshell_src_subdir(manifest)}",
-        "-e", f"DEVSHELL_BUILD={ws}/{_devshell_build_subdir(manifest)}",
-        "-e", f"DEVSHELL_MANIFEST={ws}/manifest.json",
-        "-e", f"CCACHE_LOGFILE={ws}/{DEVSHELL_CCACHE_SUBDIR}/ccache.log",
-        "-e", f"HOME={DEVSHELL_DEV_HOME}",
-        "-e", f"DEVSHELL_DEV_HOME={DEVSHELL_DEV_HOME}",
-        "-e", f"DEVSHELL_DEV_UID={uid}",
-        "-e", f"DEVSHELL_DEV_GID={gid}",
-        "-e", f"DEVSHELL_PATCHES_MOUNT={DEVSHELL_PATCHES_MOUNT}",
-        "-e", f"DEVSHELL_AI_REPO={repo}",
-        "-e", f"DEVSHELL_AI_REPO_ENCODED={encoded}",
+        ("LLVM_PREFIX", f"{ws}/{DEVSHELL_INSTALL_SUBDIR}"),
+        ("DEVSHELL_SRC", f"{ws}/{_devshell_src_subdir(manifest)}"),
+        ("DEVSHELL_BUILD", f"{ws}/{_devshell_build_subdir(manifest)}"),
+        ("DEVSHELL_MANIFEST", f"{ws}/manifest.json"),
+        ("CCACHE_LOGFILE", f"{ws}/{DEVSHELL_CCACHE_SUBDIR}/ccache.log"),
+        ("HOME", f"{DEVSHELL_DEV_HOME}"),
+        ("DEVSHELL_DEV_HOME", f"{DEVSHELL_DEV_HOME}"),
+        ("DEVSHELL_DEV_UID", f"{uid}"),
+        ("DEVSHELL_DEV_GID", f"{gid}"),
+        ("DEVSHELL_PATCHES_MOUNT", f"{DEVSHELL_PATCHES_MOUNT}"),
+        ("DEVSHELL_AI_REPO", f"{repo}"),
+        ("DEVSHELL_AI_REPO_ENCODED", f"{encoded}"),
     ]
     if host_cache is not None:
-        env_args += ["-e", f"DEVSHELL_CACHE_MOUNT={DEVSHELL_CACHE_MOUNT}"]
+        env += [("DEVSHELL_CACHE_MOUNT", f"{DEVSHELL_CACHE_MOUNT}")]
     cc = cfg.get("compiler_check", "")
     if cc and cc != "unknown":
         # Producer's ccache.compiler_check verbatim. repro-config
         # applies it on the consumer side and warns on $CC --version
         # divergence.
-        env_args += ["-e", f"DEVSHELL_PRODUCER_COMPILER_CHECK={cc}"]
+        env += [("DEVSHELL_PRODUCER_COMPILER_CHECK", f"{cc}")]
     # ccache hashes LANG/LC_ALL/LC_CTYPE/LC_MESSAGES into every key, so
     # the shell has to reproduce the producer's locale to hit its cache.
     # repro-config probes for it (the recorded value first, when the
@@ -1584,39 +1508,31 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
     # which BASH_ENV makes every non-interactive bash -- scripts, the
     # AI's tool calls -- source, and /etc/bash.bashrc every interactive
     # one.
-    env_args += ["-e", f"BASH_ENV={DEVSHELL_ENV_FILE}"]
+    env += [("BASH_ENV", f"{DEVSHELL_ENV_FILE}")]
     locale = _devshell_producer_locale(cfg)
     if locale is not None:
-        env_args += ["-e", f"DEVSHELL_PRODUCER_LOCALE={locale}"]
+        env += [("DEVSHELL_PRODUCER_LOCALE", f"{locale}")]
 
-    mount_args: list[str] = []
-    if volume_name is not None:
-        mount_args += ["-v", f"{volume_name}:{ws}"]
-    else:
-        assert work_host_bind is not None
-        mount_args += ["-v", f"{work_host_bind}:{ws}"]
-    mount_args += ["-v", f"{REPO_ROOT}:/ci-workflows:ro"]
-    mount_args += ["-v", f"{patches_out}:{DEVSHELL_PATCHES_MOUNT}"]
+    mounts: list[sandbox.Mount] = [
+        sandbox.Mount(volume_name if volume_name is not None
+                      else str(work_host_bind), ws),
+        sandbox.Mount(str(REPO_ROOT), "/ci-workflows", readonly=True),
+        sandbox.Mount(str(patches_out), DEVSHELL_PATCHES_MOUNT),
+    ]
     if host_cache is not None:
-        mount_args += ["-v", f"{host_cache}:{DEVSHELL_CACHE_MOUNT}"]
+        mounts.append(sandbox.Mount(str(host_cache), DEVSHELL_CACHE_MOUNT))
 
     # Start as root: repro-config needs apt-install + chown. `--user`
     # is deferred to the interactive `docker exec` so the AI runs as
     # `dev`.
+    spec = sandbox.DevshellSpec(
+        name=name, image=image, platform=docker_platform, workdir=ws,
+        mounts=mounts, env=env,
+        labels={DEVSHELL_OPTIONS_LABEL: docker_options},
+        caller_options=docker_options,
+    )
     try:
-        subprocess.run(
-            ["docker", "run", "-d",
-             "--platform", docker_platform,
-             "--name", name,
-             *mount_args,
-             "-w", ws,
-             *env_args,
-             "--label", f"{DEVSHELL_OPTIONS_LABEL}={docker_options}",
-             # Last, so a caller can override what repro chose.
-             *shlex.split(docker_options),
-             image, "sleep", "infinity"],
-            check=True, stdout=subprocess.DEVNULL,
-        )
+        sandbox.run_detached(spec)
     except subprocess.CalledProcessError as e:
         # docker already printed its own diagnostic to stderr; a
         # 25-line Python traceback on top of it just buries the line
@@ -1642,28 +1558,17 @@ def _devshell_run_config(name: str, ws: str) -> None:
         if not src.is_file():
             sys.exit(f"error: {src} not found "
                      f"-- ci-workflows checkout incomplete?")
-    subprocess.run(
-        ["docker", "cp", str(DEVSHELL_CONFIG_SCRIPT),
-         f"{name}:/usr/local/bin/devshell-repro-config"],
-        check=True, stdout=subprocess.DEVNULL,
-    )
-    subprocess.run(
-        ["docker", "cp", str(DEVSHELL_INIT_SCRIPT),
-         f"{name}:/usr/local/bin/devshell-init"],
-        check=True, stdout=subprocess.DEVNULL,
-    )
-    subprocess.run(
-        ["docker", "exec", "-u", "0", "-w", ws, name,
-         "bash", "/usr/local/bin/devshell-repro-config"],
-        check=True,
-    )
+    sandbox.cp_in(str(DEVSHELL_CONFIG_SCRIPT), name,
+                  "/usr/local/bin/devshell-repro-config")
+    sandbox.cp_in(str(DEVSHELL_INIT_SCRIPT), name,
+                  "/usr/local/bin/devshell-init")
+    sandbox.exec_(name, ["bash", "/usr/local/bin/devshell-repro-config"],
+                  user="0", workdir=ws, check=True)
     # Self-check the hermetic-init outputs; failures here mean the
     # dev user / mounts / AI symlinks are not in the state bin/repro
     # promised. Cheap (~50ms) so we run every session.
-    r = subprocess.run(
-        ["docker", "exec", "-u", "0", name,
-         "bash", "/usr/local/bin/devshell-init", "--verify"],
-    )
+    r = sandbox.exec_(name, ["bash", "/usr/local/bin/devshell-init",
+                             "--verify"], user="0")
     if r.returncode != 0:
         sys.exit(f"error: devshell-init --verify reported "
                  f"{r.returncode} failure(s); container {name} is "
@@ -1692,8 +1597,7 @@ def cmd_devshell(args: argparse.Namespace) -> int:
     if args.devshell_rm:
         if _devshell_container_exists(name):
             _log(f"repro: removing devshell container {name}")
-            subprocess.run(["docker", "rm", "-f", name],
-                           check=True, stdout=subprocess.DEVNULL)
+            sandbox.rm(name)
         else:
             _log(f"repro: no container named {name}; nothing to remove")
         if _devshell_volume_exists(volume):
@@ -1776,7 +1680,7 @@ def cmd_devshell(args: argparse.Namespace) -> int:
          f"(volume kept)")
     _log("")
 
-    exec_user = ["-u", "0"] if args.devshell_as_root else ["-u", "dev"]
+    exec_user = "0" if args.devshell_as_root else "dev"
 
     if args.devshell_script:
         # /tmp keeps the script out of the workspace volume -- the
@@ -1784,23 +1688,16 @@ def cmd_devshell(args: argparse.Namespace) -> int:
         script_host = Path(args.devshell_script).resolve()
         if not script_host.is_file():
             sys.exit(f"error: --devshell-script: {script_host} not a file")
-        subprocess.run(
-            ["docker", "cp", str(script_host),
-             f"{name}:/tmp/devshell-script.sh"],
-            check=True, stdout=subprocess.DEVNULL,
-        )
-        subprocess.run(
-            ["docker", "exec", "-u", "0", name,
-             "chmod", "755", "/tmp/devshell-script.sh"],
-            check=True, stdout=subprocess.DEVNULL,
-        )
+        sandbox.cp_in(str(script_host), name, "/tmp/devshell-script.sh")
+        sandbox.exec_(name, ["chmod", "755", "/tmp/devshell-script.sh"],
+                      user="0", check=True, quiet=True)
         _log(f"repro: running --devshell-script ({script_host.name})...")
-        return subprocess.run(
-            ["docker", "exec", *exec_user, "-w", ws, name,
-             "bash", "/tmp/devshell-script.sh"]).returncode
+        return sandbox.exec_(name, ["bash", "/tmp/devshell-script.sh"],
+                             user=exec_user, workdir=ws).returncode
 
     return _run_interactive(
-        ["docker", "exec", "-it", *exec_user, "-w", ws, name, "bash"])
+        sandbox.exec_argv(name, ["bash"], user=exec_user, workdir=ws,
+                          tty=True))
 
 
 def _container_tree_dirty(cid: str, workspace: str) -> bool:
@@ -1811,11 +1708,8 @@ def _container_tree_dirty(cid: str, workspace: str) -> bool:
     1 as "no patch to export" -- a missing-git diagnostic isn't
     actionable here, and the user can always docker exec themselves.
     """
-    r = subprocess.run(
-        ["docker", "exec", cid, "git", "-C", workspace,
-         "diff", "--quiet", "HEAD"],
-        capture_output=True, text=True, check=False,
-    )
+    r = sandbox.exec_(cid, ["git", "-C", workspace, "diff", "--quiet", "HEAD"],
+                      capture=True)
     return r.returncode == 1
 
 
@@ -1823,10 +1717,8 @@ def _export_container_patch(cid: str, workspace: str, dest: Path) -> bool:
     """Capture `git diff HEAD` from inside the container; write to dest.
     Returns True on success, False on diagnostic-worthy failure.
     """
-    r = subprocess.run(
-        ["docker", "exec", cid, "git", "-C", workspace, "diff", "HEAD"],
-        capture_output=True, text=True, check=False,
-    )
+    r = sandbox.exec_(cid, ["git", "-C", workspace, "diff", "HEAD"],
+                      capture=True)
     if r.returncode != 0:
         _log(f"repro: docker exec git diff failed (rc={r.returncode}): "
              f"{r.stderr.strip()}")
