@@ -16,7 +16,7 @@
 # student a silently wrong toolchain. An explicit row is checked by
 # verify.yml against cells.yaml, so a stale one fails CI here instead.
 #
-# (Uncatalogued repositories are served by bin/workflow_scan.py, which
+# (Uncatalogued repositories are served by bin/cells.py, which
 # evaluates a consumer's own setup-llvm / setup-recipe calls instead.
 # The catalog stays because it is curated: it names the one row a
 # newcomer should start from, and is checked before anything is cloned.)

@@ -453,23 +453,20 @@ class ListJobsCellHintTests(unittest.TestCase):
                        "os": "ubuntu-24.04", "arch": "x86_64"}]
         fake_rows = [("main.yml", "build",
                       "ubu24-x86-clang22-llvm22-asan-ubsan")]
-        fake_dryrun = [{
-            "jobID": "build",
-            "matrix": {"name": "ubu24-x86-clang22-llvm22-asan-ubsan",
-                       "use-recipe": "llvm-asan",
-                       "clang-runtime": "22",
-                       "os": "ubuntu-24.04"},
-            "workflow_name": "CI",
-            "row_name": "ubu24-x86-clang22-llvm22-asan-ubsan",
-        }]
+        # The row's cell comes from cells.scan (tested in test_cells);
+        # here only how --list renders it.
+        fake_scan = [repro.cells.RowCells(
+            workflow=".github/workflows/main.yml", job="build",
+            row="ubu24-x86-clang22-llvm22-asan-ubsan",
+            cells=[("setup-llvm", dict(fake_cells[0]))])]
         with mock.patch.object(repro, "_require", side_effect=lambda x: x), \
              mock.patch.object(repro.subprocess, "Popen") as popen, \
              mock.patch.object(repro, "published_cells",
                                return_value=fake_cells), \
              mock.patch.object(repro, "discover_matrix_rows",
                                return_value=fake_rows), \
-             mock.patch.object(repro, "_act_dryrun_rows",
-                               return_value=fake_dryrun), \
+             mock.patch.object(repro, "_repo_rows",
+                               return_value=fake_scan), \
              mock.patch.object(repro, "_failed_rows_for_branch",
                                return_value=set()), \
              mock.patch.object(repro, "host_arch", return_value="x86_64"):
@@ -1394,9 +1391,8 @@ class DevshellCellTests(unittest.TestCase):
 
     def setUp(self):
         self.repro = _load_repro()
-        # Pin the act-matrix path: nothing scanned from whatever
-        # checkout the tests happen to run in.
-        self.repro._SCANNED = {}
+        # Nothing scanned from whatever checkout the tests run in.
+        self.repro._ROWS = []
 
     def _ns(self, name):
         return argparse.Namespace(matrix=[f"name:{name}"])
@@ -1428,78 +1424,67 @@ class DevshellCellTests(unittest.TestCase):
                     self._ns("llvm-release/22/ubuntu-24.04/x86_64"))
         self.assertIn("not in cells.yaml", str(cm.exception))
 
-    def test_row_name_lookup_returns_recipe_coord(self):
-        rows = [{
-            "row_name": "ubu24-x86-gcc14-cling-llvm20-cppyy",
-            "matrix": {"use-recipe": "llvm-cling", "recipe-version": "20",
-                       "os": "ubuntu-24.04", "recipe-arch": "x86_64"},
-        }]
-        with mock.patch.object(self.repro, "_act_dryrun_rows",
-                               return_value=rows), \
+    def _rows(self, *rows):
+        """Stand in for cells.scan of the cwd checkout."""
+        return mock.patch.object(self.repro, "_repo_rows",
+                                 return_value=list(rows))
+
+    def _row(self, name, *coords, notes=()):
+        return self.repro.cells.RowCells(
+            workflow=".github/workflows/ci.yml", job="build", row=name,
+            cells=[("setup-llvm", c) for c in coords], notes=list(notes))
+
+    CELL = {"recipe": "llvm-release", "version": "23",
+            "os": "ubuntu-24.04", "arch": "x86_64"}
+
+    def test_row_name_resolves_through_cells_scan(self):
+        # No act involved: the row's cell comes from its own workflow.
+        with self._rows(self._row("ubu24-clang20-runtime23", self.CELL)), \
+             mock.patch.object(self.repro, "published_cells",
+                               return_value=[self.CELL]), \
+             mock.patch.object(self.repro, "_act_dryrun_rows",
+                               side_effect=AssertionError("no act")):
+            coord = self.repro._devshell_cell(
+                self._ns("ubu24-clang20-runtime23"))
+        self.assertEqual(coord, self.CELL)
+
+    def test_add_on_cell_is_not_a_toolchain(self):
+        cuda = {"recipe": "cuda-headers", "version": "12.8.1",
+                "os": "ubuntu-24.04", "arch": "x86_64"}
+        with self._rows(self._row("r", cuda, self.CELL)), \
              mock.patch.object(self.repro, "published_cells",
                                return_value=[]):
-            coord = self.repro._devshell_cell(
-                self._ns("ubu24-x86-gcc14-cling-llvm20-cppyy"))
-        self.assertEqual(coord["recipe"], "llvm-cling")
-        self.assertEqual(coord["version"], "20")
+            self.assertEqual(self.repro._devshell_cell(self._ns("r")),
+                             self.CELL)
+        # apt LLVM + cuda-headers: nothing to open a devshell on.
+        with self._rows(self._row("s", cuda, notes=["flavor=system"])):
+            with self.assertRaises(SystemExit):
+                self.repro._devshell_cell(self._ns("s"))
 
-    def test_row_without_use_recipe_exits(self):
-        rows = [{"row_name": "no-recipe-row",
-                 "matrix": {"os": "ubuntu-24.04"}}]
-        with mock.patch.object(self.repro, "_act_dryrun_rows",
-                               return_value=rows):
+    def test_system_flavor_row_says_why(self):
+        note = ("setup-llvm flavor=system installs LLVM from the system "
+                "package manager")
+        with self._rows(self._row("ubu24-arm-clang16-runtime18",
+                                  notes=[note])):
             with self.assertRaises(SystemExit) as cm:
-                self.repro._devshell_cell(self._ns("no-recipe-row"))
-        self.assertIn("doesn't pull from a recipe cache", str(cm.exception))
-
-
-    def _coord_of(self, matrix, cells=()):
-        rows = [{"row_name": "r", "matrix": matrix}]
-        with mock.patch.object(self.repro, "_act_dryrun_rows",
-                               return_value=rows), \
-             mock.patch.object(self.repro, "published_cells",
-                               return_value=list(cells)):
-            return self.repro._devshell_cell(self._ns("r"))
-
-    def test_use_recipe_true_selects_llvm_release(self):
-        # clad's convention: use-recipe 'true' is setup-llvm's empty
-        # flavor, i.e. the llvm-release recipe -- not a recipe named
-        # 'true'.
-        cell = {"recipe": "llvm-release", "version": "23",
-                "os": "ubuntu-24.04", "arch": "x86_64"}
-        coord = self._coord_of(
-            {"os": "ubuntu-24.04", "clang-runtime": "23",
-             "use-recipe": "true"}, cells=[cell])
-        self.assertEqual(coord, cell)
-
-    def test_macos_row_derives_arm64(self):
-        coord = self._coord_of(
-            {"os": "macos-26", "clang-runtime": "23",
-             "use-recipe": "true"})
-        self.assertEqual(coord["arch"], "arm64")
-        coord = self._coord_of(
-            {"os": "macos-26-intel", "clang-runtime": "23",
-             "use-recipe": "true"})
-        self.assertEqual(coord["arch"], "x86_64")
-
-    def test_flavor_selects_recipe(self):
-        coord = self._coord_of(
-            {"os": "ubuntu-24.04", "clang-runtime": "22",
-             "flavor": "debug"})
-        self.assertEqual(coord["recipe"], "llvm-debug")
-        coord = self._coord_of(
-            {"os": "ubuntu-24.04", "clang-runtime": "23",
-             "flavor": "asan"})
-        self.assertEqual(coord["recipe"], "llvm-asan")
-
-    def test_system_flavor_row_exits(self):
-        # No use-recipe, no flavor: setup-llvm defaults to flavor=system
-        # (apt/brew), which has no cell.
-        with self.assertRaises(SystemExit) as cm:
-            self._coord_of({"os": "ubuntu-24.04-arm",
-                            "clang-runtime": "18"})
+                self.repro._devshell_cell(
+                    self._ns("ubu24-arm-clang16-runtime18"))
         self.assertIn("doesn't pull from a recipe cache", str(cm.exception))
         self.assertIn("flavor=system", str(cm.exception))
+
+    def test_unknown_row_exits(self):
+        with self._rows():
+            with self.assertRaises(SystemExit) as cm:
+                self.repro._devshell_cell(self._ns("no-such-row"))
+        self.assertIn("no-such-row", str(cm.exception))
+
+    def test_cell_missing_from_cells_yaml_exits(self):
+        with self._rows(self._row("r", self.CELL)), \
+             mock.patch.object(self.repro, "published_cells",
+                               return_value=[dict(self.CELL, version="22")]):
+            with self.assertRaises(SystemExit) as cm:
+                self.repro._devshell_cell(self._ns("r"))
+        self.assertIn("not in cells.yaml", str(cm.exception))
 
 
 class DevshellCoordArgvTests(unittest.TestCase):

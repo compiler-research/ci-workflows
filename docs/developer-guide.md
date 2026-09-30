@@ -430,43 +430,44 @@ cd ~/src/clad && ~/src/ci-workflows/bin/start  # uncatalogued checkout: no menu
 
 The menu also takes `o` for "another repository".
 
-Such a repository has no recorded cell, so `bin/workflow_scan.py` reads
-one out of its workflows. It expands every job's matrix the way GitHub
-does and evaluates each `setup-llvm` / `setup-recipe` `with:` (and our
-composites that call them, such as `setup-biodynamo` and `setup-cuda`)
-against each row, step `if:`s included. It needs no knowledge of the
-consumer's conventions, which really do differ: clad writes
-`use-recipe: 'true'` and defaults its flavor to `system`, while
-CppInterOp passes `matrix.flavor` straight through, so an absent flavor
-means llvm-release there. Only setup-llvm's flavor-to-recipe table
-lives in shell rather than in expressions, so that table is restated in
-the scanner.
+Such a repository has no recorded cell, so one is read out of its
+workflows: every `setup-llvm` / `setup-recipe` call is evaluated against
+every matrix row, step `if:`s included, walking into composites such as
+`setup-biodynamo` and `setup-cuda`. Evaluating the consumer's own
+expressions is what makes this convention-free, and the conventions do
+differ: clad writes `use-recipe: 'true'` and defaults its flavor to
+`system`, while CppInterOp passes `matrix.flavor` straight through, so
+an absent flavor means llvm-release there.
 
 Each resulting cell is checked against `cells.yaml` and against what
-`--devshell` can open (the ubuntu-24.04 and ubuntu-22.04 runner images today). Usable cells are
-listed plainest first: llvm-release before its sanitizer and debug
-variants, then by how many rows use it. The rest are listed with the
-reason they can't be used. A repository whose rows only use
-`flavor=system` gets told there is nothing to download; `bin/repro
-<row>` replays such a row under act instead.
+`--devshell` can open (the ubuntu-24.04 and ubuntu-22.04 runner images
+today). Usable cells are listed plainest first -- llvm-release before
+its sanitizer and debug variants, then by how many rows use it -- and
+the rest with the reason they can't be used. A repository whose rows
+only use `flavor=system` is told there is nothing to download;
+`bin/repro <row>` replays such a row under act instead.
 
-`bin/repro --devshell <row>` and the `[cell: ...]` tags in `bin/repro
---list` use the same scan, and fall back to the act matrix when the
-scan finds nothing for a row.
+### Where the cell-resolution code lives
 
-On selection it enables host-cache mode -- a newcomer's download should
-survive `docker volume rm` and a machine move -- binds the checkout at
-`/patches`, and lets `repro-config` do the rest: the recipe's
-`devshell-setup.sh`, the ccache wiring, and the Claude Code install.
-Nothing is copied out afterwards, because `/patches` *is* the checkout;
-git runs host-side, where the credentials are and where a container
-running an AI agent cannot reach them.
+One implementation, used by both `bin/repro` (`--devshell <row>`, the
+`[cell: ...]` tags in `--list`) and `bin/start`:
 
-`--list` prints the catalog and exits, which is also the cheap way to
-see whether a cell has actually been warmed.
+| file | knows about |
+| --- | --- |
+| `bin/gha.py` | GitHub Actions only: YAML, `${{ }}` expressions, matrix expansion, step `if:`, walking into composite actions. Nothing about recipes. |
+| `bin/cells.py` | Recipes: the coord type, `cells.yaml`, one resolver per action that picks its recipe in shell, row scanning, "plainest first" ranking. |
 
-To add a project, see
-[Adding a project to `bin/start`](#adding-a-project-to-binstart).
+To support a new action, see the module docstring of `bin/cells.py`.
+An action that only forwards to one we already resolve needs nothing,
+because the walk goes into it. An action that picks its recipe in a
+shell step needs a resolver registered with `@resolves("<action>")`:
+a function from the call's evaluated inputs to a coord.
+
+`bin/start` drives `bin/repro` only through its command line,
+`repro.main(argv)`, built by `devshell_argv()`. So a change inside
+repro can't break start as long as the command line a user would type
+still works, and `bin/test_start.py` checks that argv against repro's
+real parser.
 
 ## Iterating on a recipe with `--devshell`
 

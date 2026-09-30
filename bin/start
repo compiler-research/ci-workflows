@@ -16,9 +16,9 @@ Any other repository works too, as long as its CI uses ci-workflows:
     cd ~/src/clad && ~/src/ci-workflows/bin/start
 
 A repository outside the catalog has no recorded cell, so its own
-workflows are read instead (bin/workflow_scan.py): every setup-llvm /
-setup-recipe call is evaluated against every matrix row, and the cells
-that a dev container can serve are offered, plainest toolchain first.
+workflows are read instead: every setup-llvm /
+setup-recipe call is evaluated against every matrix row (bin/cells.py),
+and the cells a dev container can serve are offered, plainest first.
 
 Why a second entry point rather than a `bin/repro` flag: repro's
 audience already knows what a matrix row is and why they want to
@@ -51,7 +51,8 @@ from typing import Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "bin"))
-import workflow_scan  # noqa: E402
+import cells  # noqa: E402
+import gha  # noqa: E402
 PROJECTS_YAML = REPO_ROOT / "projects.yaml"
 #: Where a project gets cloned when the user accepts the default.
 DEFAULT_SRC_PARENT = Path.home() / "src"
@@ -65,7 +66,7 @@ DEVSHELL_HOST_CACHE = Path.home() / ".cache" / "ci-workflows" / "devshell-cache"
 #: or wave a big one through.
 WARN_FREE_GIB = 10
 
-_COORD_KEYS = ("recipe", "version", "os", "arch")
+_COORD_KEYS = cells.COORD_KEYS
 _REQUIRED = ("name", "description", "repo", "workflow", "row") + _COORD_KEYS
 
 
@@ -137,8 +138,7 @@ def coord_of(project: Dict[str, str]) -> Dict[str, str]:
     return {k: project[k] for k in _COORD_KEYS}
 
 
-def coord_str(coord: Dict[str, str]) -> str:
-    return "/".join(coord[k] for k in _COORD_KEYS)
+coord_str = cells.coord_str
 
 
 # -------------------------------------------------------------- preflight
@@ -275,7 +275,7 @@ def _asset_size(base: str, key: str) -> Optional[int]:
 
 
 def cell_status(repro, base: str, project: Dict[str, str],
-                cells: List[Dict[str, str]]) -> str:
+                catalog: List[Dict[str, str]]) -> str:
     """One line describing whether this project's cell is usable.
 
     Two failures are worth distinguishing. Not in cells.yaml means the
@@ -284,7 +284,7 @@ def cell_status(repro, base: str, project: Dict[str, str],
     which fixes itself on the next publish.
     """
     coord = coord_of(project)
-    if not any(all(coord[k] == c[k] for k in _COORD_KEYS) for c in cells):
+    if not cells.in_catalog(coord, catalog):
         return "unknown cell -- not in cells.yaml, this entry is stale"
     try:
         key = repro._devshell_compute_key(coord)
@@ -525,18 +525,7 @@ def repo_pinned_version(checkout: Path,
 # ---------------------------------------------------- any other checkout
 
 
-def _git_toplevel(start_dir: Path) -> Optional[Path]:
-    """The checkout containing start_dir, or None.
-
-    Walks up for `.git` rather than asking git, so a worktree whose
-    main repository is not visible (a container mount, say) still
-    counts: only the workflow files are read, never git state.
-    """
-    here = start_dir.resolve()
-    for d in (here, *here.parents):
-        if (d / ".git").exists():
-            return d
-    return None
+_git_toplevel = gha.checkout_root
 
 
 _SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -573,45 +562,36 @@ def _devshell_servable(repro, coord: Dict[str, str]) -> bool:
 #: start_checkout()'s answer when the user quit at its prompt.
 QUIT = ({}, {})
 
-#: Recipes that are a variant of a plain toolchain; sorted after it.
-_VARIANT_RECIPES = {"llvm-asan", "llvm-msan", "llvm-debug", "cuda-headers"}
 
-
-def repo_cells(repro, checkout: Path, cells: List[Dict[str, str]]
+def repo_cells(repro, checkout: Path, catalog: List[Dict[str, str]]
                ) -> Tuple[List[Tuple[Dict[str, str], List[str]]],
                           List[Tuple[Dict[str, str], List[str], str]]]:
-    """Group the checkout's scanned cells into (usable, unusable).
+    """Group the checkout's rows by toolchain cell (RowCells.primary)
+    into (usable, unusable).
 
-    usable: (coord, rows) a devshell can open, plainest first -- a
-    plain llvm-release before its sanitizer or debug variants, then by
-    how many rows use it, then newest version. unusable: the same plus
-    the reason, so "why is my row missing" has an answer.
+    usable: (coord, rows) a devshell can open, cells.plainest_first.
+    unusable: the same plus the reason, so "why is my row missing" has
+    an answer.
     """
     grouped: Dict[Tuple[str, ...], List[str]] = {}
-    for e in workflow_scan.scan_repo(checkout):
-        key = tuple(e[k] for k in _COORD_KEYS)
-        rows = grouped.setdefault(key, [])
-        if e["row"] not in rows:
-            rows.append(e["row"])
+    for rc in cells.scan(checkout):
+        coord = rc.primary
+        if coord is None:
+            continue
+        rows = grouped.setdefault(tuple(coord[k] for k in _COORD_KEYS), [])
+        if rc.row not in rows:
+            rows.append(rc.row)
     usable, unusable = [], []
     for key, rows in grouped.items():
         coord = dict(zip(_COORD_KEYS, key))
-        if not any(all(coord[k] == c[k] for k in _COORD_KEYS)
-                   for c in cells):
+        if not cells.in_catalog(coord, catalog):
             unusable.append((coord, rows, "not in cells.yaml"))
         elif not _devshell_servable(repro, coord):
             unusable.append((coord, rows, "no dev container for this "
                                           "os/arch"))
         else:
             usable.append((coord, rows))
-
-    def rank(item):
-        coord, rows = item
-        variant = (0 if coord["recipe"] == "llvm-release" else
-                   2 if coord["recipe"] in _VARIANT_RECIPES else 1)
-        ver = re.match(r"\d+", coord["version"])
-        return (variant, -len(rows), -(int(ver.group()) if ver else 0))
-    usable.sort(key=rank)
+    usable.sort(key=lambda item: cells.plainest_first(item[0], len(item[1])))
     return usable, unusable
 
 
@@ -641,7 +621,7 @@ def render_repo(name: str, checkout: Path, refs: int,
         print()
 
 
-def start_checkout(repro, base: str, cells: List[Dict[str, str]],
+def start_checkout(repro, base: str, catalog: List[Dict[str, str]],
                    checkout: Path, list_only: bool = False
                    ) -> Optional[Tuple[Dict[str, str], Dict[str, str]]]:
     """Pick a cell for an uncatalogued checkout.
@@ -655,15 +635,15 @@ def start_checkout(repro, base: str, cells: List[Dict[str, str]],
     a dev container could add over the host.
     """
     name = checkout.name
-    refs = workflow_scan.ci_workflows_refs(checkout)
+    refs = gha.ci_workflows_refs(checkout)
     if not refs:
         print(f"  {name} ({checkout}) does not use compiler-research/"
               f"ci-workflows: no action or workflow of ours is referenced "
               f"under .github/, so there is no cached toolchain to set "
               f"up.")
         return None
-    usable, unusable = repo_cells(repro, checkout, cells)
-    statuses = [cell_status(repro, base, coord, cells)
+    usable, unusable = repo_cells(repro, checkout, catalog)
+    statuses = [cell_status(repro, base, coord, catalog)
                 for coord, _rows in usable]
     render_repo(name, checkout, len(refs), usable, unusable, statuses)
     if list_only:
@@ -685,22 +665,30 @@ def start_checkout(repro, base: str, cells: List[Dict[str, str]],
 # ------------------------------------------------------------------ main
 
 
+def devshell_argv(checkout: Path, coord: Dict[str, str]) -> List[str]:
+    """The `bin/repro` command line that opens this checkout's devshell.
+
+    bin/start drives repro through its CLI -- repro.main(argv) -- and
+    through nothing else, so any change to repro's internals stays
+    compatible with this file for as long as the documented command
+    line keeps working. Host-cache mode is on because a newcomer wants
+    the download to survive `docker volume rm` and a machine move; the
+    cell goes as a direct coord, which skips row lookup and act.
+    """
+    return ["--devshell", "--devshell-host-cache",
+            "--devshell-patches-out", str(checkout), coord_str(coord)]
+
+
 def launch(repro, project: Dict[str, str], checkout: Path,
            coord: Dict[str, str]) -> int:
-    """Hand off to bin/repro's devshell.
-
-    The Namespace is the full set cmd_devshell and its helpers read.
-    Host-cache mode is on because a newcomer wants the download to
-    survive `docker volume rm` and a machine move; the coordinate goes
-    through `matrix` because _devshell_cell takes a direct coord there
-    and skips act entirely.
-    """
+    """Hand off to `bin/repro --devshell` (see devshell_argv)."""
     # Say where the work lives before the shell opens, because the
     # question it answers ("how do I get my changes out?") otherwise
     # gets asked after the fact. There is no export step: /patches is
     # the checkout, so git runs on the host, where the credentials
     # are -- and deliberately nowhere near a container running an AI
     # agent. The container has no git identity for the same reason.
+    argv = devshell_argv(checkout, coord)
     print()
     print(f"  {checkout} is mounted at /patches inside the container.")
     print("  Edits appear there immediately; commit, push and open "
@@ -708,18 +696,10 @@ def launch(repro, project: Dict[str, str], checkout: Path,
     print("  from the host as usual -- no credentials are copied "
           "into the container.")
     print()
-    args = argparse.Namespace(
-        matrix=[f"name:{coord_str(coord)}"],
-        devshell_host_cache=True,
-        devshell_host_cache_dir=None,
-        devshell_patches_out=str(checkout),
-        devshell_image=None,
-        devshell_refetch=False,
-        devshell_rm=False,
-        devshell_script=None,
-        devshell_as_root=False,
-    )
-    return repro.cmd_devshell(args)
+    print("  to reopen it later:")
+    print(f"    {REPO_ROOT / 'bin' / 'repro'} {' '.join(argv)}")
+    print()
+    return repro.main(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -765,9 +745,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.path.insert(0, str(REPO_ROOT / "actions" / "lib"))
         import cache_io  # noqa: E402
         base = cache_io.resolve_cache_base()
-        cells = repro.published_cells()
+        catalog = repro.published_cells()
         print()
-        render(projects, [cell_status(repro, base, p, cells)
+        render(projects, [cell_status(repro, base, p, catalog)
                           for p in projects])
         return 0
 
@@ -781,25 +761,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     import cache_io  # noqa: E402
 
     base = cache_io.resolve_cache_base()
-    cells = repro.published_cells()
+    catalog = repro.published_cells()
 
     if args.repo:
         checkout = custom_checkout(args.repo)
         if checkout is None:
             return 1
-        return _launch_checkout(repro, base, cells, checkout)
+        return _launch_checkout(repro, base, catalog, checkout)
 
     detected = detect_project(repro, projects)
     here = _git_toplevel(Path.cwd())
     if (detected is None and here is not None
             and here != REPO_ROOT.resolve()
-            and workflow_scan.ci_workflows_refs(here)):
+            and gha.ci_workflows_refs(here)):
         # Sitting in a checkout of an uncatalogued project that uses
         # us: same rule as a catalogued one -- announce, don't ask.
         print(f"  in {here.name} ({here}), which is not in "
               f"projects.yaml; reading its workflows.")
         print()
-        return _launch_checkout(repro, base, cells, here)
+        return _launch_checkout(repro, base, catalog, here)
     if detected is not None:
         # Announce, don't ask. cd'ing into the checkout and running this
         # is already the answer to both questions the menu path asks,
@@ -808,9 +788,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         project, checkout = detected
         print(f"  in a {project['name']} checkout ({checkout});"
               f" skipping the menu.")
-        print(f"    {cell_status(repro, base, project, cells)}")
+        print(f"    {cell_status(repro, base, project, catalog)}")
     else:
-        statuses = [cell_status(repro, base, p, cells) for p in projects]
+        statuses = [cell_status(repro, base, p, catalog) for p in projects]
         render(projects, statuses)
         print("   o  another repository -- any whose CI uses ci-workflows")
         print()
@@ -829,7 +809,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             checkout = custom_checkout(spec)
             if checkout is None:
                 return 1
-            return _launch_checkout(repro, base, cells, checkout)
+            return _launch_checkout(repro, base, catalog, checkout)
         project = projects[index]
         maybe_checkout = resolve_checkout(project)
         if maybe_checkout is None:
@@ -846,10 +826,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     return launch(repro, project, checkout, coord)
 
 
-def _launch_checkout(repro, base: str, cells: List[Dict[str, str]],
+def _launch_checkout(repro, base: str, catalog: List[Dict[str, str]],
                      checkout: Path) -> int:
     """--repo / `o` / an uncatalogued cwd: scan, pick a cell, launch."""
-    picked = start_checkout(repro, base, cells, checkout)
+    picked = start_checkout(repro, base, catalog, checkout)
     if picked is None:
         return 1
     if picked is QUIT:

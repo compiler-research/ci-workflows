@@ -1,10 +1,5 @@
-"""Unit tests for bin/workflow_scan.py.
-
-Pins the three layers that decide which cell a consumer's row maps to:
-the YAML subset, the expression evaluator, and matrix expansion -- and
-then the end-to-end scan over workflows shaped like clad's, CppInterOp's
-and CARTopiaX's, whose conventions for reaching a cell all differ.
-"""
+"""Unit tests for bin/gha.py: the YAML subset, the expression evaluator,
+matrix expansion, and walking steps into composites."""
 
 from __future__ import annotations
 
@@ -15,7 +10,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import workflow_scan as ws  # noqa: E402
+import gha as ws  # noqa: E402
 
 
 def _y(text: str):
@@ -142,119 +137,66 @@ class MatrixTest(unittest.TestCase):
         self.assertEqual(ws.expand_matrix(None), [{}])
 
 
-def _repo(files):
-    root = Path(tempfile.mkdtemp())
-    for rel, text in files.items():
-        f = root / rel
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(textwrap.dedent(text), encoding="utf-8")
-    return root
-
-
-CLAD_LIKE = """
-    on: push
-    jobs:
-      build:
-        runs-on: ${{ matrix.os }}
-        strategy:
-          matrix:
-            include:
-              - { name: sys18, os: ubuntu-24.04-arm, clang-runtime: '18' }
-              - { name: rel23, os: ubuntu-24.04, clang-runtime: '23', use-recipe: 'true' }
-              - { name: mac23, os: macos-26, clang-runtime: '23', use-recipe: 'true' }
-              - { name: dbg22, os: ubuntu-24.04, clang-runtime: '22', flavor: debug }
-              - { name: win23, os: windows-2022, clang-runtime: '23' }
-        steps: &steps
-          - uses: actions/checkout@v4
-          - name: Setup LLVM
-            if: runner.os != 'Windows'
-            uses: compiler-research/ci-workflows/actions/setup-llvm@main
-            with:
-              version: ${{ matrix.clang-runtime }}
-              os:      ${{ matrix.self-hosted-os || matrix.os }}
-              flavor:  ${{ matrix.use-recipe != 'true' && (matrix.flavor || 'system') || '' }}
-      wasm:
-        runs-on: ubuntu-24.04
-        steps:
-          - uses: compiler-research/ci-workflows/actions/setup-recipe@main
-            with: { recipe: llvm-wasm, version: '22', os: ubuntu-24.04, arch: x86_64 }
-"""
-
-CPPINTEROP_LIKE = """
-    on: push
-    jobs:
-      build:
-        runs-on: ${{ matrix.os }}
-        strategy:
-          matrix:
-            include:
-              - name: plain
-                os: ubuntu-24.04
-                clang-runtime: '22'
-              - name: cling
-                os: ubuntu-24.04
-                clang-runtime: '22'
-                flavor: cling
-                cling-patches: ROOT
-        steps:
-          - uses: compiler-research/ci-workflows/actions/setup-llvm@main
-            with:
-              version: ${{ matrix.clang-runtime }}
-              os: ${{ matrix.os }}
-              flavor: ${{ matrix.flavor }}
-              flavor-version: ${{ matrix.cling-patches && format('{0}-llvm{1}', matrix.cling-patches, matrix.clang-runtime) || matrix.flavor-version }}
-"""
-
-
-def _cells(repo):
-    return {e["row"]: "/".join(e[k] for k in ws.COORD_KEYS)
-            for e in ws.scan_repo(repo)}
-
-
-class ScanTest(unittest.TestCase):
-    def test_clad_shaped_matrix(self):
-        got = _cells(_repo({".github/workflows/ci.yml": CLAD_LIKE}))
-        self.assertEqual(got, {
-            # sys18: flavor=system (apt), no cell. win23: step skipped.
-            "rel23": "llvm-release/23/ubuntu-24.04/x86_64",
-            "mac23": "llvm-release/23/macos-26/arm64",
-            "dbg22": "llvm-debug/22/ubuntu-24.04/x86_64",
-            "wasm":  "llvm-wasm/22/ubuntu-24.04/x86_64",
-        })
-
-    def test_cppinterop_shaped_matrix(self):
-        # Here an absent flavor is setup-llvm's default '' (llvm-release),
-        # not clad's 'system' -- only evaluating the `with:` gets both.
-        got = _cells(_repo({".github/workflows/main.yml": CPPINTEROP_LIKE}))
-        self.assertEqual(got, {
-            "plain": "llvm-release/22/ubuntu-24.04/x86_64",
-            "cling": "llvm-root/ROOT-llvm22/ubuntu-24.04/x86_64",
-        })
-
-    def test_composite_of_ours_is_followed(self):
-        # setup-biodynamo -> setup-recipe, with arch from a shell step
-        # output we cannot see; falls back to the os-derived arch.
-        repo = _repo({".github/workflows/ci.yml": """
-            jobs:
-              b:
-                runs-on: ubuntu-24.04
-                strategy:
-                  matrix:
-                    include: [{ name: g, os: ubuntu-24.04, recipe-version: v1 }]
-                steps:
-                  - uses: compiler-research/ci-workflows/actions/setup-biodynamo@main
-                    with: { version: '${{ matrix.recipe-version }}', os: '${{ matrix.os }}' }
-        """})
-        self.assertEqual(_cells(repo),
-                         {"g": "biodynamo/v1/ubuntu-24.04/x86_64"})
+class WalkTest(unittest.TestCase):
+    def test_rows_and_calls_through_a_local_composite(self):
+        root = Path(tempfile.mkdtemp())
+        files = {
+            ".github/workflows/ci.yml": """
+                jobs:
+                  b:
+                    runs-on: ${{ matrix.os }}
+                    strategy:
+                      matrix:
+                        os: [ubuntu-24.04, windows-2022]
+                    steps:
+                      - uses: ./.github/actions/mine
+                        with: { v: '22' }
+            """,
+            ".github/actions/mine/action.yml": """
+                inputs:
+                  v: { required: true }
+                  flavor: { default: asan }
+                runs:
+                  using: composite
+                  steps:
+                    - if: runner.os == 'Linux'
+                      uses: compiler-research/ci-workflows/actions/setup-llvm@main
+                      with:
+                        version: ${{ inputs.v }}
+                        flavor: ${{ inputs.flavor }}
+            """,
+        }
+        for rel, text in files.items():
+            f = root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(textwrap.dedent(text), encoding="utf-8")
+        got = []
+        for row in ws.iter_rows(root):
+            for call in ws.iter_calls(row.steps, row.ctx, root,
+                                      {"setup-llvm"}):
+                got.append((row.name, call.via, call.action,
+                            call.inputs["version"], call.inputs["flavor"]))
+        # windows row: the composite's step `if:` is false.
+        self.assertEqual(got, [("b (os=ubuntu-24.04)",
+                                "./.github/actions/mine", "setup-llvm",
+                                "22", "asan")])
 
     def test_refs_detect_use_of_ci_workflows(self):
-        self.assertTrue(ws.ci_workflows_refs(
-            _repo({".github/workflows/ci.yml": CLAD_LIKE})))
-        self.assertEqual(ws.ci_workflows_refs(_repo({
-            ".github/workflows/ci.yml":
-                "jobs: {a: {steps: [{uses: actions/checkout@v4}]}}\n"})), [])
+        root = Path(tempfile.mkdtemp())
+        (root / ".github" / "workflows").mkdir(parents=True)
+        wf = root / ".github" / "workflows" / "ci.yml"
+        wf.write_text("jobs: {a: {steps: [{uses: actions/checkout@v4}]}}\n")
+        self.assertEqual(ws.ci_workflows_refs(root), [])
+        wf.write_text("jobs: {a: {uses: compiler-research/ci-workflows/"
+                      ".github/workflows/x.yml@main}}\n")
+        self.assertEqual(len(ws.ci_workflows_refs(root)), 1)
         self.assertEqual(ws.ci_workflows_refs(Path(tempfile.mkdtemp())), [])
+
+    def test_checkout_root_accepts_a_worktree_git_file(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        (root / ".git").write_text("gitdir: /elsewhere\n")
+        (root / "a" / "b").mkdir(parents=True)
+        self.assertEqual(ws.checkout_root(root / "a" / "b"), root)
 
 
 if __name__ == "__main__":

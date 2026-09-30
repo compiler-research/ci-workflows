@@ -118,6 +118,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CELLS_YAML = REPO_ROOT / "cells.yaml"
+# Cell resolution lives in bin/cells.py (on top of bin/gha.py), shared
+# with bin/start; this file only asks it questions.
+sys.path.insert(0, str(REPO_ROOT / "bin"))
+import cells  # noqa: E402
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -314,44 +318,9 @@ def list_jobs(args: argparse.Namespace) -> int:
 
 
 def published_cells(path: Optional[Path] = None) -> List[Dict[str, str]]:
-    """Parse cells.yaml's `cells:` array into a list of dicts.
-
-    cells.yaml lists each cell as one inline-flow YAML row:
-        - { recipe: llvm-asan, version: '22', os: ubuntu-24.04, arch: x86_64 }
-    Hand-rolled parser instead of pulling in PyYAML to keep the
-    script stdlib-only. Returns [] on missing file or parse failure
-    -- the caller treats this purely as a hint, never a hard error.
-    `path` defaults to the in-tree cells.yaml; tests inject a
-    different path.
-    """
-    if path is None:
-        path = CELLS_YAML
-    if not path.is_file():
-        return []
-    out: List[Dict[str, str]] = []
-    in_cells = False
-    for line in path.read_text().splitlines():
-        if line.startswith("cells:"):
-            in_cells = True
-            continue
-        if not in_cells:
-            continue
-        # Any new top-level key ends the cells: section.
-        if line and not line[0].isspace() and not line.startswith("#"):
-            break
-        s = line.strip()
-        if not s.startswith("- {") or not s.endswith("}"):
-            continue
-        body = s[3:-1].strip()  # strip leading "- {" and trailing "}"
-        cell: Dict[str, str] = {}
-        for kv in body.split(","):
-            if ":" not in kv:
-                continue
-            k, _, v = kv.partition(":")
-            cell[k.strip()] = v.strip().strip("'").strip('"')
-        if all(k in cell for k in ("recipe", "version", "os", "arch")):
-            out.append(cell)
-    return out
+    """cells.yaml's `cells:` list -- see cells.load_catalog. `path`
+    defaults to the in-tree cells.yaml; tests inject a different one."""
+    return cells.load_catalog(path or CELLS_YAML)
 
 
 def _act_listing() -> List[Dict[str, str]]:
@@ -547,83 +516,15 @@ def _act_dryrun_rows() -> List[Dict[str, object]]:
     return out
 
 
-# setup-llvm's `flavor` -> recipe table (actions/setup-llvm, "Resolve
-# flavor -> recipe"). flavor=system maps to no recipe: the row installs
-# LLVM from apt/brew and there is no cell to fetch.
-_FLAVOR_TO_RECIPE = {
-    "":      "llvm-release",
-    "asan":  "llvm-asan",
-    "msan":  "llvm-msan",
-    "cling": "llvm-root",
-    "debug": "llvm-debug",
-}
+_ROWS: Optional[List["cells.RowCells"]] = None
 
 
-def _os_to_cell_arch(os_slug: str) -> str:
-    """Derive a cell arch from a runner slug, like setup-llvm does."""
-    if os_slug.startswith("macos-"):
-        return "x86_64" if os_slug.endswith("-intel") else "arm64"
-    if os_slug.endswith("-arm"):
-        return "arm64"
-    return "x86_64"
-
-
-def _row_cell_coord(m: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    """Map a matrix row to its (recipe, version, os, arch) cell coord.
-
-    Handles both consumer conventions:
-      - `use-recipe: <recipe-name>` (+ recipe-version / recipe-arch),
-        fed straight to setup-recipe (CARTopiaX, CppInterOp);
-      - setup-llvm's flavor dispatch (clad): `use-recipe: 'true'`
-        selects the empty flavor (llvm-release), otherwise
-        `flavor` (default `system`) picks the recipe.
-    A row that resolves to no recipe gets `recipe: None`.
-    """
-    use_recipe = m.get("use-recipe")
-    if str(use_recipe).lower() == "true":
-        recipe: Optional[str] = _FLAVOR_TO_RECIPE[""]
-    elif use_recipe:
-        recipe = str(use_recipe)
-    else:
-        recipe = _FLAVOR_TO_RECIPE.get(str(m.get("flavor") or "system"))
-    os_slug = m.get("self-hosted-os") or m.get("os")
-    version = m.get("recipe-version") or m.get("clang-runtime")
-    arch = (m.get("recipe-arch") or m.get("arch")
-            or (_os_to_cell_arch(str(os_slug)) if os_slug else None))
-    return {
-        "recipe":  recipe,
-        "version": str(version) if version else None,
-        "os":      str(os_slug) if os_slug else None,
-        "arch":    str(arch) if arch else None,
-    }
-
-
-_SCANNED: Optional[Dict[str, Dict[str, str]]] = None
-
-
-def _scanned_row_coord(row_name: str) -> Optional[Dict[str, str]]:
-    """The cell `row_name` pulls, read from the workflows themselves.
-
-    workflow_scan evaluates each setup-llvm / setup-recipe `with:`
-    against the row, so it needs no knowledge of the consumer's
-    conventions -- clad's `use-recipe: 'true'`, CppInterOp's bare
-    `flavor`. A row that pulls several cells (LLVM plus cuda-headers)
-    maps to the first its steps fetch. None when the row fetches no
-    cell or the cwd is not a checkout.
-    """
-    global _SCANNED
-    if _SCANNED is None:
-        _SCANNED = {}
-        sys.path.insert(0, str(REPO_ROOT / "bin"))
-        import workflow_scan  # noqa: E402
-        here = Path.cwd().resolve()
-        top = next((d for d in (here, *here.parents)
-                    if (d / ".git").exists()), None)
-        for e in (workflow_scan.scan_repo(top) if top else []):
-            _SCANNED.setdefault(e["row"], {k: e[k] for k in
-                                           workflow_scan.COORD_KEYS})
-    coord = _SCANNED.get(row_name)
-    return dict(coord) if coord else None
+def _repo_rows() -> List["cells.RowCells"]:
+    """cells.scan() of the checkout we run in, computed once."""
+    global _ROWS
+    if _ROWS is None:
+        _ROWS = cells.scan_cwd()
+    return _ROWS
 
 
 def _print_fast_cells_hint() -> None:
@@ -631,26 +532,16 @@ def _print_fast_cells_hint() -> None:
     for each matrix row, annotating rows that hit a published Linux
     cell (download instead of inline build).
     """
-    cells = published_cells()
+    catalog = published_cells()
     rows = discover_matrix_rows()
     if not rows:
         return
-    # Index act-resolved matrices by row_name so cell tagging uses
-    # the same data act has already computed.
-    matrix_by_row: Dict[str, Dict[str, str]] = {
-        r["row_name"]: r["matrix"] for r in _act_dryrun_rows()
-    }
+    repo_rows = _repo_rows()
 
     def _cell_for(row_name: str) -> Optional[Dict[str, str]]:
-        coord = (_scanned_row_coord(row_name) or
-                 _row_cell_coord(matrix_by_row.get(row_name) or {}))
-        if not all(coord.values()):
-            return None
-        for c in cells:
-            if all(coord[k] == c[k]
-                   for k in ("recipe", "version", "os", "arch")):
-                return c
-        return None
+        found = cells.find_row(repo_rows, row_name)
+        coord = found.primary if found else None
+        return coord if coord and cells.in_catalog(coord, catalog) else None
 
     # Count name occurrences so we know whether the user needs `-W`
     # / `-j` to disambiguate. Unique row names get the minimal
@@ -671,11 +562,10 @@ def _print_fast_cells_hint() -> None:
     _log("[failed] marks rows whose latest run on this branch failed.")
     _log("")
     for wf_file, job_id, row_name in rows:
-        cell = _cell_for(row_name) if cells else None
+        cell = _cell_for(row_name) if catalog else None
         tags = []
         if cell:
-            tags.append(f"[cell: {cell['recipe']}/{cell['version']}/"
-                        f"{cell['os']}/{cell['arch']}]")
+            tags.append(f"[cell: {cells.coord_str(cell)}]")
         if row_name in failed or job_id in failed:
             tags.append(f"{red}[failed]{reset}")
         suffix = "  # " + " ".join(tags) if tags else ""
@@ -1091,59 +981,37 @@ DEVSHELL_INIT_SCRIPT   = REPO_ROOT / "scripts" / "devshell-init"
 
 
 def _devshell_cell(args: argparse.Namespace) -> Dict[str, str]:
-    """Resolve the matrix-row name in args.matrix to a cell coord.
-
-    Mirrors `_print_fast_cells_hint._cell_for`: walks act's dry-run
-    matrix output, then validates the (recipe, version, os, arch)
-    tuple against cells.yaml (so a typo doesn't silently produce a
-    URL that 404s). Exits with a clear message on miss.
+    """Resolve args.matrix's `name:` -- a row name or a direct
+    recipe/version/os/arch coord -- to a cell, validated against
+    cells.yaml so a typo doesn't become a URL that 404s. Row names are
+    looked up with cells.scan over the checkout's own workflows.
+    Exits with a clear message on miss.
     """
     name = _matrix_get(args.matrix or [], "name")
     if not name:
         sys.exit("error: --devshell needs a row name "
                  "(positional alias or `-m name:<row>`)")
-    # Direct-coord shorthand for cells not in any consumer matrix
-    # (e.g. llvm-release/22/ubuntu-24.04/x86_64). Skip the act matrix
-    # lookup; jump straight to cells.yaml validation below.
+    # Direct-coord shorthand, for cells no consumer matrix references.
     if "/" in name:
-        parts = name.split("/")
-        if len(parts) != 4:
+        coord = cells.parse_coord(name)
+        if coord is None:
             sys.exit(f"error: --devshell direct-coord must be "
                      f"recipe/version/os/arch; got '{name}'")
-        coord = {
-            "recipe": parts[0], "version": parts[1],
-            "os":     parts[2], "arch":    parts[3],
-        }
-        cells = published_cells()
-        if cells and not any(all(coord[k] == c[k]
-                                 for k in ("recipe", "version", "os", "arch"))
-                             for c in cells):
+        catalog = published_cells()
+        if catalog and not cells.in_catalog(coord, catalog):
             sys.exit(f"error: cell {coord} not in cells.yaml")
         return coord
-    scanned = _scanned_row_coord(name)
-    if scanned is not None:
-        m: Dict[str, Any] = {}
-        coord: Dict[str, Optional[str]] = dict(scanned)
-    else:
-        matrix_by_row = {r["row_name"]: r["matrix"]
-                         for r in _act_dryrun_rows()}
-        m = matrix_by_row.get(name)
-        if m is None:
-            sys.exit(f"error: row '{name}' not found in matrix discovery")
-        coord = _row_cell_coord(m)
-    if not coord["recipe"]:
+    row = cells.find_row(_repo_rows(), name)
+    if row is None:
+        sys.exit(f"error: row '{name}' calls no ci-workflows action that "
+                 f"fetches a cell (or is not a row of this checkout's "
+                 f".github/workflows)")
+    coord = row.primary
+    if coord is None:
         sys.exit(f"error: row '{name}' doesn't pull from a recipe cache "
-                 f"(no matrix.use-recipe, and flavor="
-                 f"{m.get('flavor') or 'system'} installs LLVM from the "
-                 f"system package manager)")
-    if not all(coord.values()):
-        missing = ", ".join(k for k, v in coord.items() if not v)
-        sys.exit(f"error: row '{name}' doesn't pull from a recipe cache "
-                 f"(can't resolve cell {missing} from its matrix)")
-    cells = published_cells()
-    if cells and not any(all(coord[k] == c[k]
-                             for k in ("recipe", "version", "os", "arch"))
-                         for c in cells):
+                 f"({'; '.join(row.notes)})")
+    catalog = published_cells()
+    if catalog and not cells.in_catalog(coord, catalog):
         sys.exit(f"error: cell {coord} not in cells.yaml -- the asset "
                  f"likely doesn't exist on Releases")
     return coord
@@ -2149,8 +2017,10 @@ def _resolve_pattern(pattern: str, args: argparse.Namespace) -> None:
     args.matrix = (args.matrix or []) + [f"name:{name}"]
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: Optional[List[str]] = None) -> int:
+    """The CLI. bin/start calls this with an argv of its own, so the
+    command line is the whole contract between the two scripts."""
+    args = parse_args(argv)
     if args.list:
         return list_jobs(args)
 

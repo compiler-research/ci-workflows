@@ -1,24 +1,22 @@
-"""Find the recipe cells a repository's GitHub workflows pull.
+"""GitHub Actions semantics, stdlib-only: enough to read a workflow the
+way the runner would, without running it.
 
-    import workflow_scan
-    workflow_scan.ci_workflows_refs(checkout)   # does it use us at all?
-    workflow_scan.scan_repo(checkout)           # which cells, from which rows
+    rows = gha.iter_rows(checkout)                 # every expanded matrix row
+    gha.iter_calls(row.steps, row.ctx, checkout, {"setup-llvm"})
 
-A consumer never names its cell outright: it hands matrix values to
-setup-llvm / setup-recipe (or to a composite that calls them) through
-`${{ }}` expressions, and each consumer wires those differently --
-clad's `flavor: ${{ matrix.use-recipe != 'true' && (matrix.flavor ||
-'system') || '' }}`, CppInterOp's bare `${{ matrix.flavor }}`,
-CARTopiaX's setup-biodynamo. Rather than knowing every consumer's
-convention, this evaluates the consumer's own `with:` against each
-expanded matrix row, the way the runner would, and then applies the
-one piece of logic that lives in shell rather than in expressions:
-setup-llvm's flavor -> recipe table.
+Knows nothing about recipes or cells -- that is bin/cells.py, which
+builds on this. What is here:
 
-Stdlib-only, like bin/repro and bin/start, hence the YAML-subset parser
-below. It covers what workflow files use -- block and flow collections,
-quoted and block scalars, anchors, aliases and merge keys -- and
-nothing else (no tags, no multi-document streams, no complex keys).
+  - a YAML subset parser: block and flow collections, quoted and block
+    scalars, anchors, aliases and merge keys (no tags, no multi-doc);
+  - the `${{ }}` expression language: operators, loose equality,
+    format/contains/startsWith/..., and interpolation;
+  - matrix expansion (product, exclude, include), step `if:`, and
+    walking a job's steps into composite actions, feeding each one its
+    `inputs` context.
+
+Stdlib-only for the same reason as bin/repro and bin/start: a
+contributor running those has Docker and a Python, and nothing else.
 """
 
 from __future__ import annotations
@@ -27,39 +25,18 @@ import itertools
 import json
 import math
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import (Any, Collection, Dict, Iterator, List, Optional,
+                    Tuple)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-COORD_KEYS = ("recipe", "version", "os", "arch")
 
 #: `uses:` of one of our actions: owner/repo/actions/<name>@ref.
 _CI_ACTION_RE = re.compile(
     r"^compiler-research/ci-workflows/actions/([A-Za-z0-9_.-]+)@")
 #: Anything of ours, including reusable workflows.
 _CI_ANY_RE = re.compile(r"compiler-research/ci-workflows/[^\s'\"]+@")
-
-#: setup-llvm's "Resolve flavor -> recipe" step. The only mapping that
-#: happens in shell rather than in an expression, so the only one that
-#: has to be restated here. system -> None: apt/brew, no cell.
-FLAVOR_TO_RECIPE = {
-    "":      "llvm-release",
-    "asan":  "llvm-asan",
-    "msan":  "llvm-msan",
-    "cling": "llvm-root",
-    "debug": "llvm-debug",
-    "system": None,
-}
-
-
-def os_to_arch(os_slug: str) -> str:
-    """setup-llvm's arch-from-os derivation."""
-    if os_slug.startswith("macos-"):
-        return "x86_64" if os_slug.endswith("-intel") else "arm64"
-    if os_slug.endswith("-arm"):
-        return "arm64"
-    return "x86_64"
 
 
 # ------------------------------------------------------------------ YAML
@@ -748,14 +725,14 @@ def expand_matrix(matrix: Any) -> Optional[List[Dict[str, Any]]]:
     return rows + added
 
 
-# --------------------------------------------------------------- scanning
+# --------------------------------------------------------------- actions
 
 
 def ci_workflows_refs(checkout: Path) -> List[Tuple[str, str]]:
     """(file, uses) for every reference to ci-workflows under .github/.
 
     The cheap "is this repo ci-workflows enabled" check: a textual scan,
-    so it also counts reusable workflows and actions scan_repo cannot
+    so it also counts reusable workflows and actions iter_calls cannot
     evaluate.
     """
     out: List[Tuple[str, str]] = []
@@ -803,22 +780,11 @@ def _action_inputs(action: Dict[str, Any], given: Dict[str, Any],
     return out
 
 
-def _coord(recipe: Optional[str], version: Any, os_slug: Any,
-           arch: Any) -> Optional[Dict[str, str]]:
-    if not recipe:
-        return None
-    os_s, ver = to_str(os_slug), to_str(version)
-    arch_s = to_str(arch) or (os_to_arch(os_s) if os_s else "")
-    coord = {"recipe": recipe, "version": ver, "os": os_s, "arch": arch_s}
-    return coord if all(coord.values()) else None
-
-
 def _load_action(ref: str, checkout: Path) -> Optional[Dict[str, Any]]:
     """action.yml for a `uses:` we can see locally, or None.
 
     Ours resolve against this ci-workflows tree, not a fetch of @ref:
-    the scan answers "which cells", and cells.yaml is read from here
-    too.
+    callers pair the answer with this tree's cells.yaml.
     """
     m = _CI_ACTION_RE.match(ref)
     if m:
@@ -871,52 +837,39 @@ def step_runs(cond: Any, ctx: Dict[str, Any]) -> bool:
         return True
 
 
-def _step_cells(steps: Any, ctx: Dict[str, Any], checkout: Path,
-                depth: int = 0) -> Iterator[Tuple[str, Dict[str, str]]]:
-    """Yield (action, coord) for every cell these steps would fetch."""
-    if depth > 5 or not isinstance(steps, list):
-        return
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        uses = to_str(step.get("uses"))
-        if not uses or not step_runs(step.get("if"), ctx):
-            continue
-        try:
-            given = {k: render(v, ctx)
-                     for k, v in (step.get("with") or {}).items()}
-        except ExprError:
-            continue
-        m = _CI_ACTION_RE.match(uses)
-        name = m.group(1) if m else None
-        action = _load_action(uses, checkout)
-        inputs = (_action_inputs(action, given, ctx) if action
-                  else {k: to_str(v) for k, v in given.items()})
-        if name == "setup-llvm":
-            # setup-llvm reaches setup-recipe through a shell step's
-            # outputs, which no expression can see -- resolve it here.
-            flavor = inputs.get("flavor", "")
-            if flavor not in FLAVOR_TO_RECIPE:
-                continue
-            coord = _coord(FLAVOR_TO_RECIPE[flavor],
-                           inputs.get("flavor-version") or
-                           inputs.get("version"),
-                           inputs.get("os"), inputs.get("arch"))
-            if coord:
-                yield name, coord
-            continue
-        if name == "setup-recipe":
-            coord = _coord(inputs.get("recipe"), inputs.get("version"),
-                           inputs.get("os"), inputs.get("arch"))
-            if coord:
-                yield name, coord
-            continue
-        runs = (action or {}).get("runs") or {}
-        if runs.get("using") == "composite":
-            sub = dict(ctx, inputs=inputs, steps={})
-            for _inner, coord in _step_cells(runs.get("steps"), sub,
-                                             checkout, depth + 1):
-                yield name or uses, coord
+def checkout_root(path: Path) -> Optional[Path]:
+    """The checkout containing `path`, or None.
+
+    Walks up for `.git` rather than asking git, so a worktree whose
+    main repository is not visible (a container mount, say) still
+    counts: only files under .github/ are ever read.
+    """
+    here = path.resolve()
+    for d in (here, *here.parents):
+        if (d / ".git").exists():
+            return d
+    return None
+
+
+# ---------------------------------------------------------------- walking
+
+
+@dataclass
+class Row:
+    """One expanded matrix row of one job, with its expression context."""
+    workflow: str   # repo-relative path of the workflow file
+    job: str
+    name: str       # matrix.name, else the rendered job name, else job id
+    ctx: Dict[str, Any]
+    steps: Any
+
+
+@dataclass
+class Call:
+    """One call to an action of ours, with its inputs fully evaluated."""
+    action: str     # e.g. "setup-llvm"
+    via: str        # the step the row itself runs: action name or uses:
+    inputs: Dict[str, str]
 
 
 def _row_label(job_id: str, job: Dict[str, Any], row: Dict[str, Any],
@@ -935,21 +888,16 @@ def _row_label(job_id: str, job: Dict[str, Any], row: Dict[str, Any],
     return job_id
 
 
-def scan_repo(checkout: Path) -> List[Dict[str, str]]:
-    """Every (row, cell) the checkout's workflows would fetch.
+def iter_rows(checkout: Path) -> Iterator[Row]:
+    """Every matrix row of every job in .github/workflows/, in file order.
 
-    One entry per distinct (workflow, job, row, cell), in file order,
-    with keys: workflow, job, row, action, recipe, version, os, arch.
-    Files that do not parse are skipped; this is a best-effort map,
-    and the caller validates each cell against cells.yaml.
+    Files that do not parse and matrices computed at run time are
+    skipped: this is a best-effort static reading.
     """
-    out: List[Dict[str, str]] = []
-    seen = set()
     wf_dir = checkout / ".github" / "workflows"
     if not wf_dir.is_dir():
-        return out
-    files = sorted(list(wf_dir.glob("*.yml")) + list(wf_dir.glob("*.yaml")))
-    for wf in files:
+        return
+    for wf in sorted(list(wf_dir.glob("*.yml")) + list(wf_dir.glob("*.yaml"))):
         try:
             doc = load_yaml(wf)
         except (YAMLError, OSError, IndexError):
@@ -959,12 +907,12 @@ def scan_repo(checkout: Path) -> List[Dict[str, str]]:
         for job_id, job in doc["jobs"].items():
             if not isinstance(job, dict):
                 continue
-            rows = expand_matrix((job.get("strategy") or {}).get("matrix")
-                                 if isinstance(job.get("strategy"), dict)
-                                 else None)
-            for row in rows or []:
+            strategy = job.get("strategy")
+            matrix = strategy.get("matrix") if isinstance(strategy, dict) \
+                else None
+            for values in expand_matrix(matrix) or []:
                 ctx: Dict[str, Any] = {
-                    "matrix": row, "inputs": {}, "env": {}, "vars": {},
+                    "matrix": values, "inputs": {}, "env": {}, "vars": {},
                     "secrets": {}, "steps": {}, "needs": {},
                     "github": {"event_name": "push",
                                "repository": checkout.name,
@@ -975,15 +923,47 @@ def scan_repo(checkout: Path) -> List[Dict[str, str]]:
                                                        ctx))
                 except ExprError:
                     ctx["runner"] = _runner_ctx("")
-                label = _row_label(str(job_id), job, row, ctx)
-                for action, coord in _step_cells(job.get("steps"), ctx,
-                                                 checkout):
-                    key = (wf.name, job_id, label) + tuple(
-                        coord[k] for k in COORD_KEYS)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    out.append(dict(coord, workflow=f".github/workflows/"
-                                    f"{wf.name}", job=str(job_id),
-                                    row=label, action=action))
-    return out
+                yield Row(workflow=str(wf.relative_to(checkout)),
+                          job=str(job_id),
+                          name=_row_label(str(job_id), job, values, ctx),
+                          ctx=ctx, steps=job.get("steps"))
+
+
+def iter_calls(steps: Any, ctx: Dict[str, Any], checkout: Path,
+               leaves: Collection[str], via: Optional[str] = None,
+               depth: int = 0) -> Iterator[Call]:
+    """Calls to the actions named in `leaves` that these steps would make.
+
+    Steps whose `if:` is false for this row are skipped. Any other
+    composite -- ours, or the consumer's own ./path action -- is walked
+    into with its `inputs` context, so a leaf reached through, say,
+    setup-biodynamo is still found. Leaves are not walked into: the
+    caller knows what they do.
+    """
+    if depth > 5 or not isinstance(steps, list):
+        return
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        uses = to_str(step.get("uses"))
+        if not uses or not step_runs(step.get("if"), ctx):
+            continue
+        try:
+            given = {k: render(v, ctx)
+                     for k, v in (step.get("with") or {}).items()}
+        except ExprError:
+            continue
+        m = _CI_ACTION_RE.match(uses)
+        name = m.group(1) if m else None
+        action = _load_action(uses, checkout)
+        inputs = (_action_inputs(action, given, ctx) if action
+                  else {k: to_str(v) for k, v in given.items()})
+        outer = via or name or uses
+        if name in leaves:
+            yield Call(action=name, via=outer, inputs=inputs)
+            continue
+        runs = (action or {}).get("runs") or {}
+        if runs.get("using") == "composite":
+            sub = dict(ctx, inputs=inputs, steps={})
+            yield from iter_calls(runs.get("steps"), sub, checkout, leaves,
+                                  outer, depth + 1)

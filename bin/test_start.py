@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import io
+import re
 import sys
 import tempfile
 import unittest
@@ -328,31 +329,41 @@ class SelectTest(unittest.TestCase):
 
 
 class LaunchTest(unittest.TestCase):
-    def test_hands_cmd_devshell_every_attribute_it_reads(self):
-        repro = mock.Mock()
-        repro.cmd_devshell.return_value = 0
+    """bin/start reaches bin/repro only through its command line."""
+
+    def _launch(self, coord, checkout="/somewhere/CARTopiaX"):
+        repro = start._load_repro()
+        with mock.patch.object(repro, "cmd_devshell",
+                               return_value=0) as cmd, \
+                redirect_stdout(io.StringIO()) as out:
+            rc = start.launch(repro, {}, Path(checkout), coord)
+        return rc, cmd.call_args[0][0], out.getvalue()
+
+    def test_argv_goes_through_repro_main_and_parser(self):
         project = start.load_projects(_write(WELL_FORMED))[0]
-        coord = start.coord_of(project)
-
-        with redirect_stdout(io.StringIO()):
-            rc = start.launch(repro, project, Path("/somewhere/CARTopiaX"),
-                              coord)
-
+        rc, ns, out = self._launch(start.coord_of(project))
         self.assertEqual(rc, 0)
-        ns = repro.cmd_devshell.call_args[0][0]
-        # cmd_devshell and its helpers read exactly these; a missing one
-        # is an AttributeError deep inside provisioning.
-        for attr in ("matrix", "devshell_host_cache",
-                     "devshell_host_cache_dir", "devshell_patches_out",
-                     "devshell_image", "devshell_refetch", "devshell_rm",
-                     "devshell_script", "devshell_as_root"):
-            self.assertTrue(hasattr(ns, attr), attr)
+        # Whatever repro's parser produces is what cmd_devshell reads,
+        # so a flag added to repro can't be missing here.
         self.assertEqual(
             ns.matrix,
             ["name:biodynamo/v1.05-cr-20260812-01/ubuntu-24.04/x86_64"])
         # Host-cache mode is the point for a newcomer: the download has
         # to outlive the container.
         self.assertTrue(ns.devshell_host_cache)
+        self.assertEqual(ns.devshell_patches_out, "/somewhere/CARTopiaX")
+        # The same command is printed, for reopening the shell later.
+        self.assertIn(" ".join(start.devshell_argv(
+            Path("/somewhere/CARTopiaX"), start.coord_of(project))), out)
+
+    def test_argv_is_accepted_by_the_real_parser(self):
+        repro = start._load_repro()
+        coord = {"recipe": "llvm-release", "version": "22",
+                 "os": "ubuntu-24.04", "arch": "x86_64"}
+        ns = repro.parse_args(start.devshell_argv(Path("/x"), coord))
+        self.assertTrue(ns.devshell)
+        self.assertEqual(ns.passthrough,
+                         ["llvm-release/22/ubuntu-24.04/x86_64"])
 
 
 class ResolveCheckoutTest(unittest.TestCase):
@@ -506,13 +517,10 @@ def _checkout(ci: Optional[str] = _CLAD_LIKE_CI) -> Path:
 
 
 def _fake_repro():
-    """Real devshell os/arch gates, no network for the cell key."""
-    real = start._load_repro()
-    repro = mock.Mock()
-    repro._devshell_image = real._devshell_image
-    repro._devshell_platform = real._devshell_platform
-    repro._devshell_compute_key.return_value = "k"
-    repro.cmd_devshell.return_value = 0
+    """The real repro, minus the network and the container."""
+    repro = start._load_repro()
+    repro._devshell_compute_key = mock.Mock(return_value="k")
+    repro.cmd_devshell = mock.Mock(return_value=0)
     return repro
 
 
@@ -576,8 +584,8 @@ class AnyRepositoryTest(unittest.TestCase):
     def test_main_in_an_uncatalogued_checkout_skips_the_menu(self):
         co = _checkout()
         repro = _fake_repro()
-        repro._origin_repo_slug.return_value = "vgvassilev/clad"
-        repro.published_cells.return_value = _CELLS
+        repro._origin_repo_slug = mock.Mock(return_value="vgvassilev/clad")
+        repro.published_cells = mock.Mock(return_value=_CELLS)
         with mock.patch.object(start, "preflight", return_value=True), \
                 mock.patch.object(start, "_load_repro", return_value=repro), \
                 mock.patch.object(start, "_asset_size", return_value=None), \
