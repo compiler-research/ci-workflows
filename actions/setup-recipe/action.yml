@@ -265,6 +265,34 @@ runs:
         if [ "${hash_dir:-false}" != false ]; then
           echo "::warning title=setup-recipe::the recipe hashed with hash_dir on, so its entries are bound to its own paths; expect misses."
         fi
+        # Precompiled-header compiles (LLVM >= 23) are only cacheable under
+        # this sloppiness, here as on the producer; it is not part of the
+        # key, so adding it to what the manifest records cannot cost a hit.
+        slop="$(mf build_env.ccache.sloppiness)"
+        slop="${slop// /}"   # `ccache --get-config` separates with ", "
+        case "$slop" in unknown) slop="" ;; esac
+        for s in pch_defines time_macros; do
+          case ",$slop," in *",$s,"*) ;; *) slop="${slop:+$slop,}$s" ;; esac
+        done
+        ccache --set-config="sloppiness=$slop"
+        # ccache hashes LANG / LC_ALL / LC_CTYPE / LC_MESSAGES into every key
+        # (they localise the diagnostics it caches), so a job whose locale
+        # differs from the producer's misses the whole cache. Reproduce what
+        # the manifest recorded; a variable the producer had unset cannot be
+        # unset from here, so that case only warns. Manifests predating the
+        # field say nothing either way.
+        python3 - "$manifest" "$GITHUB_ENV" <<'PY'
+        import json, os, sys
+        cfg = (json.load(open(sys.argv[1])).get("build_env") or {}).get("ccache") or {}
+        loc = cfg.get("locale")
+        if isinstance(loc, dict) and "locale" not in (cfg.get("sloppiness") or ""):
+            with open(sys.argv[2], "a") as env:
+                for var in ("LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES"):
+                    if var in loc:
+                        env.write(f"{var}={loc[var]}\n")
+                    elif var in os.environ:
+                        print(f"::warning title=setup-recipe::the recipe was built with {var} unset, here it is {os.environ[var]!r}; ccache lookups will miss.")
+        PY
         {
           echo "CCACHE_DIR=$dir"
           echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"

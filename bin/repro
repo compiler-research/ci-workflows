@@ -1240,6 +1240,28 @@ def _devshell_ccache_cfg(manifest: Dict) -> Dict[str, str]:
     return ((manifest.get("build_env") or {}).get("ccache") or {})
 
 
+#: Where repro-config writes the environment the devshell's shells need
+#: (today: the producer's locale, see _devshell_producer_locale).
+DEVSHELL_ENV_FILE = "/etc/devshell-env.sh"
+_LOCALE_VARS = ("LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES")
+_LOCALE_VALUE = re.compile(r"^[A-Za-z0-9_.@-]*$")
+
+
+def _devshell_producer_locale(cfg: Dict) -> Optional[str]:
+    """The producer's recorded locale as `VAR=value ...`, or None.
+
+    None when the manifest predates recording it (repro-config then
+    probes without a hint). "" when it recorded that none was set. The
+    manifest sits in a directory the container can write, so values are
+    held to the shape a locale name has before they reach docker.
+    """
+    loc = cfg.get("locale")
+    if not isinstance(loc, dict):
+        return None
+    return " ".join(f"{k}={loc[k]}" for k in _LOCALE_VARS
+                    if k in loc and _LOCALE_VALUE.match(str(loc[k])))
+
+
 def _devshell_workspace(manifest: Dict) -> str:
     """In-container path mirroring the recipe's runner workspace.
 
@@ -1555,6 +1577,17 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
         # applies it on the consumer side and warns on $CC --version
         # divergence.
         env_args += ["-e", f"DEVSHELL_PRODUCER_COMPILER_CHECK={cc}"]
+    # ccache hashes LANG/LC_ALL/LC_CTYPE/LC_MESSAGES into every key, so
+    # the shell has to reproduce the producer's locale to hit its cache.
+    # repro-config probes for it (the recorded value first, when the
+    # manifest has one) and writes the winner to DEVSHELL_ENV_FILE,
+    # which BASH_ENV makes every non-interactive bash -- scripts, the
+    # AI's tool calls -- source, and /etc/bash.bashrc every interactive
+    # one.
+    env_args += ["-e", f"BASH_ENV={DEVSHELL_ENV_FILE}"]
+    locale = _devshell_producer_locale(cfg)
+    if locale is not None:
+        env_args += ["-e", f"DEVSHELL_PRODUCER_LOCALE={locale}"]
 
     mount_args: list[str] = []
     if volume_name is not None:

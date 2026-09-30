@@ -194,13 +194,18 @@ run it from (its cell is read out of that repo's own workflows, no act
 involved) or a direct `recipe/version/os/arch` coord (e.g.
 `llvm-release/22/ubuntu-24.04/x86_64`) for cells no consumer matrix
 references yet. A row whose LLVM comes from apt/brew (setup-llvm
-`flavor: system`) has no cell, and says so. Files live under
-`~/.cache/ci-workflows/devshell/<cell>/`; the container is named
-`devshell-<cell>` and persists across invocations. Common knobs:
+`flavor: system`) has no cell, and says so. The cell's install,
+ccache and source live in a per-cell docker volume `devshell-<cell-id>`
+(e.g. `devshell-llvm-release-22-ubuntu-24.04-x86_64`), or, with
+`--devshell-host-cache`, on the host under
+`~/.cache/ci-workflows/devshell-cache/cells/<cell-id>/`, where they
+survive `docker volume rm` ([storage model](docs/developer-guide.md#storage-model--hermetic-by-default)).
+The container has the same name and persists across invocations.
+Common knobs:
 
 | flag | effect |
 |------|--------|
-| `--devshell-rm` | remove the container; preserve the host workdir |
+| `--devshell-rm` | remove the container; the volume and host cache are kept |
 | `--devshell-refetch` | re-download install / ccache / manifest |
 | `--devshell-script PATH` | run PATH inside the container instead of an interactive shell (CI / smoke use) |
 
@@ -210,10 +215,26 @@ auto-installs the libstdc++-N-dev that matches the producer's
 `/usr/include/c++/N` (catches the ~100% ccache-miss class caused by
 catthehacker's libstdc++-13 vs GHA's libstdc++-14), applies the
 producer's ccache `compiler_check`, replays the recipe's own cmake
-invocation from `manifest.cmake_args`, and warns on dev-package
-version drift. A smoke compile of `lib/Support/Allocator.cpp.o`
-verifies that the producer cache actually reaches the consumer
-environment before handing off the shell.
+invocation from `manifest.cmake_args`, warns on dev-package version
+drift, and reproduces the producer's locale (below). A smoke compile of
+`lib/Support/Allocator.cpp.o` verifies that the producer cache actually
+reaches the consumer environment before handing off the shell; it
+counts only a hit on one of the producer's own entries, not on one an
+earlier session wrote.
+
+ccache hashes `LANG`, `LC_ALL`, `LC_CTYPE` and `LC_MESSAGES` into every
+key, so a shell whose locale differs from the producer's misses the
+whole cache -- the llvm-release 22 cell was built under
+`LANG=C.UTF-8`, and a devshell without it got 0 hits. (LLVM >= 23
+cells had a second problem: their builds use precompiled headers, which
+ccache refuses to cache without `sloppiness=pch_defines,time_macros`, so
+cells published before `publish-recipe` set it hold almost nothing and
+need republishing. The devshell and `setup-recipe` set it too, so their
+own rebuilds are cached regardless.) Manifests now
+record the producer's values (`build_env.ccache.locale`); for older
+ones `repro-config` finds them by replaying the smoke compile under
+each candidate. The result goes to `/etc/devshell-env.sh`, which every
+shell in the container sources (via `BASH_ENV` and `/etc/bash.bashrc`).
 
 Works for any recipe, not only the LLVM ones: the source directory
 comes from the recipe's `source.repo` and the manifest's recorded cmake
@@ -268,6 +289,10 @@ the build simply takes half an hour:
   line, so replay the manifest's `cmake_args` and add to them rather
   than writing a configure of your own -- the same rule
   `scripts/repro-config` follows for the devshell.
+* **The producer's locale.** ccache hashes `LANG`/`LC_*` too. The
+  action exports what the manifest records (`build_env.ccache.locale`)
+  to the rest of the job, and warns when the producer had a variable
+  unset that this runner sets, which it cannot undo.
 
 Worth copying the devshell's check too: compile one TU every LLVM
 build has (`lib/Support/CMakeFiles/LLVMSupport.dir/Allocator.cpp.o`)

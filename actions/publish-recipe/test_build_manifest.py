@@ -252,6 +252,24 @@ class BuildManifestTests(unittest.TestCase):
             "libedit-dev": "3.1-20230828-1build1",
         })
 
+    def test_ccache_config_records_the_locale_ccache_hashes(self):
+        # ccache hashes LANG/LC_* into every key; a devshell that cannot
+        # reproduce them misses the whole sibling cache (the llvm-release
+        # 22 cell was built with LANG=C.UTF-8, the devshell had none).
+        ok = subprocess.CompletedProcess([], 0, stdout="v\n", stderr="")
+        env = {"LANG": "C.UTF-8", "LC_CTYPE": "C.UTF-8", "PATH": "/bin"}
+        with mock.patch.object(build_manifest.subprocess, "run",
+                               return_value=ok), \
+                mock.patch.dict(os.environ, env, clear=True):
+            cfg = build_manifest._ccache_config()
+        self.assertEqual(cfg["locale"], {"LANG": "C.UTF-8",
+                                         "LC_CTYPE": "C.UTF-8"})
+        self.assertEqual(cfg["sloppiness"], "v")
+        with mock.patch.object(build_manifest.subprocess, "run",
+                               return_value=ok), \
+                mock.patch.dict(os.environ, {"PATH": "/bin"}, clear=True):
+            self.assertEqual(build_manifest._ccache_config()["locale"], {})
+
     def test_installed_packages_empty_without_dpkg(self):
         with mock.patch.object(build_manifest.subprocess, "run",
                                side_effect=FileNotFoundError):

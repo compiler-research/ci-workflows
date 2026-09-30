@@ -1504,6 +1504,31 @@ class DevshellCellTests(unittest.TestCase):
         self.assertIn("not in cells.yaml", str(cm.exception))
 
 
+class DevshellLocaleTests(unittest.TestCase):
+    """ccache hashes LANG/LC_* into every key; the devshell has to learn
+    the producer's locale from the manifest (or probe for it)."""
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def test_recorded_locale_becomes_a_probe_hint(self):
+        f = self.repro._devshell_producer_locale
+        self.assertEqual(f({"locale": {"LANG": "C.UTF-8",
+                                       "LC_CTYPE": "C.UTF-8"}}),
+                         "LANG=C.UTF-8 LC_CTYPE=C.UTF-8")
+        # Recorded as none set: an empty hint, which is not "no hint".
+        self.assertEqual(f({"locale": {}}), "")
+        # Pre-field manifests give no hint; repro-config probes blind.
+        self.assertIsNone(f({"compiler_check": "string:x"}))
+
+    def test_values_that_are_not_locale_names_are_dropped(self):
+        # The manifest lives where the container can write it.
+        self.assertEqual(self.repro._devshell_producer_locale(
+            {"locale": {"LANG": "C.UTF-8 BASH_ENV=/tmp/x",
+                        "LC_ALL": "$(id)", "LC_CTYPE": "en_US.UTF-8"}}),
+            "LC_CTYPE=en_US.UTF-8")
+
+
 class DevshellCoordArgvTests(unittest.TestCase):
     """Pin that a direct `recipe/version/os/arch` coord in the
     positional slot reaches _devshell_cell rather than the act matrix

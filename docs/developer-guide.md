@@ -493,7 +493,8 @@ The sibling ccache has a second consumer, in CI rather than at a
 prompt: `setup-llvm`'s `fetch-ccache` restores it into a workflow, for
 a row that has to compile the recipe's sources again in a
 configuration the install tree cannot express. It mirrors the
-producer's `hash_dir`/`base_dir` settings the way `repro-config` does,
+producer's `hash_dir`/`base_dir` settings and its locale (`LANG`/`LC_*`,
+which ccache hashes into every key) the way `repro-config` does,
 and leaves the two things it cannot control -- the source's relative
 path and the configure flags -- to the consumer. See the README
 section for what a row has to match.
@@ -718,7 +719,11 @@ Idempotent — runs once per fetch, no-ops on rebuild:
 4. **ccache `compiler_check`**: applies the producer's value
    verbatim (exported by `bin/repro` from
    `manifest.build_env.ccache.compiler_check`). Warns when the
-   consumer's `$CC --version` diverges.
+   consumer's `$CC --version` diverges. Also sets `sloppiness` to the
+   producer's recorded value plus `pch_defines,time_macros`: LLVM >= 23
+   builds with precompiled headers, which ccache refuses to cache
+   without them. Sloppiness is not part of the key, so adding to it
+   costs no hits.
 5. **recipe host deps**: runs
    `recipes/<recipe>/devshell-setup.sh` off the read-only
    `/ci-workflows` bind, when the recipe ships one. Step 1 installs
@@ -741,10 +746,24 @@ Idempotent — runs once per fetch, no-ops on rebuild:
    and clears the `CMakeCache.txt` cmake leaves behind on abort so a
    later session retries — a devshell whose *recipe* source is not
    configured is still a working devshell.
-7. **smoke compile**: builds
-   `lib/Support/CMakeFiles/LLVMSupport.dir/Allocator.cpp.o`. Zero
-   ccache hits ⇒ producer cache isn't reaching the consumer (drift
-   the earlier checks didn't catch); surfaces a `::warning::`
+7. **locale**: ccache hashes `LANG`, `LC_ALL`, `LC_CTYPE` and
+   `LC_MESSAGES` into every key. Replays the smoke compile below
+   read-only under each candidate -- the manifest's recorded
+   `build_env.ccache.locale` first, then none, `LANG=C.UTF-8`,
+   `LC_CTYPE=C.UTF-8` -- and keeps the first the producer's cache
+   answers. A hit only counts when the entry predates the manifest's
+   `built_at`, so the devshell's own earlier compiles cannot pass for
+   the producer's. The winner is written to `/etc/devshell-env.sh`,
+   sourced through `BASH_ENV` (non-interactive shells, the AI's tool
+   calls) and `/etc/bash.bashrc` (interactive ones). Warns when the
+   recorded value is not the one that hit. `build_manifest.py` records
+   the locale from its own Python process on purpose: `build.py`'s
+   compiles inherit Python's PEP 538 coercion (`LC_CTYPE=C.UTF-8` when
+   `LANG` is unset), and so does it.
+8. **smoke compile**: builds
+   `lib/Support/CMakeFiles/LLVMSupport.dir/Allocator.cpp.o`. A miss
+   on the producer's entries ⇒ its cache isn't reaching the consumer
+   (drift the earlier checks didn't catch); surfaces a `::warning::`
    rather than aborting.
 
 ### Limits
