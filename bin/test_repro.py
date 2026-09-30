@@ -1394,6 +1394,9 @@ class DevshellCellTests(unittest.TestCase):
 
     def setUp(self):
         self.repro = _load_repro()
+        # Pin the act-matrix path: nothing scanned from whatever
+        # checkout the tests happen to run in.
+        self.repro._SCANNED = {}
 
     def _ns(self, name):
         return argparse.Namespace(matrix=[f"name:{name}"])

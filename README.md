@@ -32,7 +32,19 @@ Your checkout is bind-mounted, not copied, so edits show up on the host
 immediately and you commit, push and open pull requests from there.
 No credentials are copied into the container.
 
-`./bin/start --list` prints the catalog without prompting. See
+Not in the list? Any repository whose CI uses ci-workflows works --
+clad, for example, either way round:
+
+```bash
+./bin/start --repo vgvassilev/clad        # owner/repo, clone URL or path
+cd ~/src/clad && ~/src/ci-workflows/bin/start
+```
+
+It reads the repository's own workflows, lists the toolchains its CI
+rows pull, and offers the plainest one first.
+
+`./bin/start --list` prints the catalog without prompting
+(`--list --repo <path>` does the same for a checkout). See
 [Onboarding a contributor](docs/developer-guide.md#onboarding-a-contributor-binstart)
 for what it sets up and how to add a project to the list.
 

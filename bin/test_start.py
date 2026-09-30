@@ -19,6 +19,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 
 START_PATH = Path(__file__).resolve().parent / "start"
@@ -462,3 +463,130 @@ class AssetSizeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+_CLAD_LIKE_CI = """\
+on: push
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - { name: sys18, os: ubuntu-24.04-arm, clang-runtime: '18' }
+          - { name: rel22, os: ubuntu-24.04, clang-runtime: '22', use-recipe: 'true' }
+          - { name: asan23, os: ubuntu-24.04, clang-runtime: '23', flavor: asan }
+          - { name: mac23, os: macos-26, clang-runtime: '23', use-recipe: 'true' }
+    steps:
+      - uses: compiler-research/ci-workflows/actions/setup-llvm@main
+        with:
+          version: ${{ matrix.clang-runtime }}
+          os:      ${{ matrix.os }}
+          flavor:  ${{ matrix.use-recipe != 'true' && (matrix.flavor || 'system') || '' }}
+"""
+
+_CELLS = [
+    {"recipe": "llvm-release", "version": "22", "os": "ubuntu-24.04",
+     "arch": "x86_64"},
+    {"recipe": "llvm-asan", "version": "23", "os": "ubuntu-24.04",
+     "arch": "x86_64"},
+    {"recipe": "llvm-release", "version": "23", "os": "macos-26",
+     "arch": "arm64"},
+]
+
+
+def _checkout(ci: Optional[str] = _CLAD_LIKE_CI) -> Path:
+    root = Path(tempfile.mkdtemp()).resolve() / "clad"
+    (root / ".git").mkdir(parents=True)
+    if ci is not None:
+        wf = root / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        (wf / "ci.yml").write_text(ci, encoding="utf-8")
+    return root
+
+
+def _fake_repro():
+    """Real devshell os/arch gates, no network for the cell key."""
+    real = start._load_repro()
+    repro = mock.Mock()
+    repro._devshell_image = real._devshell_image
+    repro._devshell_platform = real._devshell_platform
+    repro._devshell_compute_key.return_value = "k"
+    repro.cmd_devshell.return_value = 0
+    return repro
+
+
+class AnyRepositoryTest(unittest.TestCase):
+    """bin/start on a repository outside projects.yaml, clad as the
+    example: the cell comes from the repo's own workflows."""
+
+    def test_plainest_servable_cell_is_the_default(self):
+        with mock.patch("builtins.input", side_effect=[""]), \
+                mock.patch.object(start, "_asset_size", return_value=None), \
+                redirect_stdout(io.StringIO()) as out:
+            got = start.start_checkout(_fake_repro(), "file:///x", _CELLS,
+                                       _checkout())
+        project, coord = got
+        self.assertEqual(coord, _CELLS[0])  # llvm-release before asan
+        self.assertEqual(project["name"], "clad")
+        text = out.getvalue()
+        # macOS is in cells.yaml but has no dev container; say so.
+        self.assertIn("llvm-release/23/macos-26/arm64", text)
+        self.assertIn("no dev container", text)
+
+    def test_quit_at_the_toolchain_prompt(self):
+        with mock.patch("builtins.input", side_effect=["q"]), \
+                mock.patch.object(start, "_asset_size", return_value=None), \
+                redirect_stdout(io.StringIO()):
+            got = start.start_checkout(_fake_repro(), "file:///x", _CELLS,
+                                       _checkout())
+        self.assertIs(got, start.QUIT)
+
+    def test_repository_not_using_ci_workflows_is_refused(self):
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertIsNone(start.start_checkout(
+                _fake_repro(), "file:///x", _CELLS, _checkout(ci=None)))
+        self.assertIn("does not use compiler-research/ci-workflows",
+                      out.getvalue())
+
+    def test_only_system_rows_means_nothing_to_offer(self):
+        ci = _CLAD_LIKE_CI.replace("use-recipe: 'true'", "x: y").replace(
+            "flavor: asan", "x: z")
+        with redirect_stdout(io.StringIO()) as out, \
+                mock.patch("builtins.input",
+                           side_effect=AssertionError("must not prompt")):
+            self.assertIsNone(start.start_checkout(
+                _fake_repro(), "file:///x", _CELLS, _checkout(ci)))
+        self.assertIn("flavor=system", out.getvalue())
+
+    def test_owner_repo_shorthand_clones_from_github(self):
+        with mock.patch.object(start, "resolve_checkout",
+                               return_value=None) as rc:
+            start.custom_checkout("vgvassilev/clad")
+        self.assertEqual(rc.call_args[0][0],
+                         {"name": "clad",
+                          "repo": "https://github.com/vgvassilev/clad"})
+
+    def test_existing_path_is_used_without_cloning(self):
+        co = _checkout()
+        with mock.patch.object(start, "resolve_checkout",
+                               side_effect=AssertionError("no clone")):
+            self.assertEqual(start.custom_checkout(str(co / ".github")), co)
+
+    def test_main_in_an_uncatalogued_checkout_skips_the_menu(self):
+        co = _checkout()
+        repro = _fake_repro()
+        repro._origin_repo_slug.return_value = "vgvassilev/clad"
+        repro.published_cells.return_value = _CELLS
+        with mock.patch.object(start, "preflight", return_value=True), \
+                mock.patch.object(start, "_load_repro", return_value=repro), \
+                mock.patch.object(start, "_asset_size", return_value=None), \
+                mock.patch.object(start.Path, "cwd", return_value=co), \
+                mock.patch("builtins.input", side_effect=["2"]), \
+                redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(start.main([]), 0)
+        self.assertNotIn("select a project", out.getvalue())
+        ns = repro.cmd_devshell.call_args[0][0]
+        self.assertEqual(ns.matrix,
+                         ["name:llvm-asan/23/ubuntu-24.04/x86_64"])
+        self.assertEqual(ns.devshell_patches_out, str(co))

@@ -417,6 +417,43 @@ cd ~/src/CARTopiaX && ~/src/ci-workflows/bin/start
 The second form matches on the `origin` remote rather than the
 directory name, so forks and renamed directories resolve.
 
+### Repositories outside the catalog
+
+A repository that is not in `projects.yaml` still works if its CI uses
+ci-workflows. clad is the worked example:
+
+```bash
+./bin/start --repo vgvassilev/clad         # owner/repo, URL or path; clones if needed
+cd ~/src/clad && ~/src/ci-workflows/bin/start  # uncatalogued checkout: no menu
+./bin/start --list --repo ~/src/clad       # what it would offer, no prompts
+```
+
+The menu also takes `o` for "another repository".
+
+Such a repository has no recorded cell, so `bin/workflow_scan.py` reads
+one out of its workflows. It expands every job's matrix the way GitHub
+does and evaluates each `setup-llvm` / `setup-recipe` `with:` (and our
+composites that call them, such as `setup-biodynamo` and `setup-cuda`)
+against each row, step `if:`s included. It needs no knowledge of the
+consumer's conventions, which really do differ: clad writes
+`use-recipe: 'true'` and defaults its flavor to `system`, while
+CppInterOp passes `matrix.flavor` straight through, so an absent flavor
+means llvm-release there. Only setup-llvm's flavor-to-recipe table
+lives in shell rather than in expressions, so that table is restated in
+the scanner.
+
+Each resulting cell is checked against `cells.yaml` and against what
+`--devshell` can open (the ubuntu-24.04 and ubuntu-22.04 runner images today). Usable cells are
+listed plainest first: llvm-release before its sanitizer and debug
+variants, then by how many rows use it. The rest are listed with the
+reason they can't be used. A repository whose rows only use
+`flavor=system` gets told there is nothing to download; `bin/repro
+<row>` replays such a row under act instead.
+
+`bin/repro --devshell <row>` and the `[cell: ...]` tags in `bin/repro
+--list` use the same scan, and fall back to the act matrix when the
+scan finds nothing for a row.
+
 On selection it enables host-cache mode -- a newcomer's download should
 survive `docker volume rm` and a machine move -- binds the checkout at
 `/patches`, and lets `repro-config` do the rest: the recipe's

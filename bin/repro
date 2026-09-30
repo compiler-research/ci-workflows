@@ -598,6 +598,34 @@ def _row_cell_coord(m: Dict[str, Any]) -> Dict[str, Optional[str]]:
     }
 
 
+_SCANNED: Optional[Dict[str, Dict[str, str]]] = None
+
+
+def _scanned_row_coord(row_name: str) -> Optional[Dict[str, str]]:
+    """The cell `row_name` pulls, read from the workflows themselves.
+
+    workflow_scan evaluates each setup-llvm / setup-recipe `with:`
+    against the row, so it needs no knowledge of the consumer's
+    conventions -- clad's `use-recipe: 'true'`, CppInterOp's bare
+    `flavor`. A row that pulls several cells (LLVM plus cuda-headers)
+    maps to the first its steps fetch. None when the row fetches no
+    cell or the cwd is not a checkout.
+    """
+    global _SCANNED
+    if _SCANNED is None:
+        _SCANNED = {}
+        sys.path.insert(0, str(REPO_ROOT / "bin"))
+        import workflow_scan  # noqa: E402
+        here = Path.cwd().resolve()
+        top = next((d for d in (here, *here.parents)
+                    if (d / ".git").exists()), None)
+        for e in (workflow_scan.scan_repo(top) if top else []):
+            _SCANNED.setdefault(e["row"], {k: e[k] for k in
+                                           workflow_scan.COORD_KEYS})
+    coord = _SCANNED.get(row_name)
+    return dict(coord) if coord else None
+
+
 def _print_fast_cells_hint() -> None:
     """After `act -l`, print copy-pastable `bin/repro` invocations
     for each matrix row, annotating rows that hit a published Linux
@@ -614,7 +642,8 @@ def _print_fast_cells_hint() -> None:
     }
 
     def _cell_for(row_name: str) -> Optional[Dict[str, str]]:
-        coord = _row_cell_coord(matrix_by_row.get(row_name) or {})
+        coord = (_scanned_row_coord(row_name) or
+                 _row_cell_coord(matrix_by_row.get(row_name) or {}))
         if not all(coord.values()):
             return None
         for c in cells:
@@ -1091,12 +1120,17 @@ def _devshell_cell(args: argparse.Namespace) -> Dict[str, str]:
                              for c in cells):
             sys.exit(f"error: cell {coord} not in cells.yaml")
         return coord
-    matrix_by_row = {r["row_name"]: r["matrix"]
-                     for r in _act_dryrun_rows()}
-    m = matrix_by_row.get(name)
-    if m is None:
-        sys.exit(f"error: row '{name}' not found in matrix discovery")
-    coord = _row_cell_coord(m)
+    scanned = _scanned_row_coord(name)
+    if scanned is not None:
+        m: Dict[str, Any] = {}
+        coord: Dict[str, Optional[str]] = dict(scanned)
+    else:
+        matrix_by_row = {r["row_name"]: r["matrix"]
+                         for r in _act_dryrun_rows()}
+        m = matrix_by_row.get(name)
+        if m is None:
+            sys.exit(f"error: row '{name}' not found in matrix discovery")
+        coord = _row_cell_coord(m)
     if not coord["recipe"]:
         sys.exit(f"error: row '{name}' doesn't pull from a recipe cache "
                  f"(no matrix.use-recipe, and flavor="
