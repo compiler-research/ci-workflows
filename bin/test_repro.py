@@ -85,6 +85,23 @@ class BuildActCommandTests(unittest.TestCase):
             _ns(job="test", workflow="ci.yml", shell=False))
         self.assertEqual(cmd[:5], ["act", "-j", "test", "-W", "ci.yml"])
 
+    def test_options_after_the_row_are_ours(self):
+        # Regression: these used to land in passthrough -- for act -- and
+        # --devshell, which never runs act, dropped them silently.
+        ns = repro.parse_args(["--devshell", "row", "--devshell-script",
+                               "s.sh", "--devshell-as-root"])
+        self.assertEqual(ns.devshell_script, "s.sh")
+        self.assertTrue(ns.devshell_as_root)
+        self.assertTrue(ns.devshell)
+        self.assertEqual(ns.passthrough, ["row"])
+
+    def test_unknown_options_after_the_row_still_reach_act(self):
+        ns = repro.parse_args(["row", "--no-shell", "--act-flag", "--",
+                               "--verbose"])
+        self.assertFalse(ns.shell)
+        self.assertEqual(ns.passthrough, ["row", "--act-flag", "--",
+                                          "--verbose"])
+
     def test_passthrough_after_dashdash(self):
         cmd = repro.build_act_command(
             _ns(job="test", shell=False,

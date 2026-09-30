@@ -251,7 +251,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     p.add_argument("passthrough", nargs=argparse.REMAINDER,
                    help="anything after `--` is passed to act verbatim")
-    return p.parse_args(argv)
+    ns = p.parse_args(argv)
+    # REMAINDER takes everything from the row name on, so in
+    # `bin/repro <row> --devshell-rm` the option would go to act -- and
+    # under --devshell, where act never runs, vanish silently. Read our
+    # own options back out of what follows the row, up to an explicit
+    # `--`; anything we don't know still goes to act, as before.
+    rest = ns.passthrough or []
+    if rest and not rest[0].startswith("-"):
+        cut = rest.index("--") if "--" in rest else len(rest)
+        trailing = rest[1:cut]
+        if trailing:
+            ns.passthrough = []
+            ns, unknown = p.parse_known_args(trailing, namespace=ns)
+            ns.passthrough = ([rest[0]] + (ns.passthrough or []) + unknown
+                              + rest[cut:])
+    return ns
 
 
 def _log(msg: str) -> None:
