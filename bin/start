@@ -23,15 +23,17 @@ and the cells a dev container can serve are offered, plainest first.
 Why a second entry point rather than a `bin/repro` flag: repro's
 audience already knows what a matrix row is and why they want to
 reproduce one. This one's audience has been handed a link by a
-supervisor. Nothing here is new machinery -- the module is loaded and
-`cmd_devshell` called directly, so provisioning, container naming,
-ccache wiring and the AI setup all stay in one place. What this file
-owns is the catalog, the prompts, and the decision of what to hand
-`cmd_devshell`.
+supervisor. Nothing here is new machinery: a devshell is opened by
+running a `bin/repro --devshell ...` command line through repro.main
+(see devshell_argv), so provisioning, container naming, ccache wiring
+and the AI setup all stay in repro, and the CLI a user could type is the
+only contract between the two. Which cell a repository's rows pull is
+bin/cells.py's business. What this file owns is the catalog, the
+prompts, and the choice of cell to hand repro.
 
 Deliberately stdlib-only, like bin/repro: a student running this has
-Docker and a Python, and that has to be enough. That is also why
-projects.yaml is parsed here by hand instead of with PyYAML.
+Docker and a Python, and that has to be enough. YAML is read with
+bin/gha.py's parser for the same reason.
 """
 
 from __future__ import annotations
@@ -88,49 +90,24 @@ def _load_repro():
 
 
 def load_projects(path: Optional[Path] = None) -> List[Dict[str, str]]:
-    """Parse projects.yaml's `projects:` list.
-
-    Hand-rolled for the same reason published_cells() is -- no PyYAML
-    on a student's machine. The accepted shape is deliberately narrow:
-    a `- name: value` line opens an entry and further indented
-    `key: value` lines extend it. Only the first colon splits, so a
-    description may contain them.
+    """projects.yaml's `projects:` list, every value a string.
 
     Entries missing a required field are dropped rather than raised
     on: a malformed row should cost the student that one project, not
     the whole menu. verify.yml is what makes malformed rows loud.
     """
-    if path is None:
-        path = PROJECTS_YAML
-    if not path.is_file():
+    try:
+        doc = gha.load_yaml(path or PROJECTS_YAML)
+    except (OSError, gha.YAMLError, IndexError):
         return []
     out: List[Dict[str, str]] = []
-    cur: Optional[Dict[str, str]] = None
-    in_projects = False
-    for line in path.read_text().splitlines():
-        stripped = line.strip()
-        if line.startswith("projects:"):
-            in_projects = True
+    for entry in (doc or {}).get("projects") or []:
+        if not isinstance(entry, dict):
             continue
-        if not in_projects:
-            continue
-        # Any new top-level key ends the projects: block.
-        if line and not line[0].isspace() and not line.startswith("#"):
-            break
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith("- "):
-            if cur:
-                out.append(cur)
-            cur = {}
-            stripped = stripped[2:].strip()
-        if cur is None or ":" not in stripped:
-            continue
-        key, _, value = stripped.partition(":")
-        cur[key.strip()] = value.strip().strip("'").strip('"')
-    if cur:
-        out.append(cur)
-    return [p for p in out if all(k in p and p[k] for k in _REQUIRED)]
+        p = {str(k): gha.to_str(v) for k, v in entry.items()}
+        if all(p.get(k) for k in _REQUIRED):
+            out.append(p)
+    return out
 
 
 def coord_of(project: Dict[str, str]) -> Dict[str, str]:
@@ -401,18 +378,6 @@ def resolve_checkout(project: Dict[str, str]) -> Optional[Path]:
     return dest
 
 
-def _value_after(line: str, key: str) -> Optional[str]:
-    """Pull `key: value` out of one line, inline-flow or block.
-
-    Stops at a comma or a closing brace so an inline row like
-    `{ name: r, recipe-version: v1, arch: x86_64 }` yields just `v1`.
-    """
-    _, _, rest = line.partition(key)
-    rest = rest.lstrip().lstrip(":").strip()
-    value = rest.split(",")[0].split("}")[0].strip().strip("'\"")
-    return value or None
-
-
 def _repo_slug(url: str) -> str:
     """owner/repo out of a clone URL, for comparing catalog to remote."""
     trimmed = url.rstrip("/")
@@ -452,73 +417,20 @@ def detect_project(repro, projects: List[Dict[str, str]]
     return None
 
 
-#: Matrix keys that name a recipe version, most specific first. The
-#: same pair `_devshell_cell` maps from, because consumers disagree:
-#: CARTopiaX says `recipe-version`, CppInterOp says `clang-runtime`.
-_VERSION_KEYS = ("recipe-version", "clang-runtime")
-
-#: `name:` as a mapping key: opening a block item, or after `{` / `,`
-#: inline. Anchored at both ends because a substring test matches the
-#: wrong row -- `ubu24-x86-gcc12-llvm22` against the line for
-#: `ubu24-x86-gcc12-llvm22-cppyy` -- and matches `flavor-name:` too.
-_NAME_RE = re.compile(r"(?:[{,]|^\s*-)\s*name:\s*([^,}\s]+)")
-
-
-def _row_name(line: str) -> Optional[str]:
-    """The row this line opens, or None if it opens no row."""
-    m = _NAME_RE.search(line)
-    return m.group(1).strip("'\"") if m else None
-
-
-def _collect_versions(line: str, into: Dict[str, str]) -> None:
-    """Record any version keys on `line`; first occurrence wins."""
-    for key in _VERSION_KEYS:
-        if key in line and key not in into:
-            value = _value_after(line, key)
-            if value:
-                into[key] = value
-
-
-def repo_pinned_version(checkout: Path,
-                        project: Dict[str, str]) -> Optional[str]:
-    """Read the version the project itself pins for its recorded row.
+def repo_cell(checkout: Path,
+              project: Dict[str, str]) -> Optional[Dict[str, str]]:
+    """The cell the project's own workflow gives its catalogued row.
 
     The catalog makes the menu renderable before anything is cloned,
-    but the project is the authority on what it builds against, so a
-    bumped pin must not strand a contributor on last month's
-    toolchain. This is a targeted scan of one row, not a workflow
-    parser: it handles the inline and block matrix shapes because
-    consumers use both, and returns None the moment the answer is not
-    unambiguous. Being a little stale beats guessing.
-
-    Only the version is recovered. A project that changes its recipe,
-    os or arch outruns this check and needs the projects.yaml row
-    updated by hand; verify.yml is what catches the result.
+    but the project is the authority on what it builds against, so once
+    it is on disk its row is read back with cells.scan -- all four
+    coord fields, so a bumped version, a new recipe or a moved os all
+    win over a stale projects.yaml entry. None when the row is gone or
+    fetches no cell; the catalog's answer then stands.
     """
-    wf = checkout / project["workflow"]
-    if not wf.is_file():
-        return None
-    lines = wf.read_text().splitlines()
-    for i, line in enumerate(lines):
-        if _row_name(line) != project["row"]:
-            continue
-        # Collect the whole row before choosing, so precedence is by
-        # key and not by which line happened to come first.
-        found: Dict[str, str] = {}
-        _collect_versions(line, found)
-        # A block item carries its remaining keys indented past the
-        # `-`; an inline one ends here and the walk stops immediately.
-        indent = len(line) - len(line.lstrip())
-        for nxt in lines[i + 1:]:
-            if not nxt.strip() or nxt.lstrip().startswith("#"):
-                continue
-            if len(nxt) - len(nxt.lstrip()) <= indent:
-                break
-            _collect_versions(nxt, found)
-        for key in _VERSION_KEYS:
-            if key in found:
-                return found[key]
-        return None
+    for rc in cells.scan(checkout):
+        if rc.row == project["row"] and rc.workflow == project["workflow"]:
+            return rc.primary
     return None
 
 
@@ -817,11 +729,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         checkout = maybe_checkout
 
     coord = coord_of(project)
-    pinned = repo_pinned_version(checkout, project)
-    if pinned and pinned != coord["version"]:
-        print(f"  note: {project['name']} pins {pinned}, projects.yaml "
-              f"records {coord['version']}; using the repo's.")
-        coord["version"] = pinned
+    theirs = repo_cell(checkout, project)
+    if theirs and theirs != coord:
+        print(f"  note: {project['name']}'s {project['row']} row pulls "
+              f"{coord_str(theirs)}, projects.yaml records "
+              f"{coord_str(coord)}; using the repo's.")
+        coord = theirs
 
     return launch(repro, project, checkout, coord)
 

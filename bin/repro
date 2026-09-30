@@ -82,7 +82,12 @@ project`, etc. land directly on the host. The workspace-clash
 pre-flight (above) catches the resulting `build/` / `install/`
 on the next run; clean them up by hand if you want a pristine tree.
 
-Anything after `--` is passed verbatim to act.
+Options may come before or after the row name; anything after `--` is
+passed verbatim to act.
+
+Which cell a row pulls (for --devshell <row> and the --list tags) is
+read from the consumer's own workflows by bin/cells.py, which evaluates
+each setup-llvm / setup-recipe call against the row -- no act needed.
 
 Examples
 ========
@@ -97,6 +102,7 @@ Examples
 
     bin/repro --devshell llvm-root/cling-llvm22/ubuntu-24.04/x86_64
                                                   # hermetic dev shell
+    bin/repro --devshell ubu24-clang20-runtime23  # ... on that row's cell
     bin/repro --devshell --devshell-docker-options='--gpus all' <cell>
                                                   # ... that sees the GPUs
 """
@@ -2048,14 +2054,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             and not args.job):
         pattern = args.passthrough[0]
         args.passthrough = args.passthrough[1:]
-        # A `recipe/version/os/arch` coord names a cell in cells.yaml,
-        # not a matrix row, and _devshell_cell resolves it directly --
-        # the whole point of the shorthand is to reach cells that no
-        # consumer matrix references yet, so globbing it against act's
-        # rows could only miss. Anything else, including a malformed
-        # coord, still goes to the globber: a row name is free to
-        # contain a slash, and only the 4-part shape is unambiguous.
-        if args.devshell and len(pattern.split("/")) == 4:
+        # Under --devshell, two forms skip act's row globbing entirely,
+        # because _devshell_cell resolves them itself: a
+        # `recipe/version/os/arch` coord (a cell no consumer matrix may
+        # reference yet, so globbing could only miss), and an exact row
+        # name of this checkout's workflows (looked up by cells.scan).
+        # Anything else -- a glob, a malformed coord -- still goes to
+        # the globber: a row name is free to contain a slash, and only
+        # the 4-part shape is unambiguous.
+        if args.devshell and (len(pattern.split("/")) == 4 or
+                              cells.find_row(_repo_rows(), pattern)):
             args.matrix = (args.matrix or []) + [f"name:{pattern}"]
         else:
             _resolve_pattern(pattern, args)

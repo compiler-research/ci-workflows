@@ -115,119 +115,82 @@ class CoordTest(unittest.TestCase):
             "biodynamo/v1.05-cr-20260812-01/ubuntu-24.04/x86_64")
 
 
-class RepoPinnedVersionTest(unittest.TestCase):
-    """The project, once cloned, outranks the catalog."""
+_STEP = """\
+    steps:
+      - uses: compiler-research/ci-workflows/actions/setup-llvm@main
+        with:
+          version: ${{ matrix.clang-runtime }}
+          os: ${{ matrix.os }}
+          flavor: ${{ matrix.flavor }}
+"""
 
-    def _checkout(self, workflow_text: str) -> Path:
+
+class RepoCellTest(unittest.TestCase):
+    """The project, once cloned, outranks the catalog -- read through
+    cells.scan, so every coord field counts, not just the version."""
+
+    ROW = "ubu24-x86-gcc12-llvm22"
+
+    def _checkout(self, include: str) -> Path:
         root = Path(tempfile.mkdtemp())
-        wf = root / ".github" / "workflows" / "ci.yml"
+        wf = root / ".github" / "workflows" / "main.yml"
         wf.parent.mkdir(parents=True)
-        wf.write_text(workflow_text, encoding="utf-8")
+        wf.write_text("jobs:\n  build:\n    runs-on: ${{ matrix.os }}\n"
+                      "    strategy:\n      matrix:\n        include:\n"
+                      + include + _STEP, encoding="utf-8")
         return root
 
     def _project(self, **over):
-        p = {"workflow": ".github/workflows/ci.yml", "row": "ubu24-gcc"}
+        p = {"workflow": ".github/workflows/main.yml", "row": self.ROW}
         p.update(over)
         return p
 
-    def test_reads_the_pin_off_a_block_row(self):
-        # CARTopiaX's shape: `- name:` opens the row and the pin sits
-        # several keys below it. Reading only inline rows left this
-        # check inert for the project that motivated it.
+    def _cell(self, root, **over):
+        c = start.repo_cell(root, self._project(**over))
+        return start.coord_str(c) if c else None
+
+    def test_block_row(self):
         root = self._checkout(
-            "          - name: ubu24-gcc\n"
+            "          - name: ubu24-x86-gcc12-llvm22\n"
             "            os: ubuntu-24.04\n"
-            "            use-recipe: biodynamo\n"
-            "            recipe-version: v1.06-cr-20260901-01\n"
-            "            recipe-arch: x86_64\n"
-        )
-        self.assertEqual(start.repo_pinned_version(root, self._project()),
-                         "v1.06-cr-20260901-01")
+            "            clang-runtime: '23'\n")
+        self.assertEqual(self._cell(root), "llvm-release/23/ubuntu-24.04/x86_64")
 
-    def test_block_row_scan_stops_at_the_next_row(self):
+    def test_inline_row(self):
         root = self._checkout(
-            "          - name: ubu24-gcc\n"
-            "            os: ubuntu-24.04\n"
-            "          - name: ubu24-clang\n"
-            "            recipe-version: v9.99\n"
-        )
-        self.assertIsNone(start.repo_pinned_version(root, self._project()))
+            "          - { name: ubu24-x86-gcc12-llvm22, os: ubuntu-24.04, "
+            "clang-runtime: '22' }\n")
+        self.assertEqual(self._cell(root), "llvm-release/22/ubuntu-24.04/x86_64")
 
-    def test_reads_the_pin_off_an_inline_row(self):
+    def test_a_changed_recipe_is_seen_not_just_a_version(self):
         root = self._checkout(
-            "          - { name: ubu24-gcc, recipe-version: "
-            "v1.06-cr-20260901-01, arch: x86_64 }\n"
-        )
-        self.assertEqual(start.repo_pinned_version(root, self._project()),
-                         "v1.06-cr-20260901-01")
-
-    def test_other_rows_pin_is_not_picked_up(self):
-        root = self._checkout(
-            "          - { name: other-row, recipe-version: v9.99 }\n"
-        )
-        self.assertIsNone(start.repo_pinned_version(root, self._project()))
-
-    def test_missing_workflow_is_silent(self):
-        self.assertIsNone(
-            start.repo_pinned_version(Path(tempfile.mkdtemp()),
-                                      self._project()))
+            "          - { name: ubu24-x86-gcc12-llvm22, os: ubuntu-24.04, "
+            "clang-runtime: '22', flavor: debug }\n")
+        self.assertEqual(self._cell(root), "llvm-debug/22/ubuntu-24.04/x86_64")
 
     def test_a_longer_row_name_is_not_mistaken_for_this_row(self):
-        # Both of these are real CppInterOp rows. A substring test read
-        # the -cppyy row's pin for the plain row and would have pinned a
-        # contributor to LLVM 21 the moment the matrix was reordered.
+        # Both are real CppInterOp rows; a substring match once read the
+        # -cppyy row's LLVM 21 for the plain row.
         root = self._checkout(
-            "          - { name: ubu24-x86-gcc12-llvm22-cppyy, "
+            "          - { name: ubu24-x86-gcc12-llvm22-cppyy, os: ubuntu-24.04, "
             "clang-runtime: '21' }\n"
-            "          - { name: ubu24-x86-gcc12-llvm22, "
-            "clang-runtime: '22' }\n"
-        )
-        got = start.repo_pinned_version(
-            root, self._project(row="ubu24-x86-gcc12-llvm22"))
-        self.assertEqual(got, "22")
+            "          - { name: ubu24-x86-gcc12-llvm22, os: ubuntu-24.04, "
+            "clang-runtime: '22' }\n")
+        self.assertEqual(self._cell(root), "llvm-release/22/ubuntu-24.04/x86_64")
 
-    def test_a_key_merely_ending_in_name_is_not_the_row_name(self):
+    def test_other_row_or_other_workflow_is_not_picked_up(self):
         root = self._checkout(
-            "          - { flavor-name: ubu24-gcc, clang-runtime: '77' }\n"
-        )
-        self.assertIsNone(start.repo_pinned_version(root, self._project()))
-
-    def test_clang_runtime_is_read_when_that_is_what_the_row_names(self):
-        # CppInterOp names no recipe-version at all; reading only that
-        # key left this check inert for half the catalog.
+            "          - { name: other-row, os: ubuntu-24.04, "
+            "clang-runtime: '22' }\n")
+        self.assertIsNone(self._cell(root))
         root = self._checkout(
-            "          - { name: ubu24-gcc, clang-runtime: '22' }\n"
-        )
-        self.assertEqual(start.repo_pinned_version(root, self._project()),
-                         "22")
+            "          - { name: ubu24-x86-gcc12-llvm22, os: ubuntu-24.04, "
+            "clang-runtime: '22' }\n")
+        self.assertIsNone(self._cell(root, workflow=".github/workflows/x.yml"))
 
-    def test_precedence_is_by_key_not_by_line_order(self):
-        root = self._checkout(
-            "          - name: ubu24-gcc\n"
-            "            clang-runtime: '20'\n"
-            "            recipe-version: v9\n"
-        )
-        self.assertEqual(start.repo_pinned_version(root, self._project()),
-                         "v9")
-
-
-class ValueParsingTest(unittest.TestCase):
-    def test_value_after_stops_at_the_field_boundary(self):
-        self.assertEqual(
-            start._value_after("- { name: r, recipe-version: v1, a: b }",
-                               "recipe-version"), "v1")
-        self.assertEqual(
-            start._value_after("            recipe-version: 'v1'",
-                               "recipe-version"), "v1")
-
-    def test_row_name_recognises_both_matrix_shapes(self):
-        self.assertEqual(start._row_name("          - name: ubu24-gcc"),
-                         "ubu24-gcc")
-        self.assertEqual(start._row_name("  - { name: ubu24-gcc, os: x }"),
-                         "ubu24-gcc")
-        self.assertEqual(start._row_name("  - { os: x, name: ubu24-gcc }"),
-                         "ubu24-gcc")
-        self.assertIsNone(start._row_name("            os: ubuntu-24.04"))
+    def test_missing_workflow_is_silent(self):
+        self.assertIsNone(start.repo_cell(Path(tempfile.mkdtemp()),
+                                          self._project()))
 
 
 class RenderTest(unittest.TestCase):

@@ -1515,6 +1515,7 @@ class DevshellCoordArgvTests(unittest.TestCase):
 
     def setUp(self):
         self.repro = _load_repro()
+        self.repro._ROWS = []  # nothing scanned from the cwd checkout
 
     def _cell_of(self, argv):
         """Drive main() over argv; report the cell name it hands to
@@ -1539,6 +1540,16 @@ class DevshellCoordArgvTests(unittest.TestCase):
     def test_coord_positional_bypasses_the_matrix_globber(self):
         seen = self._cell_of(["--devshell", self.COORD])
         self.assertEqual(seen["name"], self.COORD)
+        self.assertFalse(seen["globbed"])
+
+    def test_exact_row_name_of_this_checkout_needs_no_act(self):
+        self.repro._ROWS = [self.repro.cells.RowCells(
+            workflow=".github/workflows/ci.yml", job="build",
+            row="ubu24-clang20-runtime23",
+            cells=[("setup-llvm", {"recipe": "llvm-release", "version": "23",
+                                   "os": "ubuntu-24.04", "arch": "x86_64"})])]
+        seen = self._cell_of(["--devshell", "ubu24-clang20-runtime23"])
+        self.assertEqual(seen["name"], "ubu24-clang20-runtime23")
         self.assertFalse(seen["globbed"])
 
     def test_row_name_positional_still_globs(self):

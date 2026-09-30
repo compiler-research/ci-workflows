@@ -141,6 +141,20 @@ class ResolverTest(unittest.TestCase):
         self.assertIsNone(r(dict(base, flavor="system"))[0])
         self.assertIn("unknown flavor", r(dict(base, flavor="zz"))[1])
 
+    def test_flavor_table_matches_setup_llvm_action(self):
+        # cells.FLAVOR_TO_RECIPE restates the `case` in setup-llvm's
+        # "Resolve flavor -> recipe" step, the one mapping done in shell.
+        # Parse the action so the two cannot drift apart unnoticed.
+        import re
+        text = (cells.REPO_ROOT / "actions" / "setup-llvm" /
+                "action.yml").read_text()
+        body = text[text.index('case "${FLAVOR}" in'):text.index("esac")]
+        table = {}
+        for m in re.finditer(r"^\s*('?)([a-z]*)\1\)\s*\n?\s*recipe=(\S*)",
+                             body, re.M):
+            table[m.group(2)] = m.group(3).strip("'") or None
+        self.assertEqual(table, cells.FLAVOR_TO_RECIPE)
+
     def test_a_new_resolver_is_picked_up_by_scan(self):
         # The extension point: registering is all it takes.
         @cells.resolves("setup-foo")
