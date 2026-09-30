@@ -33,11 +33,11 @@ immediately and you commit, push and open pull requests from there.
 No credentials are copied into the container.
 
 Not in the list? Any repository whose CI uses ci-workflows works --
-clad, for example, either way round:
+your fork of one of them, for example, either way round:
 
 ```bash
-./bin/start --repo vgvassilev/clad        # owner/repo, clone URL or path
-cd ~/src/clad && ~/src/ci-workflows/bin/start
+./bin/start --repo yourname/clad          # owner/repo, clone URL or path
+cd ~/src/my-fork && ~/src/ci-workflows/bin/start
 ```
 
 It reads the repository's own workflows, lists the toolchains its CI

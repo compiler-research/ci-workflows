@@ -584,7 +584,7 @@ class AnyRepositoryTest(unittest.TestCase):
     def test_main_in_an_uncatalogued_checkout_skips_the_menu(self):
         co = _checkout()
         repro = _fake_repro()
-        repro._origin_repo_slug = mock.Mock(return_value="vgvassilev/clad")
+        repro._origin_repo_slug = mock.Mock(return_value="someone/uncatalogued")
         repro.published_cells = mock.Mock(return_value=_CELLS)
         with mock.patch.object(start, "preflight", return_value=True), \
                 mock.patch.object(start, "_load_repro", return_value=repro), \
@@ -598,3 +598,13 @@ class AnyRepositoryTest(unittest.TestCase):
         self.assertEqual(ns.matrix,
                          ["name:llvm-asan/23/ubuntu-24.04/x86_64"])
         self.assertEqual(ns.devshell_patches_out, str(co))
+
+    def test_clad_is_in_the_catalog(self):
+        # The real projects.yaml: clad is a menu entry, and its row is
+        # the one a clad-shaped workflow resolves to a published cell.
+        clad = [p for p in start.load_projects() if p["name"] == "clad"]
+        self.assertEqual(len(clad), 1)
+        self.assertEqual(clad[0]["repo"], "https://github.com/vgvassilev/clad")
+        cell = start.coord_of(clad[0])
+        self.assertTrue(start.cells.in_catalog(
+            cell, start.cells.load_catalog()))

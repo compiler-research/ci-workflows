@@ -54,3 +54,13 @@ projects:
     version: '22'
     os: ubuntu-24.04
     arch: x86_64
+
+  - name: clad
+    description: Automatic differentiation for C/C++, as a Clang plugin
+    repo: https://github.com/vgvassilev/clad
+    workflow: .github/workflows/ci.yml
+    row: ubu24-clang20-runtime23
+    recipe: llvm-release
+    version: '23'
+    os: ubuntu-24.04
+    arch: x86_64

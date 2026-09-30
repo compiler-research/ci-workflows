@@ -420,12 +420,13 @@ directory name, so forks and renamed directories resolve.
 ### Repositories outside the catalog
 
 A repository that is not in `projects.yaml` still works if its CI uses
-ci-workflows. clad is the worked example:
+ci-workflows -- a fork, say, since the catalog matches on the exact
+`origin` owner/repo:
 
 ```bash
-./bin/start --repo vgvassilev/clad         # owner/repo, URL or path; clones if needed
-cd ~/src/clad && ~/src/ci-workflows/bin/start  # uncatalogued checkout: no menu
-./bin/start --list --repo ~/src/clad       # what it would offer, no prompts
+./bin/start --repo yourname/clad           # owner/repo, URL or path; clones if needed
+cd ~/src/my-fork && ~/src/ci-workflows/bin/start  # uncatalogued checkout: no menu
+./bin/start --list --repo ~/src/my-fork    # what it would offer, no prompts
 ```
 
 The menu also takes `o` for "another repository".

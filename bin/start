@@ -12,8 +12,8 @@ host dependencies, and opens a shell with Claude Code in it.
 
 Any other repository works too, as long as its CI uses ci-workflows:
 
-    ./bin/start --repo vgvassilev/clad        # owner/repo, URL or path
-    cd ~/src/clad && ~/src/ci-workflows/bin/start
+    ./bin/start --repo yourname/clad          # owner/repo, URL or path
+    cd ~/src/my-fork && ~/src/ci-workflows/bin/start
 
 A repository outside the catalog has no recorded cell, so its own
 workflows are read instead: every setup-llvm /
@@ -715,7 +715,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--repo", metavar="REPO",
         help="use this repository instead of the catalog: a path, a clone "
-             "URL, or GitHub owner/repo (e.g. vgvassilev/clad). Its "
+             "URL, or GitHub owner/repo (e.g. yourname/clad). Its "
              "workflows must use ci-workflows",
     )
     args = parser.parse_args(argv)
