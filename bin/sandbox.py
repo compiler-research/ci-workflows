@@ -18,6 +18,7 @@ Stdlib-only, like the rest of bin/.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import subprocess
@@ -26,6 +27,12 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 DOCKER = "docker"
+
+# Docker Desktop's CLI ends interactive sessions with "What's next:"
+# hints (e.g. to try `docker debug` on the container). They are noise in
+# a devshell, and point at a way into the container that bypasses its
+# restrictions; export DOCKER_CLI_HINTS=true to have them back.
+os.environ.setdefault("DOCKER_CLI_HINTS", "false")
 
 
 @dataclass(frozen=True)

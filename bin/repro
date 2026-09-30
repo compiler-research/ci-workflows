@@ -1657,6 +1657,8 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
         ("DEVSHELL_DEV_GID", f"{gid}"),
         ("DEVSHELL_PATCHES_MOUNT", f"{DEVSHELL_PATCHES_MOUNT}"),
         ("DEVSHELL_AI_REPO", f"{repo}"),
+        ("DEVSHELL_CELL", name[len("devshell-"):]
+                          if name.startswith("devshell-") else name),
         ("DEVSHELL_AI_REPO_ENCODED", f"{encoded}"),
     ]
     if host_cache is not None:
@@ -1867,7 +1869,7 @@ def cmd_devshell(args: argparse.Namespace) -> int:
     _log(f"  user            {'root' if args.devshell_as_root else 'dev (host UID/GID)'}")
     _log("")
     _log(f"repro: re-enter later with `bin/repro --devshell <cell>` "
-         f"or `docker exec -it -u dev -w {ws} {name} bash`")
+         f"or `docker exec -it -u dev -w {DEVSHELL_PATCHES_MOUNT} {name} bash`")
     _log(f"repro: tear down with `bin/repro --devshell --devshell-rm <cell>` "
          f"(volume kept)")
     _log("")
@@ -1887,9 +1889,12 @@ def cmd_devshell(args: argparse.Namespace) -> int:
         return sandbox.exec_(name, ["bash", "/tmp/devshell-script.sh"],
                              user=exec_user, workdir=ws).returncode
 
+    # The interactive shell starts in the project's own checkout; scripts
+    # keep the workspace as their working directory, which existing ones
+    # (verify.yml's smoke check among them) rely on.
     return _run_interactive(
-        sandbox.exec_argv(name, ["bash"], user=exec_user, workdir=ws,
-                          tty=True))
+        sandbox.exec_argv(name, ["bash"], user=exec_user,
+                          workdir=DEVSHELL_PATCHES_MOUNT, tty=True))
 
 
 def _container_tree_dirty(cid: str, workspace: str) -> bool:

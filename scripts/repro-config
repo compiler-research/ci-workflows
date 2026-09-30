@@ -281,6 +281,9 @@ write_locale() {  # $1: "VAR=value ..." (may be empty)
     echo "# Written by repro-config: the locale the producer's ccache was keyed with."
     printf 'unset %s\n' "${locale_vars[*]}"
     for kv in $1; do printf 'export %q\n' "$kv"; done
+    # Where Claude Code's own installer puts it -- the one route that
+    # works without sudo.
+    echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
   } > "$env_file"
   chmod 0644 "$env_file"
 }
@@ -344,6 +347,33 @@ fi
 write_locale "$chosen"
 grep -qF "$env_file" /etc/bash.bashrc 2>/dev/null \
   || printf '[ -r %s ] && . %s\n' "$env_file" "$env_file" >> /etc/bash.bashrc
+
+# The note an interactive shell opens with. Written here, read at shell
+# start, so it reflects the container as it is (Claude installed yet,
+# .git read-only or not) rather than as it was at provisioning.
+welcome=/etc/devshell-welcome.sh
+cat > "$welcome" <<'WELCOME'
+# Written by repro-config; sourced by interactive bash (/etc/bash.bashrc).
+[[ $- == *i* && -z "${DEVSHELL_WELCOMED:-}" ]] || return 0
+export DEVSHELL_WELCOMED=1
+_b=$'\e[1m' _d=$'\e[2m' _r=$'\e[0m'
+echo
+echo "${_b}devshell${_r} ${DEVSHELL_CELL:-} -- ${DEVSHELL_AI_REPO:-your project} is at /patches (you are here)"
+echo "  toolchain   ${DEVSHELL_INSTALL:-}"
+echo "  recipe src  ${DEVSHELL_SRC:-}   build: ${DEVSHELL_BUILD:-}"
+if grep -qE " /patches/\.git [^ ]+ ro[, ]" /proc/mounts 2>/dev/null; then
+  echo "  ${_d}.git is read-only here: edit in the container, commit and push on the host${_r}"
+fi
+if ! command -v claude >/dev/null 2>&1; then
+  echo "  Claude Code is not installed. Install it with:"
+  echo "    curl -fsSL https://claude.ai/install.sh | bash"
+fi
+echo
+unset _b _d _r
+WELCOME
+chmod 0644 "$welcome"
+grep -qF "$welcome" /etc/bash.bashrc 2>/dev/null \
+  || printf '[ -r %s ] && . %s\n' "$welcome" "$welcome" >> /etc/bash.bashrc
 
 # Sanity check: smoke-compile one TU every LLVM build has
 # (lib/Support/Allocator.cpp) and verify ccache hits the producer's

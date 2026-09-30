@@ -189,6 +189,11 @@ bin/repro ubu24-x86-gcc14-cling-llvm20-cppyy --devshell
 cd $DEVSHELL_BUILD && ninja clang
 ```
 
+The shell opens in `/patches`, your own checkout, with a short note on
+where the toolchain and the recipe's sources are, and on how to install
+Claude Code if it is missing (`curl -fsSL https://claude.ai/install.sh |
+bash`, which works without sudo).
+
 The cell argument is either a matrix-row name of the consumer repo you
 run it from (its cell is read out of that repo's own workflows, no act
 involved) or a direct `recipe/version/os/arch` coord (e.g.

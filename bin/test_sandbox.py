@@ -8,6 +8,7 @@ reviewer reads, not slip through as a side effect.
 from __future__ import annotations
 
 import importlib.machinery
+import os
 import importlib.util
 import sys
 import unittest
@@ -90,6 +91,11 @@ class CleanOutputTest(unittest.TestCase):
                 redirect_stdout(io.StringIO()) as out:
             rc = sandbox.exec_("c", ["echo"]).returncode
         self.assertEqual((rc, out.getvalue()), (0, "ok\n"))
+
+
+class CliHintsTest(unittest.TestCase):
+    def test_docker_desktop_hints_are_off_unless_asked_for(self):
+        self.assertEqual(os.environ.get("DOCKER_CLI_HINTS"), "false")
 
 
 class NothingElseBuildsDockerCommandsTest(unittest.TestCase):
