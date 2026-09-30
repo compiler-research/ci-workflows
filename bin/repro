@@ -114,7 +114,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePath
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CELLS_YAML = REPO_ROOT / "cells.yaml"
@@ -547,6 +547,57 @@ def _act_dryrun_rows() -> List[Dict[str, object]]:
     return out
 
 
+# setup-llvm's `flavor` -> recipe table (actions/setup-llvm, "Resolve
+# flavor -> recipe"). flavor=system maps to no recipe: the row installs
+# LLVM from apt/brew and there is no cell to fetch.
+_FLAVOR_TO_RECIPE = {
+    "":      "llvm-release",
+    "asan":  "llvm-asan",
+    "msan":  "llvm-msan",
+    "cling": "llvm-root",
+    "debug": "llvm-debug",
+}
+
+
+def _os_to_cell_arch(os_slug: str) -> str:
+    """Derive a cell arch from a runner slug, like setup-llvm does."""
+    if os_slug.startswith("macos-"):
+        return "x86_64" if os_slug.endswith("-intel") else "arm64"
+    if os_slug.endswith("-arm"):
+        return "arm64"
+    return "x86_64"
+
+
+def _row_cell_coord(m: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Map a matrix row to its (recipe, version, os, arch) cell coord.
+
+    Handles both consumer conventions:
+      - `use-recipe: <recipe-name>` (+ recipe-version / recipe-arch),
+        fed straight to setup-recipe (CARTopiaX, CppInterOp);
+      - setup-llvm's flavor dispatch (clad): `use-recipe: 'true'`
+        selects the empty flavor (llvm-release), otherwise
+        `flavor` (default `system`) picks the recipe.
+    A row that resolves to no recipe gets `recipe: None`.
+    """
+    use_recipe = m.get("use-recipe")
+    if str(use_recipe).lower() == "true":
+        recipe: Optional[str] = _FLAVOR_TO_RECIPE[""]
+    elif use_recipe:
+        recipe = str(use_recipe)
+    else:
+        recipe = _FLAVOR_TO_RECIPE.get(str(m.get("flavor") or "system"))
+    os_slug = m.get("self-hosted-os") or m.get("os")
+    version = m.get("recipe-version") or m.get("clang-runtime")
+    arch = (m.get("recipe-arch") or m.get("arch")
+            or (_os_to_cell_arch(str(os_slug)) if os_slug else None))
+    return {
+        "recipe":  recipe,
+        "version": str(version) if version else None,
+        "os":      str(os_slug) if os_slug else None,
+        "arch":    str(arch) if arch else None,
+    }
+
+
 def _print_fast_cells_hint() -> None:
     """After `act -l`, print copy-pastable `bin/repro` invocations
     for each matrix row, annotating rows that hit a published Linux
@@ -563,17 +614,7 @@ def _print_fast_cells_hint() -> None:
     }
 
     def _cell_for(row_name: str) -> Optional[Dict[str, str]]:
-        m = matrix_by_row.get(row_name) or {}
-        # Standard mapping convention used by main.yml's setup-recipe
-        # step: recipe = matrix.use-recipe, version = recipe-version
-        # || clang-runtime, arch = recipe-arch || x86_64.
-        coord = {
-            "recipe":  m.get("use-recipe"),
-            "version": (m.get("recipe-version")
-                        or m.get("clang-runtime")),
-            "os":      m.get("os"),
-            "arch":    m.get("recipe-arch") or "x86_64",
-        }
+        coord = _row_cell_coord(matrix_by_row.get(row_name) or {})
         if not all(coord.values()):
             return None
         for c in cells:
@@ -1055,15 +1096,16 @@ def _devshell_cell(args: argparse.Namespace) -> Dict[str, str]:
     m = matrix_by_row.get(name)
     if m is None:
         sys.exit(f"error: row '{name}' not found in matrix discovery")
-    coord = {
-        "recipe":  m.get("use-recipe"),
-        "version": (m.get("recipe-version") or m.get("clang-runtime")),
-        "os":      m.get("os"),
-        "arch":    m.get("recipe-arch") or "x86_64",
-    }
-    if not all(coord.values()):
+    coord = _row_cell_coord(m)
+    if not coord["recipe"]:
         sys.exit(f"error: row '{name}' doesn't pull from a recipe cache "
-                 f"(matrix.use-recipe missing)")
+                 f"(no matrix.use-recipe, and flavor="
+                 f"{m.get('flavor') or 'system'} installs LLVM from the "
+                 f"system package manager)")
+    if not all(coord.values()):
+        missing = ", ".join(k for k, v in coord.items() if not v)
+        sys.exit(f"error: row '{name}' doesn't pull from a recipe cache "
+                 f"(can't resolve cell {missing} from its matrix)")
     cells = published_cells()
     if cells and not any(all(coord[k] == c[k]
                              for k in ("recipe", "version", "os", "arch"))

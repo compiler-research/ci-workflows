@@ -1450,6 +1450,55 @@ class DevshellCellTests(unittest.TestCase):
         self.assertIn("doesn't pull from a recipe cache", str(cm.exception))
 
 
+    def _coord_of(self, matrix, cells=()):
+        rows = [{"row_name": "r", "matrix": matrix}]
+        with mock.patch.object(self.repro, "_act_dryrun_rows",
+                               return_value=rows), \
+             mock.patch.object(self.repro, "published_cells",
+                               return_value=list(cells)):
+            return self.repro._devshell_cell(self._ns("r"))
+
+    def test_use_recipe_true_selects_llvm_release(self):
+        # clad's convention: use-recipe 'true' is setup-llvm's empty
+        # flavor, i.e. the llvm-release recipe -- not a recipe named
+        # 'true'.
+        cell = {"recipe": "llvm-release", "version": "23",
+                "os": "ubuntu-24.04", "arch": "x86_64"}
+        coord = self._coord_of(
+            {"os": "ubuntu-24.04", "clang-runtime": "23",
+             "use-recipe": "true"}, cells=[cell])
+        self.assertEqual(coord, cell)
+
+    def test_macos_row_derives_arm64(self):
+        coord = self._coord_of(
+            {"os": "macos-26", "clang-runtime": "23",
+             "use-recipe": "true"})
+        self.assertEqual(coord["arch"], "arm64")
+        coord = self._coord_of(
+            {"os": "macos-26-intel", "clang-runtime": "23",
+             "use-recipe": "true"})
+        self.assertEqual(coord["arch"], "x86_64")
+
+    def test_flavor_selects_recipe(self):
+        coord = self._coord_of(
+            {"os": "ubuntu-24.04", "clang-runtime": "22",
+             "flavor": "debug"})
+        self.assertEqual(coord["recipe"], "llvm-debug")
+        coord = self._coord_of(
+            {"os": "ubuntu-24.04", "clang-runtime": "23",
+             "flavor": "asan"})
+        self.assertEqual(coord["recipe"], "llvm-asan")
+
+    def test_system_flavor_row_exits(self):
+        # No use-recipe, no flavor: setup-llvm defaults to flavor=system
+        # (apt/brew), which has no cell.
+        with self.assertRaises(SystemExit) as cm:
+            self._coord_of({"os": "ubuntu-24.04-arm",
+                            "clang-runtime": "18"})
+        self.assertIn("doesn't pull from a recipe cache", str(cm.exception))
+        self.assertIn("flavor=system", str(cm.exception))
+
+
 class DevshellCoordArgvTests(unittest.TestCase):
     """Pin that a direct `recipe/version/os/arch` coord in the
     positional slot reaches _devshell_cell rather than the act matrix
