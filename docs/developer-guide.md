@@ -567,28 +567,39 @@ rather than 404'ing on Releases.
 
 ### Storage model — hermetic by default
 
-The host sees only two paths from the running container:
+The host sees only these paths from the running container:
 
-1. **`$PWD` bound at `/patches` (rw).** Always on. AI inside writes
-   `git format-patch -o /patches …`; you `git am` from `$PWD` on
-   the host with your own identity. Refuses to launch if `$PWD ==
-   $HOME` or resolves to `/`.
-2. **`<host-cache>` bound at `/cache` (rw).** Opt-in via
-   `--devshell-host-cache`. Carries persistent per-cell state
-   AND the user's AI tooling. Layout:
+1. **`$PWD` bound at `/patches` (rw), its `.git` read-only.** Always
+   on. Edit in the container; commit, push and `git am` on the host
+   with your own identity. `.git` is read-only because git on the host
+   acts on its config and hooks (`--devshell-writable-git` to opt out).
+   Patches of the recipe's *own* source go the same way:
+   `git -C $DEVSHELL_SRC format-patch -o /patches …`. Refuses to launch
+   if `$PWD == $HOME` or resolves to `/`.
+2. **Parts of `<host-cache>`.** Opt-in via `--devshell-host-cache`:
+   the cell's working data as the workspace, and the AI tooling under
+   `/cache` -- skills and settings read-only, and only this project's
+   memory directory read-write. Nothing else of the host cache is
+   mounted: not other cells, not other projects' memory, and not
+   `manifests/`, the copies the host itself acts on. Layout:
 
    ```
    <host-cache>/                            default: ~/.cache/ci-workflows/devshell-cache/
-     cells/<cell-id>/                       per-cell working data
+     cells/<cell-id>/                       this cell's working data -> the workspace (rw)
        _recipe_out/install/                 install tree (LLVM_PREFIX)
        .ccache/                             producer's sibling ccache
        _recipe_work/llvm-project/           shallow llvm-project @ SRC_COMMIT
-       manifest.json                        producer manifest
+       manifest.json                        the container's copy of the manifest
+     manifests/<key>.json                   the host's copy; never mounted
      ai/
-       skills/                              user-curated skills (consumed inside via ~/.claude/skills symlink)
-       settings.json                        user-curated settings (~/.claude/settings.json symlink)
-       memory/<repo>/<encoded-host-path>/   per-project AI memory (~/.claude/projects/-patches/memory symlink)
+       skills/                              -> /cache/ai/skills (ro; ~/.claude/skills symlink)
+       settings.json                        -> /cache/ai/settings.json (ro; ~/.claude/settings.json)
+       memory/<repo>/<encoded-host-path>/   -> the same path under /cache (rw; ~/.claude/projects/-patches/memory)
    ```
+
+   bin/repro refuses to bind a path with a symlink in it below the host
+   cache, and runs git on the host only to create a checkout; an
+   existing one is updated from inside the container.
 
 Everything else — sources, build dir, ccache when host-cache is off,
 shell history, container HOME — lives in a per-cell named docker
@@ -599,6 +610,30 @@ reclaim with `docker volume rm devshell-<cell-id>`.
 Inside the container the workspace is bind-mounted at the recipe's
 runner workspace path (read from `manifest.build_env.ccache.base_dir`),
 so ccache's recorded paths match the producer.
+
+### Container restrictions
+
+The devshell runs the AI with the user's source tree in reach, so the
+container is restricted by default. All of it is built in one place,
+`bin/sandbox.py` plus `_devshell_security` / `_devshell_mounts` in
+`bin/repro`, and `scripts/devshell-posture-check` verifies it from the
+inside (verify.yml's devshell-smoke job runs it):
+
+- `dev` has no sudo, and the container runs under `no-new-privileges`.
+  `repro-config` installs what the devshell needs as root before the
+  shell starts; `--devshell-sudo` restores passwordless sudo (and lifts
+  `no-new-privileges`, which sudo cannot work under).
+- All capabilities are dropped except `CHOWN`, `DAC_OVERRIDE`,
+  `FOWNER`, `FSETID`, `KILL`, `SETGID` and `SETUID` -- what the init
+  script, apt and the switch to `dev` need -- and processes are limited.
+- No Docker socket, and the mounts above, nothing else.
+- Changing any of these re-creates the container; the restrictions it
+  was created with are recorded in a label.
+
+Not covered: the network is open (the AI needs its API, git and package
+mirrors), so the container can reach what the machine can. Put the
+devshell on a restricted network through `--devshell-docker-options`
+if that matters for the work at hand.
 
 ### Reaching the rest of the host
 

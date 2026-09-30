@@ -83,12 +83,15 @@ else
   useradd -u "$dev_uid" -g dev -d "$dev_home" -m -s /bin/bash dev
 fi
 
-# NOPASSWD sudo lets the AI apt-install build deps without any host
-# credential entering the container.
-if command -v sudo >/dev/null 2>&1 \
-   && [[ ! -f /etc/sudoers.d/devshell-dev ]]; then
+# Passwordless sudo only when asked for (bin/repro --devshell-sudo):
+# it makes everything running as dev -- the AI included -- root in the
+# container. Without it the container also runs under
+# no-new-privileges, where sudo could not raise privileges anyway.
+if [[ "${DEVSHELL_SUDO:-}" == 1 ]] && command -v sudo >/dev/null 2>&1; then
   echo "dev ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/devshell-dev
   chmod 0440 /etc/sudoers.d/devshell-dev
+else
+  rm -f /etc/sudoers.d/devshell-dev
 fi
 mkdir -p "$dev_home"
 chown "$dev_uid:$dev_gid" "$dev_home"

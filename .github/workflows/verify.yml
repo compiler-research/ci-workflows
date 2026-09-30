@@ -312,6 +312,20 @@ jobs:
               --devshell-script "$RUNNER_TEMP/smoke.sh" \
               "$COORD"
 
+      # The same devshell, checked from the inside against the
+      # restrictions bin/repro promises: not root, no sudo, no
+      # capabilities in effect, no-new-privileges, read-only .git, and
+      # only this cell's workspace and project's AI memory writable.
+      - name: Devshell security posture
+        env:
+          COORD: ${{ steps.cell.outputs.coord }}
+        run: |
+          set -euo pipefail
+          ./bin/repro --devshell \
+              --devshell-host-cache-dir "$RUNNER_TEMP/devshell-cache" \
+              --devshell-script scripts/devshell-posture-check \
+              "$COORD"
+
   # setup-llvm's system flavor adds apt-llvm.org only when the distro
   # archive does not serve the major. Ask that with the installed
   # packages counted in and a runner already carrying llvm-N reads as an

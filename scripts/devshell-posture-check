@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Verify, from inside a devshell, the restrictions bin/repro promises.
+#
+#   bin/repro --devshell --devshell-host-cache \
+#       --devshell-script scripts/devshell-posture-check <cell>
+#
+# Runs as `dev` (the user the shell and the AI get) and checks what the
+# container actually enforces, not what the flags were meant to do: the
+# account, capabilities, privilege gain, seccomp, process limit, and
+# which host paths are visible and writable. One line per property;
+# exits non-zero if any fails. verify.yml's devshell-smoke job runs it.
+#
+# Honours the two opt-outs, so it also checks that they do only what
+# they say: DEVSHELL_SUDO=1 (--devshell-sudo) and a writable
+# /patches/.git (--devshell-writable-git, detected rather than told).
+set -uo pipefail
+
+fail=0
+ok()   { echo "  ok    $1"; }
+bad()  { echo "  FAIL  $1"; fail=1; }
+check() { if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
+status() { awk -v k="$1:" '$1 == k { print $2 }' /proc/self/status; }
+
+echo "devshell posture:"
+
+# The account.
+check "not running as root"                '[ "$(id -u)" != 0 ]'
+if [[ "${DEVSHELL_SUDO:-}" == 1 ]]; then
+  check "passwordless sudo (--devshell-sudo)" 'sudo -n true'
+else
+  check "no passwordless sudo"             '! sudo -n true'
+  check "no sudoers entry for dev"         '[ ! -e /etc/sudoers.d/devshell-dev ]'
+  check "no-new-privileges set"            '[ "$(status NoNewPrivs)" = 1 ]'
+fi
+
+# Capabilities: none in effect for dev, and the bounding set -- what any
+# process in the container could ever hold -- is exactly the kept list
+# (CHOWN DAC_OVERRIDE FOWNER FSETID KILL SETGID SETUID, plus AUDIT_WRITE
+# with sudo).
+want_bnd=$(( 0xfb | (${DEVSHELL_SUDO:-0} == 1 ? 1 << 29 : 0) ))
+check "no effective capabilities"          '[ $((16#$(status CapEff))) -eq 0 ]'
+check "capability bounding set is the kept list only" \
+  '[ $((16#$(status CapBnd))) -eq '"$want_bnd"' ]'
+check "seccomp filter active"              '[ "$(status Seccomp)" = 2 ]'
+check "process count limited" \
+  'm=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max); [ "$m" != max ]'
+
+# No way to drive the Docker daemon from inside.
+check "no Docker socket"                   '[ ! -e /var/run/docker.sock ] && [ ! -e /run/docker.sock ]'
+
+# What of the host is reachable, and how.
+probe() { local f="$1/.posture-$$"; touch "$f" 2>/dev/null && rm -f "$f"; }
+check "workspace writable"                 'probe "${DEVSHELL_BUILD%/_recipe_work*}"'
+check "checkout (/patches) writable"       'probe /patches'
+check "ci-workflows tree read-only"        '! probe /ci-workflows'
+if [[ -e /patches/.git ]]; then
+  if grep -qE " /patches/\.git [^ ]+ ro[, ]" /proc/mounts; then
+    check "checkout .git read-only"        '! probe /patches/.git && ! touch /patches/.git 2>/dev/null'
+  else
+    echo "  note  /patches/.git is writable (--devshell-writable-git)"
+  fi
+fi
+if [[ -d "${DEVSHELL_CACHE_MOUNT:-/nonexistent}" ]]; then
+  c="$DEVSHELL_CACHE_MOUNT"
+  check "host cache: only ai/ visible"     '[ "$(ls -A "$c")" = ai ]'
+  check "host cache: no other cells"       '[ ! -e "$c/cells" ] && [ ! -e "$c/manifests" ]'
+  check "AI skills read-only"              '! probe "$c/ai/skills"'
+  if [[ -e "$c/ai/settings.json" ]]; then
+    check "AI settings read-only"          '! touch "$c/ai/settings.json" 2>/dev/null'
+  fi
+  mem="$c/ai/memory/${DEVSHELL_AI_REPO:-default}/${DEVSHELL_AI_REPO_ENCODED:--patches}"
+  check "this project's AI memory writable" 'probe "$mem"'
+  check "no other project's AI memory" \
+    '[ "$(ls -A "$c/ai/memory")" = "${DEVSHELL_AI_REPO:-default}" ] && [ "$(ls -A "$c/ai/memory/${DEVSHELL_AI_REPO:-default}")" = "${DEVSHELL_AI_REPO_ENCODED:--patches}" ]'
+fi
+
+echo
+if [[ $fail == 0 ]]; then
+  echo "devshell posture: all checks passed"
+else
+  echo "devshell posture: FAILED (see above)"
+fi
+exit $fail

@@ -1574,6 +1574,82 @@ class DevshellHostTrustTests(unittest.TestCase):
         self.repro._devshell_refuse_symlinks(root / "ai" / "skills", root)
 
 
+class DevshellRestrictionsTests(unittest.TestCase):
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def test_default_drops_capabilities_and_privilege_gain(self):
+        sec = self.repro._devshell_security(False)
+        self.assertEqual(sec[0], "--cap-drop=ALL")
+        self.assertIn("--security-opt=no-new-privileges", sec)
+        self.assertNotIn("--cap-add=AUDIT_WRITE", sec)
+        for dangerous in ("SYS_ADMIN", "SYS_PTRACE", "NET_ADMIN", "NET_RAW",
+                          "MKNOD", "SYS_CHROOT", "DAC_READ_SEARCH"):
+            self.assertNotIn(f"--cap-add={dangerous}", sec)
+
+    def test_sudo_opt_in_lifts_only_what_sudo_needs(self):
+        sec = self.repro._devshell_security(True)
+        self.assertNotIn("--security-opt=no-new-privileges", sec)
+        self.assertIn("--cap-add=AUDIT_WRITE", sec)
+        self.assertEqual(sec[0], "--cap-drop=ALL")
+
+    def test_checkout_git_dir_is_read_only_unless_asked(self):
+        proj = Path(tempfile.mkdtemp())
+        (proj / ".git").mkdir()
+        kw = dict(volume_name="v", work_host_bind=None, host_cache=None,
+                  patches_out=proj)
+        ro = [m for m in self.repro._devshell_mounts("/w", **kw)
+              if m.target == "/patches/.git"]
+        self.assertEqual([m.readonly for m in ro], [True])
+        self.assertFalse([m for m in self.repro._devshell_mounts(
+            "/w", writable_git=True, **kw) if m.target == "/patches/.git"])
+
+    def test_toggling_writable_git_alone_recreates_the_container(self):
+        created = []
+        for flag in (False, True):
+            args = self.repro.parse_args(
+                ["--devshell"] + (["--devshell-writable-git"] if flag else []))
+            proj = Path(tempfile.mkdtemp())
+            (proj / ".git").mkdir()
+            m = {"build_env": {"ccache": {"base_dir": "/w"}}}
+            with mock.patch.object(self.repro, "_devshell_container_exists",
+                                   return_value=True), \
+                    mock.patch.object(self.repro, "_devshell_container_running",
+                                      return_value=True), \
+                    mock.patch.object(self.repro, "_devshell_container_binds",
+                                      return_value=self.repro._devshell_desired_binds(
+                                          "/w", volume_name="v", work_host_bind=None,
+                                          host_cache=None, patches_out=proj,
+                                          writable_git=flag)), \
+                    mock.patch.object(self.repro, "_devshell_container_arch",
+                                      return_value="amd64"), \
+                    mock.patch.object(self.repro, "_devshell_container_options",
+                                      return_value=""), \
+                    mock.patch.object(self.repro, "_devshell_container_profile",
+                                      return_value=" ".join(
+                                          self.repro._devshell_security(False))), \
+                    mock.patch.object(self.repro.subprocess, "run") as run, \
+                    redirect_stderr(io.StringIO()):
+                self.repro._devshell_ensure_container(
+                    args, "n", "img", "/w", m, volume_name="v",
+                    work_host_bind=None, host_cache=None, patches_out=proj,
+                    docker_platform="linux/amd64")
+            created.append(any(c[0][0][:3] == ["docker", "run", "-d"]
+                               for c in run.call_args_list))
+        # Same profile as recorded: reused. Only the git mode changed:
+        # re-created, so the read-only .git mount really goes away.
+        self.assertEqual(created, [False, True])
+
+    def test_worktree_pointer_file_is_protected_too(self):
+        proj = Path(tempfile.mkdtemp())
+        (proj / ".git").write_text("gitdir: /elsewhere\n")
+        mounts = self.repro._devshell_mounts(
+            "/w", volume_name="v", work_host_bind=None, host_cache=None,
+            patches_out=proj)
+        self.assertIn(("/patches/.git", True),
+                      [(m.target, m.readonly) for m in mounts])
+
+
 class DevshellLocaleTests(unittest.TestCase):
     """ccache hashes LANG/LC_* into every key; the devshell has to learn
     the producer's locale from the manifest (or probe for it)."""
@@ -1939,6 +2015,10 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
                                                    "amd64")), \
              mock.patch.object(self.repro, "_devshell_container_options",
                                return_value=kw.pop("actual_options", "")), \
+             mock.patch.object(
+                 self.repro, "_devshell_container_profile",
+                 return_value=kw.pop("actual_profile", " ".join(
+                     self.repro._devshell_security(False)))), \
              mock.patch.object(self.repro.subprocess, "run") as run, \
              mock.patch.object(self.repro, "_devshell_host_uid_gid",
                                return_value=(1000, 1000)), \

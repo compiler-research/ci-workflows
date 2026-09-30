@@ -233,6 +233,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="with --devshell: run as root inside the "
                         "container. Escape hatch; files written to "
                         "/patches will be root-owned on the host.")
+    p.add_argument("--devshell-sudo", action="store_true",
+                   help="with --devshell: give the dev user passwordless "
+                        "sudo (e.g. to apt-install packages from the "
+                        "shell). Off by default: it makes everything in "
+                        "the container, the AI included, root.")
+    p.add_argument("--devshell-writable-git", action="store_true",
+                   help="with --devshell: mount /patches/.git read-write, "
+                        "so git inside can commit. Off by default: the "
+                        "checkout's .git is the host's, and git on the "
+                        "host runs what its config and hooks say. Edit "
+                        "in the container, commit on the host.")
 
     advanced = p.add_argument_group(
         "advanced",
@@ -991,6 +1002,9 @@ DEVSHELL_INSTALL_SUBDIR   = "_recipe_out/install"
 
 DEVSHELL_PATCHES_MOUNT = "/patches"
 DEVSHELL_OPTIONS_LABEL = "ci-workflows.devshell.docker-options"
+#: The container restrictions a devshell was created with (see
+#: _devshell_security); a container with others is re-created.
+DEVSHELL_PROFILE_LABEL = "ci-workflows.devshell.profile"
 DEVSHELL_CACHE_MOUNT   = "/cache"
 DEVSHELL_DEV_HOME      = "/home/dev"
 
@@ -1451,6 +1465,11 @@ def _devshell_container_options(name: str) -> str:
 _devshell_container_arch = sandbox.container_arch
 
 
+def _devshell_container_profile(name: str) -> str:
+    """The container restrictions an existing container was created with."""
+    return sandbox.container_label(name, DEVSHELL_PROFILE_LABEL)
+
+
 def _devshell_refuse_symlinks(path: Path, root: Path) -> None:
     """Exit if any component of `path` below `root` is a symlink.
 
@@ -1475,10 +1494,33 @@ def _devshell_ai_paths(host_cache: Path, patches_out: PurePath
     return ai / "skills", ai / "settings.json", ai / "memory" / repo / encoded
 
 
+#: Capabilities the container keeps. Everything else is dropped: these
+#: are what devshell-init (user/group setup, chown), apt/dpkg and
+#: setpriv (root -> dev) need, and nothing a build uses beyond that.
+DEVSHELL_CAPS = ("CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID",
+                 "SETUID", "SETGID", "KILL")
+
+
+def _devshell_security(sudo: bool) -> List[str]:
+    """Container-level restrictions for the devshell (see sandbox.py).
+
+    no-new-privileges stops any setuid binary from raising privileges,
+    which is exactly what sudo is, so --devshell-sudo turns it off (and
+    keeps AUDIT_WRITE, which sudo logs through).
+    """
+    caps = list(DEVSHELL_CAPS) + (["AUDIT_WRITE"] if sudo else [])
+    out = ["--cap-drop=ALL", *(f"--cap-add={c}" for c in caps),
+           "--pids-limit=8192"]
+    if not sudo:
+        out.append("--security-opt=no-new-privileges")
+    return out
+
+
 def _devshell_mounts(ws: str, *, volume_name: Optional[str],
                      work_host_bind: Optional[Path],
                      host_cache: Optional[Path],
-                     patches_out: Path) -> List[sandbox.Mount]:
+                     patches_out: Path,
+                     writable_git: bool = False) -> List[sandbox.Mount]:
     """Every mount the devshell container gets.
 
     The host cache is not mounted whole: the container sees its own
@@ -1493,6 +1535,13 @@ def _devshell_mounts(ws: str, *, volume_name: Optional[str],
         sandbox.Mount(str(REPO_ROOT), "/ci-workflows", readonly=True),
         sandbox.Mount(str(patches_out), DEVSHELL_PATCHES_MOUNT),
     ]
+    # The checkout's .git (a directory, or a worktree's pointer file)
+    # read-only: git on the host acts on its config and hooks.
+    dot_git = patches_out / ".git"
+    if not writable_git and os.path.lexists(dot_git):
+        mounts.append(sandbox.Mount(str(dot_git),
+                                    f"{DEVSHELL_PATCHES_MOUNT}/.git",
+                                    readonly=True))
     if host_cache is not None:
         skills, settings, memory = _devshell_ai_paths(host_cache, patches_out)
         inside = PurePath(DEVSHELL_CACHE_MOUNT)
@@ -1525,11 +1574,18 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
     `host_cache`, when given, is additionally bound at /cache.
     `patches_out` is always bound at /patches.
     """
+    writable_git = bool(getattr(args, "devshell_writable_git", False))
+    sudo = bool(getattr(args, "devshell_sudo", False))
     desired = _devshell_desired_binds(
         ws, volume_name=volume_name, work_host_bind=work_host_bind,
         host_cache=host_cache, patches_out=patches_out,
+        writable_git=writable_git,
     )
     docker_options = args.devshell_docker_options or ""
+    security = _devshell_security(sudo)
+    # The .git mode too: toggling it adds or drops a mount, which the
+    # bind comparison below only notices in one direction.
+    profile = " ".join(security + (["writable-git"] if writable_git else []))
     if _devshell_container_exists(name):
         # Mounts are fixed at creation: docker cannot remount a
         # container that already exists. So a container left over from
@@ -1556,6 +1612,8 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
         # creation as the mounts are.
         if _devshell_container_options(name) != docker_options:
             stale.append("docker options")
+        if _devshell_container_profile(name) != profile:
+            stale.append("security profile")
         if stale:
             _log(f"repro: devshell container {name} was created with a "
                  f"different {', '.join(stale)}; re-creating it against "
@@ -1623,7 +1681,10 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
 
     mounts = _devshell_mounts(ws, volume_name=volume_name,
                               work_host_bind=work_host_bind,
-                              host_cache=host_cache, patches_out=patches_out)
+                              host_cache=host_cache, patches_out=patches_out,
+                              writable_git=writable_git)
+    if sudo:
+        env += [("DEVSHELL_SUDO", "1")]
 
     # Start as root: repro-config needs apt-install + chown. `--user`
     # is deferred to the interactive `docker exec` so the AI runs as
@@ -1631,7 +1692,9 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
     spec = sandbox.DevshellSpec(
         name=name, image=image, platform=docker_platform, workdir=ws,
         mounts=mounts, env=env,
-        labels={DEVSHELL_OPTIONS_LABEL: docker_options},
+        labels={DEVSHELL_OPTIONS_LABEL: docker_options,
+                DEVSHELL_PROFILE_LABEL: profile},
+        security=security,
         caller_options=docker_options,
     )
     try:
