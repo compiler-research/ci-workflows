@@ -14,11 +14,13 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import io
+import re
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 
 START_PATH = Path(__file__).resolve().parent / "start"
@@ -113,119 +115,82 @@ class CoordTest(unittest.TestCase):
             "biodynamo/v1.05-cr-20260812-01/ubuntu-24.04/x86_64")
 
 
-class RepoPinnedVersionTest(unittest.TestCase):
-    """The project, once cloned, outranks the catalog."""
+_STEP = """\
+    steps:
+      - uses: compiler-research/ci-workflows/actions/setup-llvm@main
+        with:
+          version: ${{ matrix.clang-runtime }}
+          os: ${{ matrix.os }}
+          flavor: ${{ matrix.flavor }}
+"""
 
-    def _checkout(self, workflow_text: str) -> Path:
+
+class RepoCellTest(unittest.TestCase):
+    """The project, once cloned, outranks the catalog -- read through
+    cells.scan, so every coord field counts, not just the version."""
+
+    ROW = "ubu24-x86-gcc12-llvm22"
+
+    def _checkout(self, include: str) -> Path:
         root = Path(tempfile.mkdtemp())
-        wf = root / ".github" / "workflows" / "ci.yml"
+        wf = root / ".github" / "workflows" / "main.yml"
         wf.parent.mkdir(parents=True)
-        wf.write_text(workflow_text, encoding="utf-8")
+        wf.write_text("jobs:\n  build:\n    runs-on: ${{ matrix.os }}\n"
+                      "    strategy:\n      matrix:\n        include:\n"
+                      + include + _STEP, encoding="utf-8")
         return root
 
     def _project(self, **over):
-        p = {"workflow": ".github/workflows/ci.yml", "row": "ubu24-gcc"}
+        p = {"workflow": ".github/workflows/main.yml", "row": self.ROW}
         p.update(over)
         return p
 
-    def test_reads_the_pin_off_a_block_row(self):
-        # CARTopiaX's shape: `- name:` opens the row and the pin sits
-        # several keys below it. Reading only inline rows left this
-        # check inert for the project that motivated it.
+    def _cell(self, root, **over):
+        c = start.repo_cell(root, self._project(**over))
+        return start.coord_str(c) if c else None
+
+    def test_block_row(self):
         root = self._checkout(
-            "          - name: ubu24-gcc\n"
+            "          - name: ubu24-x86-gcc12-llvm22\n"
             "            os: ubuntu-24.04\n"
-            "            use-recipe: biodynamo\n"
-            "            recipe-version: v1.06-cr-20260901-01\n"
-            "            recipe-arch: x86_64\n"
-        )
-        self.assertEqual(start.repo_pinned_version(root, self._project()),
-                         "v1.06-cr-20260901-01")
+            "            clang-runtime: '23'\n")
+        self.assertEqual(self._cell(root), "llvm-release/23/ubuntu-24.04/x86_64")
 
-    def test_block_row_scan_stops_at_the_next_row(self):
+    def test_inline_row(self):
         root = self._checkout(
-            "          - name: ubu24-gcc\n"
-            "            os: ubuntu-24.04\n"
-            "          - name: ubu24-clang\n"
-            "            recipe-version: v9.99\n"
-        )
-        self.assertIsNone(start.repo_pinned_version(root, self._project()))
+            "          - { name: ubu24-x86-gcc12-llvm22, os: ubuntu-24.04, "
+            "clang-runtime: '22' }\n")
+        self.assertEqual(self._cell(root), "llvm-release/22/ubuntu-24.04/x86_64")
 
-    def test_reads_the_pin_off_an_inline_row(self):
+    def test_a_changed_recipe_is_seen_not_just_a_version(self):
         root = self._checkout(
-            "          - { name: ubu24-gcc, recipe-version: "
-            "v1.06-cr-20260901-01, arch: x86_64 }\n"
-        )
-        self.assertEqual(start.repo_pinned_version(root, self._project()),
-                         "v1.06-cr-20260901-01")
-
-    def test_other_rows_pin_is_not_picked_up(self):
-        root = self._checkout(
-            "          - { name: other-row, recipe-version: v9.99 }\n"
-        )
-        self.assertIsNone(start.repo_pinned_version(root, self._project()))
-
-    def test_missing_workflow_is_silent(self):
-        self.assertIsNone(
-            start.repo_pinned_version(Path(tempfile.mkdtemp()),
-                                      self._project()))
+            "          - { name: ubu24-x86-gcc12-llvm22, os: ubuntu-24.04, "
+            "clang-runtime: '22', flavor: debug }\n")
+        self.assertEqual(self._cell(root), "llvm-debug/22/ubuntu-24.04/x86_64")
 
     def test_a_longer_row_name_is_not_mistaken_for_this_row(self):
-        # Both of these are real CppInterOp rows. A substring test read
-        # the -cppyy row's pin for the plain row and would have pinned a
-        # contributor to LLVM 21 the moment the matrix was reordered.
+        # Both are real CppInterOp rows; a substring match once read the
+        # -cppyy row's LLVM 21 for the plain row.
         root = self._checkout(
-            "          - { name: ubu24-x86-gcc12-llvm22-cppyy, "
+            "          - { name: ubu24-x86-gcc12-llvm22-cppyy, os: ubuntu-24.04, "
             "clang-runtime: '21' }\n"
-            "          - { name: ubu24-x86-gcc12-llvm22, "
-            "clang-runtime: '22' }\n"
-        )
-        got = start.repo_pinned_version(
-            root, self._project(row="ubu24-x86-gcc12-llvm22"))
-        self.assertEqual(got, "22")
+            "          - { name: ubu24-x86-gcc12-llvm22, os: ubuntu-24.04, "
+            "clang-runtime: '22' }\n")
+        self.assertEqual(self._cell(root), "llvm-release/22/ubuntu-24.04/x86_64")
 
-    def test_a_key_merely_ending_in_name_is_not_the_row_name(self):
+    def test_other_row_or_other_workflow_is_not_picked_up(self):
         root = self._checkout(
-            "          - { flavor-name: ubu24-gcc, clang-runtime: '77' }\n"
-        )
-        self.assertIsNone(start.repo_pinned_version(root, self._project()))
-
-    def test_clang_runtime_is_read_when_that_is_what_the_row_names(self):
-        # CppInterOp names no recipe-version at all; reading only that
-        # key left this check inert for half the catalog.
+            "          - { name: other-row, os: ubuntu-24.04, "
+            "clang-runtime: '22' }\n")
+        self.assertIsNone(self._cell(root))
         root = self._checkout(
-            "          - { name: ubu24-gcc, clang-runtime: '22' }\n"
-        )
-        self.assertEqual(start.repo_pinned_version(root, self._project()),
-                         "22")
+            "          - { name: ubu24-x86-gcc12-llvm22, os: ubuntu-24.04, "
+            "clang-runtime: '22' }\n")
+        self.assertIsNone(self._cell(root, workflow=".github/workflows/x.yml"))
 
-    def test_precedence_is_by_key_not_by_line_order(self):
-        root = self._checkout(
-            "          - name: ubu24-gcc\n"
-            "            clang-runtime: '20'\n"
-            "            recipe-version: v9\n"
-        )
-        self.assertEqual(start.repo_pinned_version(root, self._project()),
-                         "v9")
-
-
-class ValueParsingTest(unittest.TestCase):
-    def test_value_after_stops_at_the_field_boundary(self):
-        self.assertEqual(
-            start._value_after("- { name: r, recipe-version: v1, a: b }",
-                               "recipe-version"), "v1")
-        self.assertEqual(
-            start._value_after("            recipe-version: 'v1'",
-                               "recipe-version"), "v1")
-
-    def test_row_name_recognises_both_matrix_shapes(self):
-        self.assertEqual(start._row_name("          - name: ubu24-gcc"),
-                         "ubu24-gcc")
-        self.assertEqual(start._row_name("  - { name: ubu24-gcc, os: x }"),
-                         "ubu24-gcc")
-        self.assertEqual(start._row_name("  - { os: x, name: ubu24-gcc }"),
-                         "ubu24-gcc")
-        self.assertIsNone(start._row_name("            os: ubuntu-24.04"))
+    def test_missing_workflow_is_silent(self):
+        self.assertIsNone(start.repo_cell(Path(tempfile.mkdtemp()),
+                                          self._project()))
 
 
 class RenderTest(unittest.TestCase):
@@ -327,31 +292,42 @@ class SelectTest(unittest.TestCase):
 
 
 class LaunchTest(unittest.TestCase):
-    def test_hands_cmd_devshell_every_attribute_it_reads(self):
-        repro = mock.Mock()
-        repro.cmd_devshell.return_value = 0
+    """bin/start reaches bin/repro only through its command line."""
+
+    def _launch(self, coord, checkout="/somewhere/CARTopiaX"):
+        repro = start._load_repro()
+        with mock.patch.object(repro, "cmd_devshell",
+                               return_value=0) as cmd, \
+                redirect_stdout(io.StringIO()) as out:
+            rc = start.launch(repro, {}, Path(checkout), coord)
+        return rc, cmd.call_args[0][0], out.getvalue()
+
+    def test_argv_goes_through_repro_main_and_parser(self):
         project = start.load_projects(_write(WELL_FORMED))[0]
-        coord = start.coord_of(project)
-
-        with redirect_stdout(io.StringIO()):
-            rc = start.launch(repro, project, Path("/somewhere/CARTopiaX"),
-                              coord)
-
+        rc, ns, out = self._launch(start.coord_of(project))
         self.assertEqual(rc, 0)
-        ns = repro.cmd_devshell.call_args[0][0]
-        # cmd_devshell and its helpers read exactly these; a missing one
-        # is an AttributeError deep inside provisioning.
-        for attr in ("matrix", "devshell_host_cache",
-                     "devshell_host_cache_dir", "devshell_patches_out",
-                     "devshell_image", "devshell_refetch", "devshell_rm",
-                     "devshell_script", "devshell_as_root"):
-            self.assertTrue(hasattr(ns, attr), attr)
+        # Whatever repro's parser produces is what cmd_devshell reads,
+        # so a flag added to repro can't be missing here.
         self.assertEqual(
             ns.matrix,
             ["name:biodynamo/v1.05-cr-20260812-01/ubuntu-24.04/x86_64"])
         # Host-cache mode is the point for a newcomer: the download has
         # to outlive the container.
         self.assertTrue(ns.devshell_host_cache)
+        self.assertEqual(ns.devshell_patches_out,
+                         str(Path("/somewhere/CARTopiaX")))
+        # The same command is printed, for reopening the shell later.
+        self.assertIn(" ".join(start.devshell_argv(
+            Path("/somewhere/CARTopiaX"), start.coord_of(project))), out)
+
+    def test_argv_is_accepted_by_the_real_parser(self):
+        repro = start._load_repro()
+        coord = {"recipe": "llvm-release", "version": "22",
+                 "os": "ubuntu-24.04", "arch": "x86_64"}
+        ns = repro.parse_args(start.devshell_argv(Path("/x"), coord))
+        self.assertTrue(ns.devshell)
+        self.assertEqual(ns.passthrough,
+                         ["llvm-release/22/ubuntu-24.04/x86_64"])
 
 
 class ResolveCheckoutTest(unittest.TestCase):
@@ -462,3 +438,137 @@ class AssetSizeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+_CLAD_LIKE_CI = """\
+on: push
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - { name: sys18, os: ubuntu-24.04-arm, clang-runtime: '18' }
+          - { name: rel22, os: ubuntu-24.04, clang-runtime: '22', use-recipe: 'true' }
+          - { name: asan23, os: ubuntu-24.04, clang-runtime: '23', flavor: asan }
+          - { name: mac23, os: macos-26, clang-runtime: '23', use-recipe: 'true' }
+    steps:
+      - uses: compiler-research/ci-workflows/actions/setup-llvm@main
+        with:
+          version: ${{ matrix.clang-runtime }}
+          os:      ${{ matrix.os }}
+          flavor:  ${{ matrix.use-recipe != 'true' && (matrix.flavor || 'system') || '' }}
+"""
+
+_CELLS = [
+    {"recipe": "llvm-release", "version": "22", "os": "ubuntu-24.04",
+     "arch": "x86_64"},
+    {"recipe": "llvm-asan", "version": "23", "os": "ubuntu-24.04",
+     "arch": "x86_64"},
+    {"recipe": "llvm-release", "version": "23", "os": "macos-26",
+     "arch": "arm64"},
+]
+
+
+def _checkout(ci: Optional[str] = _CLAD_LIKE_CI) -> Path:
+    root = Path(tempfile.mkdtemp()).resolve() / "clad"
+    (root / ".git").mkdir(parents=True)
+    if ci is not None:
+        wf = root / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        (wf / "ci.yml").write_text(ci, encoding="utf-8")
+    return root
+
+
+def _fake_repro():
+    """The real repro, minus the network and the container."""
+    repro = start._load_repro()
+    repro._devshell_compute_key = mock.Mock(return_value="k")
+    repro.cmd_devshell = mock.Mock(return_value=0)
+    return repro
+
+
+class AnyRepositoryTest(unittest.TestCase):
+    """bin/start on a repository outside projects.yaml, clad as the
+    example: the cell comes from the repo's own workflows."""
+
+    def test_plainest_servable_cell_is_the_default(self):
+        with mock.patch("builtins.input", side_effect=[""]), \
+                mock.patch.object(start, "_asset_size", return_value=None), \
+                redirect_stdout(io.StringIO()) as out:
+            got = start.start_checkout(_fake_repro(), "file:///x", _CELLS,
+                                       _checkout())
+        project, coord = got
+        self.assertEqual(coord, _CELLS[0])  # llvm-release before asan
+        self.assertEqual(project["name"], "clad")
+        text = out.getvalue()
+        # macOS is in cells.yaml but has no dev container; say so.
+        self.assertIn("llvm-release/23/macos-26/arm64", text)
+        self.assertIn("no dev container", text)
+
+    def test_quit_at_the_toolchain_prompt(self):
+        with mock.patch("builtins.input", side_effect=["q"]), \
+                mock.patch.object(start, "_asset_size", return_value=None), \
+                redirect_stdout(io.StringIO()):
+            got = start.start_checkout(_fake_repro(), "file:///x", _CELLS,
+                                       _checkout())
+        self.assertIs(got, start.QUIT)
+
+    def test_repository_not_using_ci_workflows_is_refused(self):
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertIsNone(start.start_checkout(
+                _fake_repro(), "file:///x", _CELLS, _checkout(ci=None)))
+        self.assertIn("does not use compiler-research/ci-workflows",
+                      out.getvalue())
+
+    def test_only_system_rows_means_nothing_to_offer(self):
+        ci = _CLAD_LIKE_CI.replace("use-recipe: 'true'", "x: y").replace(
+            "flavor: asan", "x: z")
+        with redirect_stdout(io.StringIO()) as out, \
+                mock.patch("builtins.input",
+                           side_effect=AssertionError("must not prompt")):
+            self.assertIsNone(start.start_checkout(
+                _fake_repro(), "file:///x", _CELLS, _checkout(ci)))
+        self.assertIn("flavor=system", out.getvalue())
+
+    def test_owner_repo_shorthand_clones_from_github(self):
+        with mock.patch.object(start, "resolve_checkout",
+                               return_value=None) as rc:
+            start.custom_checkout("vgvassilev/clad")
+        self.assertEqual(rc.call_args[0][0],
+                         {"name": "clad",
+                          "repo": "https://github.com/vgvassilev/clad"})
+
+    def test_existing_path_is_used_without_cloning(self):
+        co = _checkout()
+        with mock.patch.object(start, "resolve_checkout",
+                               side_effect=AssertionError("no clone")):
+            self.assertEqual(start.custom_checkout(str(co / ".github")), co)
+
+    def test_main_in_an_uncatalogued_checkout_skips_the_menu(self):
+        co = _checkout()
+        repro = _fake_repro()
+        repro._origin_repo_slug = mock.Mock(return_value="someone/uncatalogued")
+        repro.published_cells = mock.Mock(return_value=_CELLS)
+        with mock.patch.object(start, "preflight", return_value=True), \
+                mock.patch.object(start, "_load_repro", return_value=repro), \
+                mock.patch.object(start, "_asset_size", return_value=None), \
+                mock.patch.object(start.Path, "cwd", return_value=co), \
+                mock.patch("builtins.input", side_effect=["2"]), \
+                redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(start.main([]), 0)
+        self.assertNotIn("select a project", out.getvalue())
+        ns = repro.cmd_devshell.call_args[0][0]
+        self.assertEqual(ns.matrix,
+                         ["name:llvm-asan/23/ubuntu-24.04/x86_64"])
+        self.assertEqual(ns.devshell_patches_out, str(co))
+
+    def test_clad_is_in_the_catalog(self):
+        # The real projects.yaml: clad is a menu entry, and its row is
+        # the one a clad-shaped workflow resolves to a published cell.
+        clad = [p for p in start.load_projects() if p["name"] == "clad"]
+        self.assertEqual(len(clad), 1)
+        self.assertEqual(clad[0]["repo"], "https://github.com/vgvassilev/clad")
+        cell = start.coord_of(clad[0])
+        self.assertTrue(start.cells.in_catalog(
+            cell, start.cells.load_catalog()))

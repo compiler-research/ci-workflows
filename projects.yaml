@@ -6,25 +6,23 @@
 # the environment it wants a contributor to develop in -- not
 # necessarily every cell its CI matrix touches.
 #
-# Why the cell is written out here rather than derived from the
-# project's own workflows: there is no single convention to derive it
-# from. CARTopiaX annotates its matrix rows with `use-recipe` /
-# `recipe-version`, but CppInterOp names a `clang-runtime` plus a
-# `flavor` and lets setup-llvm decide the recipe, and other consumers
-# do neither. Reading each project's workflow correctly would mean
-# reimplementing every consumer's mapping, and getting it wrong hands a
-# student a silently wrong toolchain. An explicit row is checked by
-# verify.yml against cells.yaml, so a stale one fails CI here instead.
+# Why the cell is written out here although bin/cells.py can read it
+# out of a project's workflows: the menu shows each project's toolchain
+# and download size before anything is cloned. After cloning, bin/start
+# reads the row back with bin/cells.py and the project wins if it
+# disagrees on any coord field, so a stale entry self-heals. verify.yml
+# checks every entry against cells.yaml. Repositories not listed here
+# work too (`bin/start --repo`); the catalog's value is that it is
+# curated -- it names the one row a newcomer should start from.
 #
 # Adding a project:
 #   - Pick the matrix row a new contributor should develop against --
 #     the plainest Linux row, not the sanitizer or cross-compile ones.
-#   - Record its cell. It must already appear in cells.yaml; verify.yml
-#     rejects the entry otherwise.
-#   - `workflow` and `row` are provenance: they say where the cell came
-#     from, and bin/start reads `recipe-version` back out of `workflow`
-#     after cloning so a project that bumps its pin wins over a stale
-#     row here.
+#   - Record its cell: `bin/start --list --repo <clone>` prints the
+#     cell each row resolves to. It must already appear in cells.yaml;
+#     verify.yml rejects the entry otherwise.
+#   - `workflow` and `row` say where the cell came from; bin/start
+#     re-reads that row after cloning.
 #
 # Fields: name, description, repo, workflow, row, recipe, version, os,
 # arch. All required.
@@ -47,5 +45,15 @@ projects:
     row: ubu24-x86-gcc12-llvm22
     recipe: llvm-release
     version: '22'
+    os: ubuntu-24.04
+    arch: x86_64
+
+  - name: clad
+    description: Automatic differentiation for C/C++, as a Clang plugin
+    repo: https://github.com/vgvassilev/clad
+    workflow: .github/workflows/ci.yml
+    row: ubu24-clang20-runtime23
+    recipe: llvm-release
+    version: '23'
     os: ubuntu-24.04
     arch: x86_64

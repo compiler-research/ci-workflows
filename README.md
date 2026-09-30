@@ -32,7 +32,19 @@ Your checkout is bind-mounted, not copied, so edits show up on the host
 immediately and you commit, push and open pull requests from there.
 No credentials are copied into the container.
 
-`./bin/start --list` prints the catalog without prompting. See
+Not in the list? Any repository whose CI uses ci-workflows works --
+your fork of one of them, for example, either way round:
+
+```bash
+./bin/start --repo yourname/clad          # owner/repo, clone URL or path
+cd ~/src/my-fork && ~/src/ci-workflows/bin/start
+```
+
+It reads the repository's own workflows, lists the toolchains its CI
+rows pull, and offers the plainest one first.
+
+`./bin/start --list` prints the catalog without prompting
+(`--list --repo <path>` does the same for a checkout). See
 [Onboarding a contributor](docs/developer-guide.md#onboarding-a-contributor-binstart)
 for what it sets up and how to add a project to the list.
 
@@ -177,10 +189,12 @@ bin/repro ubu24-x86-gcc14-cling-llvm20-cppyy --devshell
 cd $DEVSHELL_BUILD && ninja clang
 ```
 
-The cell argument is either a matrix-row name (validated against
-`act -n --json` for the consumer repo) or a direct
-`recipe/version/os/arch` coord (e.g. `llvm-release/22/ubuntu-24.04/x86_64`)
-for cells no consumer matrix references yet. Files live under
+The cell argument is either a matrix-row name of the consumer repo you
+run it from (its cell is read out of that repo's own workflows, no act
+involved) or a direct `recipe/version/os/arch` coord (e.g.
+`llvm-release/22/ubuntu-24.04/x86_64`) for cells no consumer matrix
+references yet. A row whose LLVM comes from apt/brew (setup-llvm
+`flavor: system`) has no cell, and says so. Files live under
 `~/.cache/ci-workflows/devshell/<cell>/`; the container is named
 `devshell-<cell>` and persists across invocations. Common knobs:
 

@@ -241,16 +241,18 @@ Pick the plainest Linux row -- not a sanitizer, cross-compile or
 self-hosted one. This is the environment somebody meets the project in,
 not a matrix audit.
 
-The cell is written out rather than derived from the project's own
-workflows on purpose. There is no single convention to derive it from:
-CARTopiaX annotates its rows with `use-recipe` and `recipe-version`,
-while CppInterOp names a `clang-runtime` plus a `flavor` and leaves the
-recipe to `setup-llvm`. Re-implementing each consumer's mapping is how
-a contributor silently ends up in the wrong toolchain. The `workflow`
-and `row` fields record where the cell came from, and `bin/start` reads
-`recipe-version` back out of that row once the project is cloned -- so
-a project that bumps its pin wins over a stale entry here, and the
-catalog going a little stale is self-healing rather than harmful.
+The cell is written out so the menu can show each project's toolchain
+and download size before anything is cloned. To get it, run
+`bin/start --list --repo <checkout>` on a clone of the project: it
+lists the cell every row resolves to. The `workflow` and `row` fields
+say where the cell came from. Once the project is cloned, `bin/start`
+reads that row back out of the project's own workflow with
+`bin/cells.py`, and the project wins if it disagrees, whichever of
+recipe, version, os or arch has moved. So the catalog going a little
+stale is self-healing rather than harmful.
+
+clad's entry is a worked example: row `ubu24-clang20-runtime23`,
+which clad's `ci.yml` resolves to `llvm-release/23/ubuntu-24.04/x86_64`.
 
 ## Bumping the LLVM version
 
@@ -396,12 +398,12 @@ which flags make it persist. `bin/start` is the same machinery for
 somebody who does not: it reads `projects.yaml`, shows each project
 with its toolchain and whether that cell is published, and hands the
 selection to `--devshell`. It is a front end, not a second
-implementation -- `bin/repro` is imported and `cmd_devshell` called
-directly, the way `bin/test_repro.py` already imports it.
+implementation. It builds the `bin/repro --devshell ...` command line
+you could type yourself, runs it through `repro.main(argv)`, and prints
+it so you can reopen the shell with repro directly.
 
-Prerequisites are Docker, git and a Python 3. Not `act`: a project's
-cell is named by coordinate, and `_devshell_cell` short-circuits the
-act matrix lookup for a direct coordinate.
+Prerequisites are Docker, git and a Python 3. Not `act`: the cell goes
+to repro as a direct coordinate, which needs no matrix lookup.
 
 Two entry paths, one command:
 
@@ -417,19 +419,67 @@ cd ~/src/CARTopiaX && ~/src/ci-workflows/bin/start
 The second form matches on the `origin` remote rather than the
 directory name, so forks and renamed directories resolve.
 
-On selection it enables host-cache mode -- a newcomer's download should
-survive `docker volume rm` and a machine move -- binds the checkout at
-`/patches`, and lets `repro-config` do the rest: the recipe's
-`devshell-setup.sh`, the ccache wiring, and the Claude Code install.
-Nothing is copied out afterwards, because `/patches` *is* the checkout;
-git runs host-side, where the credentials are and where a container
-running an AI agent cannot reach them.
+### Repositories outside the catalog
 
-`--list` prints the catalog and exits, which is also the cheap way to
-see whether a cell has actually been warmed.
+A repository that is not in `projects.yaml` still works if its CI uses
+ci-workflows -- a fork, say, since the catalog matches on the exact
+`origin` owner/repo:
 
-To add a project, see
-[Adding a project to `bin/start`](#adding-a-project-to-binstart).
+```bash
+./bin/start --repo yourname/clad           # owner/repo, URL or path; clones if needed
+cd ~/src/my-fork && ~/src/ci-workflows/bin/start  # uncatalogued checkout: no menu
+./bin/start --list --repo ~/src/my-fork    # what it would offer, no prompts
+```
+
+The menu also takes `o` for "another repository".
+
+Such a repository has no recorded cell, so one is read out of its
+workflows: every `setup-llvm` / `setup-recipe` call is evaluated against
+every matrix row, step `if:`s included, walking into composites such as
+`setup-biodynamo` and `setup-cuda`. Evaluating the consumer's own
+expressions is what makes this convention-free, and the conventions do
+differ: clad writes `use-recipe: 'true'` and defaults its flavor to
+`system`, while CppInterOp passes `matrix.flavor` straight through, so
+an absent flavor means llvm-release there.
+
+Each resulting cell is checked against `cells.yaml` and against what
+`--devshell` can open (the ubuntu-24.04 and ubuntu-22.04 runner images
+today). Usable cells are listed plainest first -- llvm-release before
+its sanitizer and debug variants, then by how many rows use it -- and
+the rest with the reason they can't be used. A repository whose rows
+only use `flavor=system` is told there is nothing to download;
+`bin/repro <row>` replays such a row under act instead.
+
+### Where the cell-resolution code lives
+
+One implementation, used by both `bin/repro` (`--devshell <row>`, the
+`[cell: ...]` tags in `--list`) and `bin/start`:
+
+| file | knows about |
+| --- | --- |
+| `bin/gha.py` | GitHub Actions only: YAML, `${{ }}` expressions, matrix expansion, step `if:`, walking into composite actions. Nothing about recipes. |
+| `bin/cells.py` | Recipes: the coord type, `cells.yaml`, one resolver per action that picks its recipe in shell, row scanning, "plainest first" ranking. |
+
+To support a new action, see the module docstring of `bin/cells.py`.
+An action that only forwards to one we already resolve needs nothing,
+because the walk goes into it. An action that picks its recipe in a
+shell step needs a resolver registered with `@resolves("<action>")`:
+a function from the call's evaluated inputs to a coord.
+
+`setup-llvm` is that case today. Its "Resolve flavor → recipe" `case`
+is restated as `cells.FLAVOR_TO_RECIPE`, and `bin/test_cells.py` parses
+the action and fails if the two differ, so a new flavor added to the
+action without the table breaks the test rather than `bin/start`.
+Recipes a row layers on top of its toolchain (`cuda-headers`) are
+listed in `cells.ADDON_RECIPES`. They never count as a row's cell on
+their own, so a row that takes LLVM from apt and headers from the cache
+is reported as having no cell.
+
+`bin/start` drives `bin/repro` only through its command line,
+`repro.main(argv)`, built by `devshell_argv()`. So a change inside
+repro can't break start as long as the command line a user would type
+still works, and `bin/test_start.py` checks that argv against repro's
+real parser.
 
 ## Iterating on a recipe with `--devshell`
 
@@ -499,9 +549,13 @@ packed entry is not a published one:
 
 Either form works:
 
-- A matrix-row name from a consumer repo (`bin/repro --list` from
-  that repo enumerates them). Looked up against `act -n --json`,
-  which gives `bin/repro` the recipe coord to download.
+- A matrix-row name from the consumer repo you run it in (`bin/repro
+  --list` there enumerates them, tagging each with its cell).
+  `bin/cells.py` reads the row's cell out of the repo's own workflows
+  (see [Where the cell-resolution code lives](#where-the-cell-resolution-code-lives)),
+  so this needs no act. A row on `flavor: system` has no cell and
+  fails with that reason. A glob instead of an exact name still goes
+  through act's matrix listing first.
 - A direct `recipe/version/os/arch` coord, e.g.
   `llvm-release/22/ubuntu-24.04/x86_64`. Use this when no consumer
   matrix references the cell yet (e.g. you just published it and
