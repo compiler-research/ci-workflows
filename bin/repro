@@ -1087,7 +1087,7 @@ def _devshell_compute_key(coord: Dict[str, str]) -> str:
 
 
 def _devshell_fetch(base: str, key: str, work: Path,
-                    refetch: bool) -> Dict:
+                    refetch: bool, trusted: Optional[Path] = None) -> Dict:
     """Download <key>.tar.zst (install), <key>.ccache.tar.zst (sibling),
     and <key>.manifest.json into `work`. Returns the parsed manifest.
 
@@ -1149,18 +1149,61 @@ def _devshell_fetch(base: str, key: str, work: Path,
             _log(f"repro: no sibling ccache for this cell ({e}); "
                  f"the devshell will start with a cold cache")
 
-    # Manifest: plain JSON, no zstd/tar.
-    if refetch or not manifest.is_file():
+    # Manifest: plain JSON, no zstd/tar. With `trusted`, the copy the
+    # host acts on lives there -- outside anything the container can
+    # write -- and `work` gets a fresh copy of it each time; the host
+    # never reads back the one inside the workspace.
+    own = trusted or manifest
+    if refetch or not own.is_file():
         url = f"{base.rstrip('/')}/{key}.manifest.json"
         _log(f"repro: fetching manifest ({key}.manifest.json)...")
+        own.parent.mkdir(parents=True, exist_ok=True)
         if base.startswith("file://"):
-            shutil.copy(Path(base[len("file://"):]) / f"{key}.manifest.json",
-                        manifest)
+            data = (Path(base[len("file://"):])
+                    / f"{key}.manifest.json").read_bytes()
         else:
             with urllib.request.urlopen(url, timeout=60) as r:
-                manifest.write_bytes(r.read())
+                data = r.read()
+        own.write_bytes(data)
+    if trusted is not None:
+        # unlink first: never write through whatever the container
+        # left at that name.
+        manifest.unlink(missing_ok=True)
+        manifest.write_bytes(trusted.read_bytes())
+    parsed = json.loads(own.read_text(encoding="utf-8"))
+    _devshell_check_manifest(parsed)
+    return parsed
 
-    return json.loads(manifest.read_text())
+
+_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_REPO_URL_RE = re.compile(r"^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~-]+)+/?$")
+_SRC_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+
+
+def _devshell_check_manifest(manifest: Dict) -> None:
+    """Refuse a manifest whose source fields could steer host commands.
+
+    source.repo and source.commit reach `git` on the host and name a
+    directory there, so they are held to the shapes a real publish
+    produces: an https URL and a hex commit id. Mockups (`bin/recipe-cache
+    pack`) and unknown commits are left to _devshell_source's own checks.
+    """
+    src = manifest.get("source") or {}
+    repo, commit = src.get("repo"), src.get("commit")
+    if manifest.get("kind") == "mockup" or repo == "mockup://":
+        return
+    if repo and not _REPO_URL_RE.match(str(repo)):
+        sys.exit(f"error: manifest source.repo {repo!r} is not an https URL")
+    if commit and commit != "unknown" and not _COMMIT_RE.match(str(commit)):
+        sys.exit(f"error: manifest source.commit {commit!r} is not a commit id")
+
+
+def _host_git(*args: str) -> List[str]:
+    """`git` for the host, with nothing a repository can configure
+    allowed to run: no hooks, no fsmonitor, https transport only."""
+    return ["git", "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=false", "-c", "protocol.allow=never",
+            "-c", "protocol.https.allow=always", *args]
 
 
 def _devshell_source(work: Path, manifest: Dict) -> Optional[Path]:
@@ -1193,22 +1236,41 @@ def _devshell_source(work: Path, manifest: Dict) -> Optional[Path]:
         sys.exit(f"error: manifest missing source.{{repo,commit}}; "
                  f"cannot reproduce")
     src_dir = work / _devshell_src_subdir(manifest)
-    if not (src_dir / ".git").is_dir():
-        _log(f"repro: shallow-fetching {repo} @ {commit[:12]} "
-             f"(use `git fetch --unshallow` inside the container "
-             f"for history)...")
-        src_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "-C", str(src_dir), "init", "-q"],
-                       check=True)
-        subprocess.run(["git", "-C", str(src_dir),
-                        "remote", "add", "origin", repo], check=True)
-    subprocess.run(["git", "-C", str(src_dir),
-                    "fetch", "--depth=1", "origin", commit],
-                   check=True)
+    if os.path.lexists(src_dir / ".git"):
+        # A checkout from an earlier session lives in a directory the
+        # container writes, so the host does not run git in it; the
+        # caller updates it from inside the container instead.
+        return src_dir
+    _log(f"repro: shallow-fetching {repo} @ {commit[:12]} "
+         f"(use `git fetch --unshallow` inside the container "
+         f"for history)...")
+    src_dir.mkdir(parents=True, exist_ok=True)
+    g = lambda *a: subprocess.run(_host_git("-C", str(src_dir), *a),  # noqa: E731
+                                  check=True)
+    g("init", "-q")
+    g("remote", "add", "origin", "--", repo)
+    g("fetch", "--depth=1", "--", "origin", commit)
     _log(f"repro: checking out {commit[:12]}...")
-    subprocess.run(["git", "-C", str(src_dir),
-                    "checkout", "--detach", commit], check=True)
+    g("checkout", "--detach", commit, "--")
     return src_dir
+
+
+def _devshell_update_source_in_container(name: str, ws: str,
+                                         manifest: Dict) -> None:
+    """Move an existing checkout to the manifest's commit, from inside.
+
+    The host created the checkout, but the container has written to it
+    since; running git on it host-side would run whatever it now says.
+    Inside, git runs with the container's own reach and nothing more.
+    """
+    commit = (manifest.get("source") or {}).get("commit") or ""
+    if not _COMMIT_RE.match(commit):
+        return
+    src = f"{ws}/{_devshell_src_subdir(manifest)}"
+    sandbox.exec_(name, ["bash", "-c",
+                         'git -C "$1" fetch -q --depth=1 origin "$2" '
+                         '&& git -C "$1" checkout -q --detach "$2"',
+                         "_", src, commit], user="dev")
 
 
 def _devshell_src_subdir(manifest: Dict) -> str:
@@ -1225,7 +1287,10 @@ def _devshell_src_subdir(manifest: Dict) -> str:
     name = repo.rstrip("/").rsplit("/", 1)[-1]
     if name.endswith(".git"):
         name = name[:-len(".git")]
-    return f"_recipe_work/{name or 'source'}"
+    # The name becomes a host path component: only a plain one will do.
+    if not _SRC_NAME_RE.match(name):
+        name = "source"
+    return f"_recipe_work/{name}"
 
 
 def _devshell_build_subdir(manifest: Dict) -> str:
@@ -1386,20 +1451,63 @@ def _devshell_container_options(name: str) -> str:
 _devshell_container_arch = sandbox.container_arch
 
 
-def _devshell_desired_binds(ws: str, *, volume_name: Optional[str],
-                            work_host_bind: Optional[Path],
-                            host_cache: Optional[Path],
-                            patches_out: Path) -> Dict[str, str]:
-    """The mounts the container must have to serve this invocation."""
-    workspace = volume_name if volume_name else str(work_host_bind)
-    binds = {
-        ws: workspace,
-        DEVSHELL_PATCHES_MOUNT: str(patches_out),
-        "/ci-workflows": str(REPO_ROOT),
-    }
+def _devshell_refuse_symlinks(path: Path, root: Path) -> None:
+    """Exit if any component of `path` below `root` is a symlink.
+
+    These directories are bind-mounted, and docker follows a symlink to
+    wherever it points: one left in the host cache (by a container from
+    before it stopped seeing the whole cache) would hand the next
+    container some other host directory.
+    """
+    p = path
+    while p != root and p != p.parent:
+        if p.is_symlink():
+            sys.exit(f"error: {p} is a symlink; refusing to bind it into "
+                     f"a container. Remove it and re-run.")
+        p = p.parent
+
+
+def _devshell_ai_paths(host_cache: Path, patches_out: PurePath
+                       ) -> Tuple[Path, Path, Path]:
+    """(skills, settings.json, this project's memory dir) in the host cache."""
+    repo, encoded = _devshell_ai_repo_key(patches_out)
+    ai = host_cache / "ai"
+    return ai / "skills", ai / "settings.json", ai / "memory" / repo / encoded
+
+
+def _devshell_mounts(ws: str, *, volume_name: Optional[str],
+                     work_host_bind: Optional[Path],
+                     host_cache: Optional[Path],
+                     patches_out: Path) -> List[sandbox.Mount]:
+    """Every mount the devshell container gets.
+
+    The host cache is not mounted whole: the container sees its own
+    cell's workspace (work_host_bind), the AI skills and settings
+    read-only, and only this project's AI memory directory read-write.
+    Everything else the host keeps there -- other cells, the manifests
+    the host acts on, other projects' memory -- stays out of reach.
+    """
+    mounts = [
+        sandbox.Mount(volume_name if volume_name is not None
+                      else str(work_host_bind), ws),
+        sandbox.Mount(str(REPO_ROOT), "/ci-workflows", readonly=True),
+        sandbox.Mount(str(patches_out), DEVSHELL_PATCHES_MOUNT),
+    ]
     if host_cache is not None:
-        binds[DEVSHELL_CACHE_MOUNT] = str(host_cache)
-    return binds
+        skills, settings, memory = _devshell_ai_paths(host_cache, patches_out)
+        inside = PurePath(DEVSHELL_CACHE_MOUNT)
+        rel = lambda p: (inside / p.relative_to(host_cache)).as_posix()  # noqa: E731
+        mounts.append(sandbox.Mount(str(skills), rel(skills), readonly=True))
+        if settings.is_file():
+            mounts.append(sandbox.Mount(str(settings), rel(settings),
+                                        readonly=True))
+        mounts.append(sandbox.Mount(str(memory), rel(memory)))
+    return mounts
+
+
+def _devshell_desired_binds(ws: str, **kw) -> Dict[str, str]:
+    """destination -> source of the mounts this invocation needs."""
+    return {m.target: m.source for m in _devshell_mounts(ws, **kw)}
 
 
 def _devshell_ensure_container(args: argparse.Namespace, name: str,
@@ -1513,14 +1621,9 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
     if locale is not None:
         env += [("DEVSHELL_PRODUCER_LOCALE", f"{locale}")]
 
-    mounts: list[sandbox.Mount] = [
-        sandbox.Mount(volume_name if volume_name is not None
-                      else str(work_host_bind), ws),
-        sandbox.Mount(str(REPO_ROOT), "/ci-workflows", readonly=True),
-        sandbox.Mount(str(patches_out), DEVSHELL_PATCHES_MOUNT),
-    ]
-    if host_cache is not None:
-        mounts.append(sandbox.Mount(str(host_cache), DEVSHELL_CACHE_MOUNT))
+    mounts = _devshell_mounts(ws, volume_name=volume_name,
+                              work_host_bind=work_host_bind,
+                              host_cache=host_cache, patches_out=patches_out)
 
     # Start as root: repro-config needs apt-install + chown. `--user`
     # is deferred to the interactive `docker exec` so the AI runs as
@@ -1547,7 +1650,8 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
                  f"starting devshell container {name}{hint}")
 
 
-def _devshell_run_config(name: str, ws: str) -> None:
+def _devshell_run_config(name: str, ws: str,
+                         before_config: Optional[Any] = None) -> None:
     """Copy scripts/repro-config into the container and run it as root.
 
     `docker cp` (not bind) keeps the script out of the workspace
@@ -1562,6 +1666,12 @@ def _devshell_run_config(name: str, ws: str) -> None:
                   "/usr/local/bin/devshell-repro-config")
     sandbox.cp_in(str(DEVSHELL_INIT_SCRIPT), name,
                   "/usr/local/bin/devshell-init")
+    if before_config is not None:
+        # Needs the `dev` user, which devshell-init creates; it is
+        # idempotent, and repro-config runs it again anyway.
+        sandbox.exec_(name, ["bash", "/usr/local/bin/devshell-init"],
+                      user="0", check=True, quiet=True)
+        before_config()
     sandbox.exec_(name, ["bash", "/usr/local/bin/devshell-repro-config"],
                   user="0", workdir=ws, check=True)
     # Self-check the hermetic-init outputs; failures here mean the
@@ -1610,12 +1720,20 @@ def cmd_devshell(args: argparse.Namespace) -> int:
     patches_out = _devshell_resolve_patches_out(args)
 
     using_host_cache = host_cache is not None
+    update_in_container = False
     if using_host_cache:
-        host_cache.mkdir(parents=True, exist_ok=True)
-        (host_cache / "ai").mkdir(exist_ok=True)
         stage = host_cache / "cells" / cell_id
-        stage.mkdir(parents=True, exist_ok=True)
-        manifest = _devshell_fetch(base, key, stage, args.devshell_refetch)
+        skills, _settings, memory = _devshell_ai_paths(host_cache, patches_out)
+        for d in (stage, skills, memory):
+            _devshell_refuse_symlinks(d, host_cache)
+            d.mkdir(parents=True, exist_ok=True)
+        manifest = _devshell_fetch(
+            base, key, stage, args.devshell_refetch,
+            trusted=host_cache / "manifests" / f"{key}.json")
+        # An existing checkout is updated from inside the container
+        # (see _devshell_update_source_in_container), never host-side.
+        update_in_container = os.path.lexists(
+            stage / _devshell_src_subdir(manifest) / ".git")
         _devshell_source(stage, manifest)
         ws = _devshell_workspace(manifest)
         work_host_bind: Optional[Path] = stage
@@ -1657,7 +1775,10 @@ def cmd_devshell(args: argparse.Namespace) -> int:
         patches_out=patches_out,
         docker_platform=docker_platform,
     )
-    _devshell_run_config(name, ws)
+    _devshell_run_config(
+        name, ws, before_config=(
+            (lambda: _devshell_update_source_in_container(name, ws, manifest))
+            if update_in_container else None))
 
     _log("")
     _log(f"repro: --devshell ready ({cell_id})")

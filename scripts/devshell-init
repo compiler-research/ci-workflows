@@ -142,12 +142,16 @@ fi
 # from a different directory.
 if [[ -d "${DEVSHELL_CACHE_MOUNT:-/cache}" ]]; then
   cache="${DEVSHELL_CACHE_MOUNT:-/cache}"
-  install -d -o "$dev_uid" -g "$dev_gid" \
-    "$cache/ai" "$cache/ai/skills" "$cache/ai/memory"
+  # bin/repro binds pieces of the host cache, not all of it: skills
+  # (and settings.json) read-only, and this project's memory directory.
+  # Create only what is missing -- the mount points exist, and chown on
+  # a read-only one would abort this script.
   repo="${DEVSHELL_AI_REPO:-default}"
   encoded="${DEVSHELL_AI_REPO_ENCODED:--patches}"
   mem_dir="$cache/ai/memory/$repo/$encoded"
-  install -d -o "$dev_uid" -g "$dev_gid" "$mem_dir"
+  for d in "$cache/ai" "$cache/ai/skills" "$cache/ai/memory" "$mem_dir"; do
+    [[ -d "$d" ]] || install -d -o "$dev_uid" -g "$dev_gid" "$d"
+  done
 
   claude_root="$dev_home/.claude"
   install -d -o "$dev_uid" -g "$dev_gid" \
