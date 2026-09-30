@@ -314,7 +314,8 @@ class LaunchTest(unittest.TestCase):
         # Host-cache mode is the point for a newcomer: the download has
         # to outlive the container.
         self.assertTrue(ns.devshell_host_cache)
-        self.assertEqual(ns.devshell_patches_out, "/somewhere/CARTopiaX")
+        self.assertEqual(ns.devshell_patches_out,
+                         str(Path("/somewhere/CARTopiaX")))
         # The same command is printed, for reopening the shell later.
         self.assertIn(" ".join(start.devshell_argv(
             Path("/somewhere/CARTopiaX"), start.coord_of(project))), out)

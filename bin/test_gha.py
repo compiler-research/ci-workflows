@@ -192,6 +192,21 @@ class WalkTest(unittest.TestCase):
         self.assertEqual(len(ws.ci_workflows_refs(root)), 1)
         self.assertEqual(ws.ci_workflows_refs(Path(tempfile.mkdtemp())), [])
 
+    def test_workflow_paths_are_posix_on_every_os(self):
+        # projects.yaml names workflows `/`-separated, and repo_cell
+        # compares against it; str() of a relative path would give
+        # `.github\\workflows\\ci.yml` on Windows and never match.
+        root = Path(tempfile.mkdtemp())
+        wf = root / ".github" / "workflows" / "ci.yml"
+        wf.parent.mkdir(parents=True)
+        wf.write_text("jobs:\n  a:\n    steps:\n      - uses: "
+                      "compiler-research/ci-workflows/actions/setup-llvm@main\n",
+                      encoding="utf-8")
+        self.assertEqual([r.workflow for r in ws.iter_rows(root)],
+                         [".github/workflows/ci.yml"])
+        self.assertEqual([f for f, _ in ws.ci_workflows_refs(root)],
+                         [".github/workflows/ci.yml"])
+
     def test_checkout_root_accepts_a_worktree_git_file(self):
         root = Path(tempfile.mkdtemp()).resolve()
         (root / ".git").write_text("gitdir: /elsewhere\n")

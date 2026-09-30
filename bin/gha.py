@@ -747,7 +747,7 @@ def ci_workflows_refs(checkout: Path) -> List[Tuple[str, str]]:
         except OSError:
             continue
         for m in _CI_ANY_RE.finditer(text):
-            out.append((str(f.relative_to(checkout)), m.group(0)))
+            out.append((f.relative_to(checkout).as_posix(), m.group(0)))
     return out
 
 
@@ -857,7 +857,8 @@ def checkout_root(path: Path) -> Optional[Path]:
 @dataclass
 class Row:
     """One expanded matrix row of one job, with its expression context."""
-    workflow: str   # repo-relative path of the workflow file
+    workflow: str   # repo-relative path of the workflow file, `/`-separated
+                    # on every OS, as projects.yaml spells it
     job: str
     name: str       # matrix.name, else the rendered job name, else job id
     ctx: Dict[str, Any]
@@ -923,7 +924,7 @@ def iter_rows(checkout: Path) -> Iterator[Row]:
                                                        ctx))
                 except ExprError:
                     ctx["runner"] = _runner_ctx("")
-                yield Row(workflow=str(wf.relative_to(checkout)),
+                yield Row(workflow=wf.relative_to(checkout).as_posix(),
                           job=str(job_id),
                           name=_row_label(str(job_id), job, values, ctx),
                           ctx=ctx, steps=job.get("steps"))

@@ -147,7 +147,7 @@ class ResolverTest(unittest.TestCase):
         # Parse the action so the two cannot drift apart unnoticed.
         import re
         text = (cells.REPO_ROOT / "actions" / "setup-llvm" /
-                "action.yml").read_text()
+                "action.yml").read_text(encoding="utf-8")
         body = text[text.index('case "${FLAVOR}" in'):text.index("esac")]
         table = {}
         for m in re.finditer(r"^\s*('?)([a-z]*)\1\)\s*\n?\s*recipe=(\S*)",
