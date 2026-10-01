@@ -751,5 +751,15 @@ def _launch_checkout(repro, base: str, catalog: List[Dict[str, str]],
     return launch(repro, project, checkout, coord)
 
 
+def cli(argv: Optional[List[str]] = None) -> int:
+    """main(), with Ctrl+C at a prompt or mid-download ending the run
+    quietly (exit 130) rather than in a traceback."""
+    try:
+        return main(argv)
+    except KeyboardInterrupt:
+        print("\n  interrupted.", file=sys.stderr)
+        return 130
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())

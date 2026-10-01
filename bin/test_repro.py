@@ -18,6 +18,7 @@ import subprocess
 import sys
 import json
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path, PureWindowsPath
@@ -2307,6 +2308,62 @@ class DevshellSrcSubdirTests(unittest.TestCase):
         m = {"source": {"repo": "https://github.com/kokkos/kokkos"}}
         self.assertEqual(repro._devshell_build_subdir(m),
                          "_recipe_work/kokkos/build")
+
+
+class DevshellInterruptedFetchTests(unittest.TestCase):
+    """A fetch cut short must not leave a tree the next run trusts."""
+
+    def setUp(self):
+        self.repro = _load_repro()
+        self.d = Path(tempfile.mkdtemp())
+        self.base = self.d / "backend"
+        self.base.mkdir()
+        (self.base / "k.manifest.json").write_text("{}")
+        self.work = self.d / "cell"
+        self.work.mkdir()
+
+    def _fetch(self, download):
+        with mock.patch.object(self.repro, "_log"), \
+                mock.patch("cache_io.cache_download", side_effect=download):
+            return self.repro._devshell_fetch(f"file://{self.base}", "k",
+                                              self.work, False)
+
+    def test_interrupted_install_is_fetched_again(self):
+        def interrupted(base, key, out):
+            (Path(out) / "install" / "bin").mkdir(parents=True)
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self._fetch(interrupted)
+        self.assertFalse((self.work / "_recipe_out" / "install").exists())
+
+        def complete(base, key, out):
+            (Path(out) / "install" / "bin").mkdir(parents=True)
+            (Path(out) / "install" / "bin" / "clang").write_text("ok")
+        self._fetch(complete)
+        self.assertEqual((self.work / "_recipe_out" / "install" / "bin" /
+                          "clang").read_text(), "ok")
+        self.assertFalse((self.work / "_recipe_out.partial").exists())
+
+    def test_a_dead_zstd_pump_stays_quiet_but_other_errors_do_not(self):
+        def raise_in_thread(exc):
+            def boom():
+                raise exc
+            t = threading.Thread(target=boom); t.start(); t.join()
+        with redirect_stderr(io.StringIO()) as err:
+            with self.repro._quiet_broken_pipe_threads():
+                raise_in_thread(BrokenPipeError(32, "Broken pipe"))
+            self.assertEqual(err.getvalue(), "")
+            with self.repro._quiet_broken_pipe_threads():
+                raise_in_thread(ValueError("real failure"))
+        self.assertIn("real failure", err.getvalue())
+
+    def test_cli_turns_ctrl_c_into_exit_130(self):
+        with mock.patch.object(self.repro, "main",
+                               side_effect=KeyboardInterrupt), \
+                redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self.repro.cli(), 130)
+        self.assertIn("interrupted", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
 
 
 class DevshellMockupSourceTests(unittest.TestCase):

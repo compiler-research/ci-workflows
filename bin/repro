@@ -110,6 +110,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import platform
 import re
@@ -119,6 +120,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path, PurePath
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1106,6 +1108,26 @@ def _devshell_compute_key(coord: Dict[str, str]) -> str:
     return out[len("key="):]
 
 
+@contextlib.contextmanager
+def _quiet_broken_pipe_threads():
+    """Keep a dead zstd's BrokenPipeError in cache_io's pump thread off
+    the terminal. zstd dies first on Ctrl+C (the whole process group
+    gets it), and the main thread then reports the interrupt -- or the
+    failure that killed zstd -- itself. cache_io is left as is: it is
+    under actions/lib/, which every cache key hashes."""
+    prev = threading.excepthook
+
+    def hook(a):
+        if not issubclass(a.exc_type, BrokenPipeError):
+            prev(a)
+    threading.excepthook = hook
+    try:
+        yield
+    finally:
+        threading.excepthook = prev
+
+
+@_quiet_broken_pipe_threads()
 def _devshell_fetch(base: str, key: str, work: Path,
                     refetch: bool, trusted: Optional[Path] = None) -> Dict:
     """Download <key>.tar.zst (install), <key>.ccache.tar.zst (sibling),
@@ -1113,7 +1135,10 @@ def _devshell_fetch(base: str, key: str, work: Path,
 
     `refetch` re-downloads even when the local copy is present.
     Each download is gated independently so a partial run resumes
-    cheaply.
+    cheaply. Archives are extracted beside their destination and moved
+    into place only once complete: the gate is "the directory exists",
+    so a half-extracted tree left by Ctrl+C or a dropped connection
+    would otherwise pass for a finished one on every later run.
     """
     sys.path.insert(0, str(REPO_ROOT / "actions" / "lib"))
     import cache_io  # noqa: E402
@@ -1133,11 +1158,14 @@ def _devshell_fetch(base: str, key: str, work: Path,
     # `<work>/_recipe_out/install/`.
     install_root = install_parent / "install"
     if refetch or not install_root.is_dir():
+        partial = work / "_recipe_out.partial"
+        shutil.rmtree(partial, ignore_errors=True)  # an interrupted fetch
+        partial.mkdir(parents=True)
+        _log(f"repro: fetching install ({key}.tar.zst)...")
+        cache_io.cache_download(base, key, str(partial))
         if install_parent.is_dir():
             shutil.rmtree(install_parent)
-        install_parent.mkdir(parents=True)
-        _log(f"repro: fetching install ({key}.tar.zst)...")
-        cache_io.cache_download(base, key, str(install_parent))
+        partial.rename(install_parent)
 
     # Sibling ccache: archive's top-level dir is `.ccache/`, extracting
     # to `<work>/` lands the ccache at `<work>/.ccache/`.
@@ -1150,24 +1178,30 @@ def _devshell_fetch(base: str, key: str, work: Path,
     # one.
     ccache_dir = ccache_root / DEVSHELL_CCACHE_SUBDIR
     if refetch or not ccache_dir.is_dir():
-        if ccache_dir.is_dir():
-            shutil.rmtree(ccache_dir)
         asset = f"{key}.ccache.tar.zst"
         _log(f"repro: fetching ccache ({asset})...")
+        stage = ccache_root / f"{DEVSHELL_CCACHE_SUBDIR}.partial"
+        shutil.rmtree(stage, ignore_errors=True)  # an interrupted fetch
+        stage.mkdir(parents=True)
         try:
             if base.startswith("file://"):
                 with (Path(base[len("file://"):]) / asset).open("rb") as f:
-                    cache_io._zstd_decode_into_tar(f, ccache_root)
+                    cache_io._zstd_decode_into_tar(f, stage)
             else:
                 with urllib.request.urlopen(
                         f"{base.rstrip('/')}/{asset}", timeout=300) as r:
-                    cache_io._zstd_decode_into_tar(r, ccache_root)
+                    cache_io._zstd_decode_into_tar(r, stage)
+            if ccache_dir.is_dir():
+                shutil.rmtree(ccache_dir)
+            (stage / DEVSHELL_CCACHE_SUBDIR).rename(ccache_dir)
         except (OSError, urllib.error.URLError) as e:
             # The directory still has to exist: CCACHE_LOGFILE points inside it
             # and ccache fails outright if it cannot open the log.
             ccache_dir.mkdir(parents=True, exist_ok=True)
             _log(f"repro: no sibling ccache for this cell ({e}); "
                  f"the devshell will start with a cold cache")
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
 
     # Manifest: plain JSON, no zstd/tar. With `trusted`, the copy the
     # host acts on lives there -- outside anything the container can
@@ -2404,5 +2438,16 @@ def _log_keep_hint(cid: str, prefix: str = "repro: ") -> None:
          f"docker exec -it {cid[:12]} bash")
 
 
+def cli() -> int:
+    """main(), with Ctrl+C ending the run quietly (exit 130) rather than
+    in a traceback. A shell inside a devshell keeps its own Ctrl+C: the
+    interactive docker exec runs with SIGINT ignored here."""
+    try:
+        return main()
+    except KeyboardInterrupt:
+        print("\nrepro: interrupted", file=sys.stderr)
+        return 130
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())
