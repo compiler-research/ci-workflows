@@ -25,8 +25,9 @@ It lists the projects in [`projects.yaml`](projects.yaml) with the
 toolchain each develops against, clones the one you pick, and opens a
 container holding that exact toolchain -- the same artifact the
 project's CI uses -- with its host dependencies installed and Claude
-Code ready. Run it from inside a checkout you already have and it skips
-the menu.
+Code ready. The clone goes into the current directory, or beside the
+checkout you run it from (ci-workflows here). Run it from inside a
+checkout you already have and it skips the menu.
 
 Your checkout is bind-mounted, not copied, so edits show up on the host
 immediately and you commit, push and open pull requests from there.
