@@ -213,6 +213,7 @@ Common knobs:
 | `--devshell-rm` | remove the container; the volume and host cache are kept |
 | `--devshell-refetch` | re-download install / ccache / manifest |
 | `--devshell-script PATH` | run PATH inside the container instead of an interactive shell (CI / smoke use) |
+| `--devshell-install PKG...` | apt-install packages into the devshell as root, then exit; a failed `apt-get install` inside prints this command for you |
 | `--devshell-sudo` | give `dev` passwordless sudo (off by default: it makes the AI root in the container) |
 | `--devshell-writable-git` | mount `/patches/.git` read-write so git inside can commit (off by default: commit on the host) |
 

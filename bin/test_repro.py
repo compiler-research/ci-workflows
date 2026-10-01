@@ -1627,7 +1627,8 @@ class DevshellRestrictionsTests(unittest.TestCase):
                                       return_value=""), \
                     mock.patch.object(self.repro, "_devshell_container_profile",
                                       return_value=" ".join(
-                                          self.repro._devshell_security(False))), \
+                                          self.repro._devshell_security(False)
+                                          + [f"layout={self.repro.DEVSHELL_LAYOUT}"])), \
                     mock.patch.object(self.repro.subprocess, "run") as run, \
                     redirect_stderr(io.StringIO()):
                 self.repro._devshell_ensure_container(
@@ -1648,6 +1649,51 @@ class DevshellRestrictionsTests(unittest.TestCase):
             patches_out=proj)
         self.assertIn(("/patches/.git", True),
                       [(m.target, m.readonly) for m in mounts])
+
+
+class DevshellInstallTests(unittest.TestCase):
+    """Packages get into a sudo-less devshell from the host."""
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def test_package_names_are_checked_before_apt_sees_them(self):
+        ok = self.repro._APT_PACKAGE.match
+        for name in ("python3-dev", "libstdc++-14-dev", "nlohmann-json3-dev",
+                     "gcc:amd64", "cmake=3.28.3-1build7"):
+            self.assertTrue(ok(name), name)
+        for name in ("-o", "--allow-unauthenticated", "a b", "x;y", "", "Foo"):
+            self.assertFalse(ok(name), name)
+        with self.assertRaises(SystemExit):
+            self.repro._devshell_install("c", ["python3-dev", "-oDebug::x=1"])
+
+    def test_install_runs_apt_as_root_with_names_after_dashdash(self):
+        with mock.patch.object(self.repro.sandbox, "exec_") as ex, \
+                redirect_stderr(io.StringIO()):
+            ex.return_value = mock.Mock(returncode=0)
+            self.assertEqual(self.repro._devshell_install(
+                "devshell-x", ["python3-dev", "liblz4-dev"]), 0)
+        argv, kw = ex.call_args
+        self.assertEqual(kw["user"], "0")
+        self.assertIn('-- "$@"', argv[1][2])
+        self.assertEqual(argv[1][-2:], ["python3-dev", "liblz4-dev"])
+
+    def test_reopen_command_keeps_every_creation_flag(self):
+        args = self.repro.parse_args([
+            "--devshell", "--devshell-host-cache", "--devshell-writable-git",
+            "--devshell-docker-options=--gpus all", "llvm-release/22/ubuntu-24.04/x86_64"])
+        args.matrix = ["name:llvm-release/22/ubuntu-24.04/x86_64"]
+        argv = self.repro._devshell_reopen_argv(args, Path("/src/cppjit"))
+        self.assertEqual(argv[1:], [
+            "--devshell", "--devshell-host-cache",
+            "--devshell-patches-out", str(Path("/src/cppjit")),
+            "--devshell-writable-git", "--devshell-docker-options=--gpus all",
+            "llvm-release/22/ubuntu-24.04/x86_64"])
+
+    def test_install_flag_parses_after_the_cell_too(self):
+        ns = self.repro.parse_args(["--devshell", "c/v/o/a", "--devshell-install",
+                                    "python3-dev", "liblz4-dev"])
+        self.assertEqual(ns.devshell_install, ["python3-dev", "liblz4-dev"])
 
 
 class DevshellLocaleTests(unittest.TestCase):
@@ -2018,7 +2064,8 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
              mock.patch.object(
                  self.repro, "_devshell_container_profile",
                  return_value=kw.pop("actual_profile", " ".join(
-                     self.repro._devshell_security(False)))), \
+                     self.repro._devshell_security(False)
+                     + [f"layout={self.repro.DEVSHELL_LAYOUT}"]))), \
              mock.patch.object(self.repro.subprocess, "run") as run, \
              mock.patch.object(self.repro, "_devshell_host_uid_gid",
                                return_value=(1000, 1000)), \

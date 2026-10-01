@@ -348,6 +348,54 @@ write_locale "$chosen"
 grep -qF "$env_file" /etc/bash.bashrc 2>/dev/null \
   || printf '[ -r %s ] && . %s\n' "$env_file" "$env_file" >> /etc/bash.bashrc
 
+# Package installs. The shell has no sudo by default, so apt-get, apt
+# and sudo are shadowed in /usr/local/bin by wrappers that run the real
+# tool and, when it fails to change packages, add how a package gets in
+# from the host (`bin/repro --devshell-install`) below its own error.
+cat > /usr/local/bin/devshell-apt-hint <<'HINT'
+#!/bin/bash
+# Written by repro-config. $@: the failed apt command's arguments.
+pkgs=()
+for a in "${@:2}"; do [[ $a == -* ]] || pkgs+=("$a"); done
+p="${pkgs[*]:-<package>...}"
+{
+  echo
+  echo "devshell: no root here, so packages are installed from the host:"
+  echo "    ${DEVSHELL_REOPEN:-bin/repro --devshell <cell>} --devshell-install $p"
+  echo "  or straight into this running container:"
+  echo "    docker exec -u 0 ${DEVSHELL_CONTAINER:-<container>} apt-get install -y $p"
+  echo "  Python packages need no root: python3 -m venv ~/.venv && ~/.venv/bin/pip install <pkg>"
+  echo "  nor does conda: \"\${SHELL}\" <(curl -L micro.mamba.pm/install.sh)"
+} >&2
+HINT
+for tool in apt-get apt; do
+  cat > "/usr/local/bin/$tool" <<WRAP
+#!/bin/bash
+# Written by repro-config: the real $tool, plus a hint when a package
+# change fails for want of root.
+[[ \$EUID -eq 0 ]] && exec /usr/bin/$tool "\$@"
+/usr/bin/$tool "\$@"; rc=\$?
+case "\${1:-}" in
+  install|reinstall|remove|purge|upgrade|full-upgrade|dist-upgrade|update|autoremove|build-dep)
+    [[ \$rc -ne 0 ]] && /usr/local/bin/devshell-apt-hint "\$@" ;;
+esac
+exit \$rc
+WRAP
+done
+cat > /usr/local/bin/sudo <<'WRAP'
+#!/bin/bash
+# Written by repro-config: the real sudo; when it fails on apt (no sudo in
+# this devshell unless --devshell-sudo), the host command too.
+/usr/bin/sudo "$@"; rc=$?
+args=("$@"); while [[ ${args[0]:-} == -* ]]; do args=("${args[@]:1}"); done
+if [[ $rc -ne 0 && ( ${args[0]:-} == apt || ${args[0]:-} == apt-get ) ]]; then
+  /usr/local/bin/devshell-apt-hint "${args[@]:1}"
+fi
+exit $rc
+WRAP
+chmod 0755 /usr/local/bin/devshell-apt-hint /usr/local/bin/apt-get \
+  /usr/local/bin/apt /usr/local/bin/sudo
+
 # The note an interactive shell opens with. Written here, read at shell
 # start, so it reflects the container as it is (Claude installed yet,
 # .git read-only or not) rather than as it was at provisioning.
@@ -364,6 +412,7 @@ echo "  recipe src  ${DEVSHELL_SRC:-}   build: ${DEVSHELL_BUILD:-}"
 if grep -qE " /patches/\.git [^ ]+ ro[, ]" /proc/mounts 2>/dev/null; then
   echo "  ${_d}.git is read-only here: edit in the container, commit and push on the host${_r}"
 fi
+echo "  packages    ${_d}no sudo: a failed apt-get install prints the host command; Python: a venv; conda: micromamba${_r}"
 if ! command -v claude >/dev/null 2>&1; then
   echo "  Claude Code is not installed. Install it with:"
   echo "    curl -fsSL https://claude.ai/install.sh | bash"
