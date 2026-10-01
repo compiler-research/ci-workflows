@@ -93,6 +93,34 @@ class LoadProjectsTest(unittest.TestCase):
         got = start.load_projects(_write(text))
         self.assertEqual([p["name"] for p in got], ["CppInterOp"])
 
+    def test_workflow_and_row_are_optional_but_only_together(self):
+        base = ("projects:\n  - name: P\n    description: d\n"
+                "    repo: https://h/p\n    recipe: r\n    version: '1'\n"
+                "    os: ubuntu-24.04\n    arch: x86_64\n")
+        self.assertEqual([p["name"] for p in start.load_projects(_write(base))],
+                         ["P"])
+        self.assertEqual(start.load_projects(_write(base + "    row: r\n")), [])
+        both = base + "    workflow: .github/workflows/ci.yml\n    row: r\n"
+        self.assertEqual(len(start.load_projects(_write(both))), 1)
+
+    def test_clone_options_are_limited_to_shaping_the_clone(self):
+        ok = {"clone": "--filter=blob:none --branch=release/23.x"}
+        self.assertEqual(start.clone_options(ok),
+                         ["--filter=blob:none", "--branch=release/23.x"])
+        self.assertEqual(start.clone_branch(ok), "release/23.x")
+        self.assertEqual(start.clone_options({}), [])
+        self.assertIsNone(start.clone_branch({}))
+        for bad in ("--config=core.hooksPath=x", "-c x=y", "--upload-pack=x",
+                    "--template=/tmp", "--branch=-x", "--separate-git-dir=/x",
+                    "--recurse-submodules", "--depth=1", "--sparse",
+                    "--filter=blob:limit=1k"):
+            self.assertIsNone(start.clone_options({"clone": bad}), bad)
+
+    def test_shipped_catalog_keeps_every_entry(self):
+        text = start.PROJECTS_YAML.read_text(encoding="utf-8")
+        self.assertEqual(len(start.load_projects()),
+                         len(re.findall(r"^  - name:", text, re.M)))
+
     def test_missing_file_yields_empty_list(self):
         self.assertEqual(
             start.load_projects(Path(tempfile.mkdtemp()) / "nope.yaml"), [])
@@ -188,6 +216,12 @@ class RepoCellTest(unittest.TestCase):
             "clang-runtime: '22' }\n")
         self.assertIsNone(self._cell(root, workflow=".github/workflows/x.yml"))
 
+    def test_entry_without_a_row_keeps_its_recorded_cell(self):
+        root = self._checkout(
+            "          - { name: ubu24-x86-gcc12-llvm22, os: ubuntu-24.04, "
+            "clang-runtime: '22' }\n")
+        self.assertIsNone(start.repo_cell(root, {"workflow": "", "row": ""}))
+
     def test_missing_workflow_is_silent(self):
         self.assertIsNone(start.repo_cell(Path(tempfile.mkdtemp()),
                                           self._project()))
@@ -229,6 +263,25 @@ class DetectProjectTest(unittest.TestCase):
         self.assertIsNotNone(got)
         self.assertEqual(got[0]["name"], "CARTopiaX")
         self.assertEqual(got[1], Path("/home/s/renamed-dir"))
+
+    def test_a_branch_entry_matches_only_a_checkout_on_that_branch(self):
+        projects = [{"name": "llvm-23", "repo": "https://github.com/llvm/llvm-project",
+                     "clone": "--filter=blob:none --branch=release/23.x"},
+                    {"name": "llvm-22", "repo": "https://github.com/llvm/llvm-project",
+                     "clone": "--branch=release/22.x"}]
+        repro = mock.Mock()
+        repro._origin_repo_slug.return_value = "llvm/llvm-project"
+
+        def on(branch):
+            def run(argv, **kw):
+                out = "/src/llvm\n" if "--show-toplevel" in argv else branch + "\n"
+                return mock.Mock(returncode=0, stdout=out)
+            return run
+        for branch, want in (("release/23.x", "llvm-23"), ("release/22.x", "llvm-22"),
+                             ("main", None)):
+            with mock.patch.object(start.subprocess, "run", side_effect=on(branch)):
+                got = start.detect_project(repro, projects)
+            self.assertEqual(got and got[0]["name"], want, branch)
 
     def test_uncatalogued_or_non_git_cwd_falls_through_to_the_menu(self):
         projects = start.load_projects(_write(WELL_FORMED))
@@ -335,6 +388,18 @@ class ResolveCheckoutTest(unittest.TestCase):
 
     PROJECT = {"name": "CARTopiaX", "recipe": "biodynamo", "version": "v1",
                "repo": "https://github.com/compiler-research/CARTopiaX"}
+
+    def test_clone_passes_the_options_before_the_url(self):
+        dest = Path(tempfile.mkdtemp()) / "LLVM"
+        project = dict(self.PROJECT, clone="--filter=blob:none --branch=release/23.x")
+        with mock.patch("builtins.input", side_effect=[str(dest), ""]), \
+                mock.patch.object(start.subprocess, "run") as run, \
+                redirect_stdout(io.StringIO()):
+            run.return_value = mock.Mock(returncode=0)
+            start.resolve_checkout(project)
+        self.assertEqual(run.call_args[0][0], [
+            "git", "clone", "--filter=blob:none", "--branch=release/23.x",
+            "--", project["repo"], str(dest.resolve())])
 
     def test_existing_checkout_is_reused_and_never_touched(self):
         # .resolve(), because resolve_checkout does: on macOS /var is a

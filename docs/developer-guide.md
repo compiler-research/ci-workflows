@@ -254,6 +254,15 @@ stale is self-healing rather than harmful.
 clad's entry is a worked example: row `ubu24-clang20-runtime23`,
 which clad's `ci.yml` resolves to `llvm-release/23/ubuntu-24.04/x86_64`.
 
+A project whose CI does not use ci-workflows -- ROOT, LLVM itself --
+has no row to point at: leave `workflow` and `row` out and the cell in
+the entry is used as is. A large repository can say how to clone it
+with `clone`, limited to a partial-clone filter and a branch; llvm-23
+uses `--filter=blob:none --branch=release/23.x`. An entry with a
+branch matches a checkout only while it is on that branch, so an
+llvm-project clone on a feature branch gets the menu rather than
+LLVM 23.
+
 ## Bumping the LLVM version
 
 Change the `version` input on the `setup-recipe` call in your

@@ -102,6 +102,12 @@ class ExprTest(unittest.TestCase):
         self.assertEqual(ws.render("ROOT-llvm${{ matrix.v }}", ctx),
                          "ROOT-llvm22")
 
+    def test_render_of_adjacent_expressions(self):
+        ctx = {"matrix": {"os": "u", "llvm": "22", "vg": True}}
+        self.assertEqual(
+            ws.render("${{ matrix.os }}/llvm${{ matrix.llvm }}"
+                      "${{ matrix.vg && '/vg' || '' }}", ctx), "u/llvm22/vg")
+
     def test_step_if_reading_runtime_state_is_assumed_true(self):
         ctx = {"matrix": {}, "runner": {"os": "Linux"}}
         self.assertFalse(ws.step_runs("${{ matrix.cuda }}", ctx))
@@ -206,6 +212,54 @@ class WalkTest(unittest.TestCase):
                          [".github/workflows/ci.yml"])
         self.assertEqual([f for f, _ in ws.ci_workflows_refs(root)],
                          [".github/workflows/ci.yml"])
+
+    def test_jobs_calling_a_reusable_workflow_are_walked(self):
+        root = Path(tempfile.mkdtemp())
+        files = {
+            ".github/workflows/ci.yml": """
+                jobs:
+                  t:
+                    name: ${{ matrix.os }}/llvm${{ matrix.llvm }}
+                    strategy:
+                      matrix:
+                        include:
+                          - { os: ubuntu-24.04, llvm: '22', flavor: cling }
+                          - { os: windows-2025, llvm: '22', flavor: '' }
+                    uses: ./.github/workflows/build.yml
+                    with:
+                      os: ${{ matrix.os }}
+                      version: ${{ matrix.llvm }}
+                      flavor: ${{ matrix.flavor }}
+            """,
+            ".github/workflows/build.yml": """
+                on:
+                  workflow_call:
+                    inputs:
+                      os: { type: string, required: true }
+                      version: { type: string, required: true }
+                      flavor: { type: string, default: system }
+                jobs:
+                  b:
+                    runs-on: ${{ inputs.os }}
+                    steps:
+                      - if: runner.os != 'Windows'
+                        uses: compiler-research/ci-workflows/actions/setup-llvm@main
+                        with:
+                          version: ${{ inputs.version }}
+                          os: ${{ inputs.os }}
+                          flavor: ${{ inputs.flavor }}
+            """,
+        }
+        for rel, text in files.items():
+            f = root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(textwrap.dedent(text), encoding="utf-8")
+        got = [(r.name, c.inputs["flavor"])
+               for r in ws.iter_rows(root)
+               for c in ws.iter_calls(r.steps, r.ctx, root, {"setup-llvm"})]
+        # The caller row's name and with:; Windows skipped by the
+        # callee's own step condition, evaluated with its inputs.
+        self.assertEqual(got, [("ubuntu-24.04/llvm22", "cling")])
 
     def test_checkout_root_accepts_a_worktree_git_file(self):
         root = Path(tempfile.mkdtemp()).resolve()

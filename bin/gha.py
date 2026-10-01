@@ -35,6 +35,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #: `uses:` of one of our actions: owner/repo/actions/<name>@ref.
 _CI_ACTION_RE = re.compile(
     r"^compiler-research/ci-workflows/actions/([A-Za-z0-9_.-]+)@")
+#: `uses:` of one of our reusable workflows, at job level.
+_CI_WORKFLOW_RE = re.compile(
+    r"^compiler-research/ci-workflows/\.github/workflows/([A-Za-z0-9_.-]+\.ya?ml)@")
 #: Anything of ours, including reusable workflows.
 _CI_ANY_RE = re.compile(r"compiler-research/ci-workflows/[^\s'\"]+@")
 
@@ -668,8 +671,11 @@ def render(value: Any, ctx: Dict[str, Any]) -> Any:
     """
     if not isinstance(value, str) or "${{" not in value:
         return value
+    # One expression and nothing else keeps its type. Count them first:
+    # fullmatch would also accept `${{ a }}/${{ b }}` as one expression
+    # running from the first `${{` to the last `}}`.
     whole = _INTERP_RE.fullmatch(value.strip())
-    if whole:
+    if whole and value.count("${{") == 1:
         return evaluate(whole.group(1), ctx)
     return _INTERP_RE.sub(lambda m: to_str(evaluate(m.group(1), ctx)), value)
 
@@ -889,9 +895,95 @@ def _row_label(job_id: str, job: Dict[str, Any], row: Dict[str, Any],
     return job_id
 
 
+def _context(checkout: Path, matrix: Dict[str, Any],
+             inputs: Dict[str, Any], runs_on: Any) -> Dict[str, Any]:
+    ctx: Dict[str, Any] = {
+        "matrix": matrix, "inputs": inputs, "env": {}, "vars": {},
+        "secrets": {}, "steps": {}, "needs": {},
+        "github": {"event_name": "push", "repository": checkout.name,
+                   "workspace": "/github/workspace"},
+    }
+    try:
+        ctx["runner"] = _runner_ctx(render(runs_on, ctx))
+    except ExprError:
+        ctx["runner"] = _runner_ctx("")
+    return ctx
+
+
+def _load_called_workflow(ref: str, checkout: Path) -> Optional[Dict[str, Any]]:
+    """The reusable workflow a job-level `uses:` names, if we can see it.
+
+    Ours resolve against this ci-workflows tree, as actions do; the
+    repository's own resolve against the checkout.
+    """
+    m = _CI_WORKFLOW_RE.match(ref)
+    if m:
+        path = REPO_ROOT / ".github" / "workflows" / m.group(1)
+    elif ref.startswith("./.github/workflows/"):
+        path = checkout / ref[2:]
+    else:
+        return None
+    try:
+        doc = load_yaml(path)
+    except (YAMLError, OSError, IndexError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _called_rows(job: Dict[str, Any], caller: Dict[str, Any],
+                 checkout: Path, depth: int
+                 ) -> Iterator[Tuple[Dict[str, Any], Any]]:
+    """(context, steps) of every job of the reusable workflow `job` calls,
+    with `inputs` its defaults overlaid with the caller's evaluated
+    `with:`."""
+    doc = _load_called_workflow(to_str(job.get("uses")), checkout)
+    if doc is None or depth > 3:
+        return
+    trig = doc.get("on") if isinstance(doc.get("on"), dict) else {}
+    call = trig.get("workflow_call") if isinstance(trig, dict) else None
+    specs = (call or {}).get("inputs") or {} if isinstance(call, dict) else {}
+    inputs: Dict[str, Any] = {}
+    for name, spec in specs.items():
+        if isinstance(spec, dict) and "default" in spec:
+            inputs[name] = spec["default"]
+    try:
+        for k, v in (job.get("with") or {}).items():
+            inputs[k] = render(v, caller)
+    except ExprError:
+        return
+    for inner in (doc.get("jobs") or {}).values():
+        if not isinstance(inner, dict):
+            continue
+        if inner.get("uses"):
+            ctx = _context(checkout, {}, inputs, None)
+            yield from _called_rows(inner, ctx, checkout, depth + 1)
+            continue
+        strategy = inner.get("strategy")
+        matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+        for values in expand_matrix(matrix) or []:
+            ctx = _context(checkout, values, inputs, None)
+            ctx["runner"] = _context(checkout, values, inputs,
+                                     inner.get("runs-on"))["runner"]
+            if not step_runs(inner.get("if"), ctx):
+                continue
+            yield ctx, inner.get("steps")
+
+
+def _only_called(doc: Dict[str, Any]) -> bool:
+    """A reusable workflow nothing triggers but a caller: it runs only
+    through a job that calls it, and is walked from there."""
+    on = doc.get("on")
+    names = (set(on) if isinstance(on, (dict, list))
+             else {on} if isinstance(on, str) else set())
+    return names == {"workflow_call"}
+
+
 def iter_rows(checkout: Path) -> Iterator[Row]:
     """Every matrix row of every job in .github/workflows/, in file order.
 
+    A job that calls a reusable workflow -- one of ours, or the
+    repository's own -- yields that workflow's jobs, evaluated with the
+    caller row's `with:` as their `inputs`, under the caller row's name.
     Files that do not parse and matrices computed at run time are
     skipped: this is a best-effort static reading.
     """
@@ -905,6 +997,9 @@ def iter_rows(checkout: Path) -> Iterator[Row]:
             continue
         if not isinstance(doc, dict) or not isinstance(doc.get("jobs"), dict):
             continue
+        if _only_called(doc):
+            continue
+        rel = wf.relative_to(checkout).as_posix()
         for job_id, job in doc["jobs"].items():
             if not isinstance(job, dict):
                 continue
@@ -912,21 +1007,14 @@ def iter_rows(checkout: Path) -> Iterator[Row]:
             matrix = strategy.get("matrix") if isinstance(strategy, dict) \
                 else None
             for values in expand_matrix(matrix) or []:
-                ctx: Dict[str, Any] = {
-                    "matrix": values, "inputs": {}, "env": {}, "vars": {},
-                    "secrets": {}, "steps": {}, "needs": {},
-                    "github": {"event_name": "push",
-                               "repository": checkout.name,
-                               "workspace": "/github/workspace"},
-                }
-                try:
-                    ctx["runner"] = _runner_ctx(render(job.get("runs-on"),
-                                                       ctx))
-                except ExprError:
-                    ctx["runner"] = _runner_ctx("")
-                yield Row(workflow=wf.relative_to(checkout).as_posix(),
-                          job=str(job_id),
-                          name=_row_label(str(job_id), job, values, ctx),
+                ctx = _context(checkout, values, {}, job.get("runs-on"))
+                name = _row_label(str(job_id), job, values, ctx)
+                if job.get("uses"):
+                    for inner_ctx, steps in _called_rows(job, ctx, checkout, 0):
+                        yield Row(workflow=rel, job=str(job_id), name=name,
+                                  ctx=inner_ctx, steps=steps)
+                    continue
+                yield Row(workflow=rel, job=str(job_id), name=name,
                           ctx=ctx, steps=job.get("steps"))
 
 

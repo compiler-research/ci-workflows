@@ -185,13 +185,20 @@ jobs:
           count=$(yq '.projects | length' projects.yaml)
           for i in $(seq 0 $((count - 1))); do
             name=$(yq -r ".projects[$i].name" projects.yaml)
-            for f in name description repo workflow row recipe version os arch; do
+            for f in name description repo recipe version os arch; do
               v=$(yq -r ".projects[$i].$f // \"\"" projects.yaml)
               if [ -z "$v" ]; then
                 echo "::error file=projects.yaml::$name missing field: $f"
                 fail=1
               fi
             done
+            # workflow and row are optional, but only together.
+            w=$(yq -r ".projects[$i].workflow // \"\"" projects.yaml)
+            r=$(yq -r ".projects[$i].row // \"\"" projects.yaml)
+            if [ "${w:+set}" != "${r:+set}" ]; then
+              echo "::error file=projects.yaml::$name: give workflow and row together, or neither"
+              fail=1
+            fi
             coord=$(yq -r ".projects[$i] | [.recipe, .version, .os, .arch] | @tsv" projects.yaml)
             # Materialise the cell list before matching. `grep -q` exits on
             # the first match, which SIGPIPEs yq, and `set -o pipefail` then
