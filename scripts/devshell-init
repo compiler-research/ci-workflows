@@ -80,7 +80,9 @@ if [[ -n "$existing_user" ]]; then
       || usermod -l dev "$existing_user"
   fi
 else
-  useradd -u "$dev_uid" -g dev -d "$dev_home" -m -s /bin/bash dev
+  # A macOS uid (501) is below Ubuntu's UID_MIN; say so rather than warn.
+  useradd -K UID_MIN="$dev_uid" -u "$dev_uid" -g dev -d "$dev_home" -m \
+    -s /bin/bash dev
 fi
 
 # Passwordless sudo only when asked for (bin/repro --devshell-sudo):
@@ -185,6 +187,8 @@ if ! declare -F devshell_install_ai_cli >/dev/null; then
     echo "          fork's scripts/repro-config." >&2
   }
 fi
-if ! command -v claude >/dev/null 2>&1; then
+# DEVSHELL_INIT_USER_ONLY: bin/repro runs this once before repro-config
+# only to have the dev user, without the installer repro-config passes.
+if [[ -z "${DEVSHELL_INIT_USER_ONLY:-}" ]] && ! command -v claude >/dev/null 2>&1; then
   devshell_install_ai_cli || true
 fi
