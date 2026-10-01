@@ -18,7 +18,7 @@ import re
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Optional
 from unittest import mock
@@ -572,3 +572,18 @@ class AnyRepositoryTest(unittest.TestCase):
         cell = start.coord_of(clad[0])
         self.assertTrue(start.cells.in_catalog(
             cell, start.cells.load_catalog()))
+
+
+class InterruptTest(unittest.TestCase):
+    def test_ctrl_c_at_the_menu_exits_quietly(self):
+        with mock.patch.object(start, "preflight", return_value=True), \
+                mock.patch.object(start, "_load_repro", return_value=mock.Mock(
+                    published_cells=mock.Mock(return_value=[]),
+                    _origin_repo_slug=mock.Mock(return_value=None))), \
+                mock.patch.object(start, "_asset_size", return_value=None), \
+                mock.patch.object(start, "_git_toplevel", return_value=None), \
+                mock.patch("builtins.input", side_effect=KeyboardInterrupt), \
+                redirect_stdout(io.StringIO()), \
+                redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(start.cli([]), 130)
+        self.assertIn("interrupted", err.getvalue())
