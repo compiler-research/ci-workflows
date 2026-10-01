@@ -22,10 +22,15 @@
 #     cell each row resolves to. It must already appear in cells.yaml;
 #     verify.yml rejects the entry otherwise.
 #   - `workflow` and `row` say where the cell came from; bin/start
-#     re-reads that row after cloning.
+#     re-reads that row after cloning. A project whose CI does not use
+#     ci-workflows has no such row: leave both out, and the cell
+#     written here is used as is.
 #
-# Fields: name, description, repo, workflow, row, recipe, version, os,
-# arch. All required.
+# Fields: name, description, repo, recipe, version, os, arch, all
+# required; workflow and row, optional but only together; clone,
+# optional `git clone` options -- only --filter=blob:none|tree:0 and
+# --branch=<name>, or bin/start drops the entry. With a branch, a
+# checkout matches the entry only while on that branch.
 
 projects:
   - name: CARTopiaX
@@ -55,5 +60,43 @@ projects:
     row: ubu24-clang20-runtime23
     recipe: llvm-release
     version: '23'
+    os: ubuntu-24.04
+    arch: x86_64
+
+  # ROOT also wants liblz4-dev, libxxhash-dev and nlohmann-json3-dev,
+  # which the image lacks: `bin/repro --devshell-install` them, or
+  # configure with -Dbuiltin_lz4=ON -Dbuiltin_xxhash=ON
+  # -Dbuiltin_nlohmannjson=ON.
+  - name: ROOT
+    description: CERN's data analysis framework, on cling's LLVM
+    repo: https://github.com/root-project/root
+    clone: --filter=blob:none --branch=master
+    recipe: llvm-root
+    version: ROOT-llvm22
+    os: ubuntu-24.04
+    arch: x86_64
+
+  # Two llvm-project trees in this devshell: /patches is your clone, at
+  # the tip of release/23.x; $DEVSHELL_SRC is the recipe's, configured in
+  # $DEVSHELL_BUILD at the cell's own commit. The producer's ccache only
+  # serves builds of the latter -- build there to start warm, and in
+  # /patches to work on the branch as it is.
+  - name: llvm-23
+    description: LLVM and Clang release/23.x, to develop and experiment on
+    repo: https://github.com/llvm/llvm-project
+    clone: --filter=blob:none --branch=release/23.x
+    recipe: llvm-release
+    version: '23'
+    os: ubuntu-24.04
+    arch: x86_64
+
+  # cppjit's configure needs python3-dev (`bin/repro --devshell-install`).
+  - name: cppjit
+    description: Python-C++ bindings generator on CppInterOp
+    repo: https://github.com/compiler-research/cppjit
+    workflow: .github/workflows/ci.yml
+    row: ubuntu-24.04/llvm22/py3.14/c++20
+    recipe: llvm-release
+    version: '22'
     os: ubuntu-24.04
     arch: x86_64

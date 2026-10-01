@@ -43,6 +43,7 @@ import importlib.machinery
 import importlib.util
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -69,7 +70,7 @@ DEVSHELL_HOST_CACHE = Path.home() / ".cache" / "ci-workflows" / "devshell-cache"
 WARN_FREE_GIB = 10
 
 _COORD_KEYS = cells.COORD_KEYS
-_REQUIRED = ("name", "description", "repo", "workflow", "row") + _COORD_KEYS
+_REQUIRED = ("name", "description", "repo") + _COORD_KEYS
 
 
 def _load_repro():
@@ -105,9 +106,38 @@ def load_projects(path: Optional[Path] = None) -> List[Dict[str, str]]:
         if not isinstance(entry, dict):
             continue
         p = {str(k): gha.to_str(v) for k, v in entry.items()}
-        if all(p.get(k) for k in _REQUIRED):
+        # workflow and row go together: either the entry names the CI
+        # row its cell came from, or (a project whose CI does not use
+        # ci-workflows) neither.
+        if all(p.get(k) for k in _REQUIRED) \
+                and bool(p.get("workflow")) == bool(p.get("row")) \
+                and clone_options(p) is not None:
             out.append(p)
     return out
+
+
+#: `git clone` options a catalog entry may ask for: a partial-clone
+#: filter to keep a large repository's first clone small, and the branch
+#: the entry's cell serves. Nothing that configures git.
+_CLONE_OPTION = re.compile(
+    r"^--(filter=(blob:none|tree:0)|branch=[A-Za-z0-9][A-Za-z0-9._/-]*)$")
+
+
+def clone_options(project: Dict[str, str]) -> Optional[List[str]]:
+    """The entry's `clone` field as git clone options, or None if any
+    of them is not one a catalog entry may set."""
+    opts = shlex.split(project.get("clone", ""))
+    if all(_CLONE_OPTION.match(o) for o in opts):
+        return opts
+    return None
+
+
+def clone_branch(project: Dict[str, str]) -> Optional[str]:
+    """The branch the entry clones, if it names one."""
+    for o in clone_options(project) or []:
+        if o.startswith("--branch="):
+            return o[len("--branch="):]
+    return None
 
 
 def coord_of(project: Dict[str, str]) -> Dict[str, str]:
@@ -368,10 +398,13 @@ def resolve_checkout(project: Dict[str, str]) -> Optional[Path]:
         print(f"  using the checkout already at {dest}")
         return dest
 
-    if not _confirm(f"clone {project['repo']} to {dest}?"):
+    opts = " ".join(clone_options(project) or [])
+    if not _confirm(f"clone {project['repo']}{' (' + opts + ')' if opts else ''}"
+                    f" to {dest}?"):
         return None
     dest.parent.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run(["git", "clone", project["repo"], str(dest)])
+    r = subprocess.run(["git", "clone", *(clone_options(project) or []),
+                        "--", project["repo"], str(dest)])
     if r.returncode != 0:
         print(f"  git clone failed (exit {r.returncode})")
         return None
@@ -397,24 +430,39 @@ def detect_project(repro, projects: List[Dict[str, str]]
     project they are in, nor where to put it. Matching is on the
     origin remote rather than the directory name, so a fork or a
     renamed directory still resolves.
+
+    An entry that clones a branch (llvm-23 clones release/23.x) matches
+    only a checkout on that branch: its cell serves that branch, and a
+    checkout of main or of another release would otherwise be put on it
+    without being asked.
     """
     slug = repro._origin_repo_slug()
     if not slug:
         return None
+    top = None
     for p in projects:
         if _repo_slug(p["repo"]) != slug.lower():
             continue
-        try:
-            top = subprocess.run(
-                ["git", "rev-parse", "--show-toplevel"],
-                capture_output=True, text=True, timeout=30,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if top.returncode != 0 or not top.stdout.strip():
-            return None
-        return p, Path(top.stdout.strip())
+        if top is None:
+            top = _git_out("rev-parse", "--show-toplevel")
+            if not top:
+                return None
+        branch = clone_branch(p)
+        if branch and _git_out("-C", top, "rev-parse", "--abbrev-ref",
+                               "HEAD") != branch:
+            continue
+        return p, Path(top)
     return None
+
+
+def _git_out(*args: str) -> Optional[str]:
+    """`git *args` output, stripped, or None when it fails."""
+    try:
+        r = subprocess.run(["git", *args], capture_output=True, text=True,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
 
 def repo_cell(checkout: Path,
@@ -428,6 +476,8 @@ def repo_cell(checkout: Path,
     win over a stale projects.yaml entry. None when the row is gone or
     fetches no cell; the catalog's answer then stands.
     """
+    if not project.get("row"):
+        return None
     for rc in cells.scan(checkout):
         if rc.row == project["row"] and rc.workflow == project["workflow"]:
             return rc.primary
