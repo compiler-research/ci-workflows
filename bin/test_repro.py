@@ -16,6 +16,7 @@ import os
 import signal as _signal
 import subprocess
 import sys
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -1504,6 +1505,176 @@ class DevshellCellTests(unittest.TestCase):
         self.assertIn("not in cells.yaml", str(cm.exception))
 
 
+class DevshellHostTrustTests(unittest.TestCase):
+    """The host acts only on what it fetched itself, never on what a
+    container may have left in the directories it shares."""
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    GOOD = {"source": {"repo": "https://github.com/llvm/llvm-project",
+                       "commit": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"}}
+
+    def test_manifest_source_fields_are_held_to_their_shape(self):
+        check = self.repro._devshell_check_manifest
+        check(self.GOOD)
+        check({"kind": "mockup", "source": {"repo": "mockup://"}})
+        for bad in ({"repo": "ext::sh -c x", "commit": "abc1234"},
+                    {"repo": "https://h/x", "commit": "--upload-pack=x"},
+                    {"repo": "-uhttps://h/x", "commit": "abc1234"}):
+            with self.assertRaises(SystemExit):
+                check({"source": bad})
+
+    def test_source_dir_name_cannot_leave_the_workspace(self):
+        sub = self.repro._devshell_src_subdir
+        self.assertEqual(sub({"source": {"repo": "https://h/a/.."}}),
+                         "_recipe_work/source")
+        self.assertEqual(sub(self.GOOD), "_recipe_work/llvm-project")
+
+    def test_host_manifest_is_the_trusted_copy_not_the_workspace_one(self):
+        d = Path(tempfile.mkdtemp())
+        base = d / "backend"; base.mkdir()
+        (base / "k.manifest.json").write_text(json.dumps(self.GOOD))
+        work, trusted = d / "cell", d / "manifests" / "k.json"
+        for sub in ("_recipe_out/install", ".ccache"):
+            (work / sub).mkdir(parents=True)
+        got = self.repro._devshell_fetch(f"file://{base}", "k", work, False,
+                                         trusted=trusted)
+        self.assertEqual(got, self.GOOD)
+        # The container rewrites its copy; the host keeps using its own.
+        (work / "manifest.json").write_text(json.dumps(
+            {"source": {"repo": "https://h/x", "commit": "--upload-pack=x"}}))
+        got = self.repro._devshell_fetch(f"file://{base}", "k", work, False,
+                                         trusted=trusted)
+        self.assertEqual(got, self.GOOD)
+        self.assertEqual(json.loads((work / "manifest.json").read_text()),
+                         self.GOOD)
+
+    def test_existing_checkout_is_not_touched_host_side(self):
+        work = Path(tempfile.mkdtemp())
+        (work / "_recipe_work" / "llvm-project" / ".git").mkdir(parents=True)
+        with mock.patch.object(self.repro.subprocess, "run") as run:
+            self.repro._devshell_source(work, self.GOOD)
+        run.assert_not_called()
+
+    def test_host_git_disables_repository_configured_commands(self):
+        argv = self.repro._host_git("-C", "d", "status")
+        for opt in ("core.hooksPath=/dev/null", "core.fsmonitor=false",
+                    "protocol.allow=never"):
+            self.assertIn(opt, argv)
+
+    @unittest.skipIf(sys.platform == "win32", "symlinks need privileges")
+    def test_symlinked_bind_source_is_refused(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "ai").mkdir()
+        (root / "ai" / "memory").symlink_to(Path(tempfile.mkdtemp()))
+        with self.assertRaises(SystemExit):
+            self.repro._devshell_refuse_symlinks(
+                root / "ai" / "memory" / "r" / "e", root)
+        self.repro._devshell_refuse_symlinks(root / "ai" / "skills", root)
+
+
+class DevshellRestrictionsTests(unittest.TestCase):
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def test_default_drops_capabilities_and_privilege_gain(self):
+        sec = self.repro._devshell_security(False)
+        self.assertEqual(sec[0], "--cap-drop=ALL")
+        self.assertIn("--security-opt=no-new-privileges", sec)
+        self.assertNotIn("--cap-add=AUDIT_WRITE", sec)
+        for dangerous in ("SYS_ADMIN", "SYS_PTRACE", "NET_ADMIN", "NET_RAW",
+                          "MKNOD", "SYS_CHROOT", "DAC_READ_SEARCH"):
+            self.assertNotIn(f"--cap-add={dangerous}", sec)
+
+    def test_sudo_opt_in_lifts_only_what_sudo_needs(self):
+        sec = self.repro._devshell_security(True)
+        self.assertNotIn("--security-opt=no-new-privileges", sec)
+        self.assertIn("--cap-add=AUDIT_WRITE", sec)
+        self.assertEqual(sec[0], "--cap-drop=ALL")
+
+    def test_checkout_git_dir_is_read_only_unless_asked(self):
+        proj = Path(tempfile.mkdtemp())
+        (proj / ".git").mkdir()
+        kw = dict(volume_name="v", work_host_bind=None, host_cache=None,
+                  patches_out=proj)
+        ro = [m for m in self.repro._devshell_mounts("/w", **kw)
+              if m.target == "/patches/.git"]
+        self.assertEqual([m.readonly for m in ro], [True])
+        self.assertFalse([m for m in self.repro._devshell_mounts(
+            "/w", writable_git=True, **kw) if m.target == "/patches/.git"])
+
+    def test_toggling_writable_git_alone_recreates_the_container(self):
+        created = []
+        for flag in (False, True):
+            args = self.repro.parse_args(
+                ["--devshell"] + (["--devshell-writable-git"] if flag else []))
+            proj = Path(tempfile.mkdtemp())
+            (proj / ".git").mkdir()
+            m = {"build_env": {"ccache": {"base_dir": "/w"}}}
+            with mock.patch.object(self.repro, "_devshell_container_exists",
+                                   return_value=True), \
+                    mock.patch.object(self.repro, "_devshell_container_running",
+                                      return_value=True), \
+                    mock.patch.object(self.repro, "_devshell_container_binds",
+                                      return_value=self.repro._devshell_desired_binds(
+                                          "/w", volume_name="v", work_host_bind=None,
+                                          host_cache=None, patches_out=proj,
+                                          writable_git=flag)), \
+                    mock.patch.object(self.repro, "_devshell_container_arch",
+                                      return_value="amd64"), \
+                    mock.patch.object(self.repro, "_devshell_container_options",
+                                      return_value=""), \
+                    mock.patch.object(self.repro, "_devshell_container_profile",
+                                      return_value=" ".join(
+                                          self.repro._devshell_security(False))), \
+                    mock.patch.object(self.repro.subprocess, "run") as run, \
+                    redirect_stderr(io.StringIO()):
+                self.repro._devshell_ensure_container(
+                    args, "n", "img", "/w", m, volume_name="v",
+                    work_host_bind=None, host_cache=None, patches_out=proj,
+                    docker_platform="linux/amd64")
+            created.append(any(c[0][0][:3] == ["docker", "run", "-d"]
+                               for c in run.call_args_list))
+        # Same profile as recorded: reused. Only the git mode changed:
+        # re-created, so the read-only .git mount really goes away.
+        self.assertEqual(created, [False, True])
+
+    def test_worktree_pointer_file_is_protected_too(self):
+        proj = Path(tempfile.mkdtemp())
+        (proj / ".git").write_text("gitdir: /elsewhere\n")
+        mounts = self.repro._devshell_mounts(
+            "/w", volume_name="v", work_host_bind=None, host_cache=None,
+            patches_out=proj)
+        self.assertIn(("/patches/.git", True),
+                      [(m.target, m.readonly) for m in mounts])
+
+
+class DevshellLocaleTests(unittest.TestCase):
+    """ccache hashes LANG/LC_* into every key; the devshell has to learn
+    the producer's locale from the manifest (or probe for it)."""
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def test_recorded_locale_becomes_a_probe_hint(self):
+        f = self.repro._devshell_producer_locale
+        self.assertEqual(f({"locale": {"LANG": "C.UTF-8",
+                                       "LC_CTYPE": "C.UTF-8"}}),
+                         "LANG=C.UTF-8 LC_CTYPE=C.UTF-8")
+        # Recorded as none set: an empty hint, which is not "no hint".
+        self.assertEqual(f({"locale": {}}), "")
+        # Pre-field manifests give no hint; repro-config probes blind.
+        self.assertIsNone(f({"compiler_check": "string:x"}))
+
+    def test_values_that_are_not_locale_names_are_dropped(self):
+        # The manifest lives where the container can write it.
+        self.assertEqual(self.repro._devshell_producer_locale(
+            {"locale": {"LANG": "C.UTF-8 BASH_ENV=/tmp/x",
+                        "LC_ALL": "$(id)", "LC_CTYPE": "en_US.UTF-8"}}),
+            "LC_CTYPE=en_US.UTF-8")
+
+
 class DevshellCoordArgvTests(unittest.TestCase):
     """Pin that a direct `recipe/version/os/arch` coord in the
     positional slot reaches _devshell_cell rather than the act matrix
@@ -1844,6 +2015,10 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
                                                    "amd64")), \
              mock.patch.object(self.repro, "_devshell_container_options",
                                return_value=kw.pop("actual_options", "")), \
+             mock.patch.object(
+                 self.repro, "_devshell_container_profile",
+                 return_value=kw.pop("actual_profile", " ".join(
+                     self.repro._devshell_security(False)))), \
              mock.patch.object(self.repro.subprocess, "run") as run, \
              mock.patch.object(self.repro, "_devshell_host_uid_gid",
                                return_value=(1000, 1000)), \
@@ -1957,7 +2132,13 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
             patches_out=patches,
         )
         self.assertIn(f"{bind}:/home/runner/work/x/x", argv)
-        self.assertIn(f"{cache}:{self.repro.DEVSHELL_CACHE_MOUNT}", argv)
+        # Not the whole host cache: its AI skills read-only and this
+        # project's memory directory, nothing else of it.
+        self.assertNotIn(f"{cache}:{self.repro.DEVSHELL_CACHE_MOUNT}", argv)
+        self.assertIn(f"{cache / 'ai' / 'skills'}:/cache/ai/skills:ro", argv)
+        self.assertTrue(any(a.startswith(f"{cache / 'ai' / 'memory'}")
+                            and a.endswith(":rw") is False
+                            and ":/cache/ai/memory/proj/" in a for a in argv))
         self.assertIn(f"{patches}:{self.repro.DEVSHELL_PATCHES_MOUNT}",
                       argv)
         self.assertFalse(any(a.startswith("devshell-x:") for a in argv))

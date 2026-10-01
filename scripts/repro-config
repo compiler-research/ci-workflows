@@ -148,6 +148,25 @@ if [[ -n "${DEVSHELL_PRODUCER_COMPILER_CHECK:-}" ]]; then
 else
   as_dev ccache --set-config="compiler_check=string:$cc_version"
 fi
+# ccache refuses precompiled-header compiles (LLVM >= 23 uses them)
+# unless sloppiness allows them, on this side as on the producer's.
+# The producer's recorded value plus the PCH pair: sloppiness is not in
+# the key, so adding to it cannot cost a hit.
+sloppiness=$(python3 - "${DEVSHELL_MANIFEST:-}" <<'PY'
+import json, sys
+try:
+    cfg = (json.load(open(sys.argv[1])).get("build_env") or {}).get("ccache") or {}
+    have = cfg.get("sloppiness") or ""
+except (OSError, ValueError, IndexError):
+    have = ""
+items = [s for s in have.replace(" ", ",").split(",") if s and s != "unknown"]
+for s in ("pch_defines", "time_macros"):
+    if s not in items:
+        items.append(s)
+print(",".join(items))
+PY
+)
+as_dev ccache --set-config="sloppiness=$sloppiness"
 
 build="${DEVSHELL_BUILD:?env not set; bin/repro --devshell exports it}"
 src="${DEVSHELL_SRC:?env not set; bin/repro --devshell exports it}"
@@ -240,27 +259,148 @@ PY
   fi
 fi
 
+sanity_tu="lib/Support/CMakeFiles/LLVMSupport.dir/Allocator.cpp.o"
+have_sanity_tu() {
+  [[ -f "$build/build.ninja" ]] \
+    && (cd "$build" && ninja -t commands "$sanity_tu" >/dev/null 2>&1)
+}
+
+# Locale. ccache hashes LANG, LC_ALL, LC_CTYPE and LC_MESSAGES into every
+# key (they localise the diagnostics it caches), so a shell whose locale
+# differs from the producer's build misses the entire cache -- which is
+# how the llvm-release 22 cell, built under LANG=C.UTF-8, came to give
+# this container 0 hits. Runners disagree on it, so find it: replay the
+# smoke compile read-only under each candidate, recorded one first, and
+# keep the first that the producer's cache answers. The winner goes to
+# $BASH_ENV's file, which non-interactive bash sources and
+# /etc/bash.bashrc sources for interactive shells.
+env_file="${BASH_ENV:-/etc/devshell-env.sh}"
+locale_vars=(LANG LC_ALL LC_CTYPE LC_MESSAGES)
+write_locale() {  # $1: "VAR=value ..." (may be empty)
+  {
+    echo "# Written by repro-config: the locale the producer's ccache was keyed with."
+    printf 'unset %s\n' "${locale_vars[*]}"
+    for kv in $1; do printf 'export %q\n' "$kv"; done
+    # Where Claude Code's own installer puts it -- the one route that
+    # works without sudo.
+    echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
+  } > "$env_file"
+  chmod 0644 "$env_file"
+}
+# A hit only says something about the producer if the entry it came from
+# is the producer's: this devshell's own earlier compiles (another
+# session's, or a probe's under another locale) land in the same cache.
+# Entries record their creation time; the producer's predate its
+# manifest's built_at.
+built_at=$(python3 - "$manifest" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+try:
+    t = json.load(open(sys.argv[1])).get("built_at", "")
+    print(int(datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ")
+              .replace(tzinfo=timezone.utc).timestamp()))
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    pass
+PY
+)
+producer_hit() {  # $1: ccache log of one probe compile
+  grep -qE "Result: (direct|preprocessed)_cache_hit" "$1" || return 1
+  [[ -n "$built_at" ]] || return 0
+  local key entry created
+  key=$(grep -oE "Result key: [0-9a-z]+" "$1" | tail -1 | awk '{print $3}')
+  entry="${CCACHE_DIR}/${key:0:1}/${key:1:1}/${key:2}R"
+  created=$(as_dev ccache --inspect "$entry" 2>/dev/null \
+            | awk '/^Creation time:/ {print $3}')
+  [[ -n "$created" && "$created" -le $((built_at + 3600)) ]]
+}
+
+# Without a smoke target to probe with (non-LLVM recipes), the record is
+# all there is to go on.
+chosen="${DEVSHELL_PRODUCER_LOCALE-}"
+if have_sanity_tu && ! as_dev ccache --get-config sloppiness | grep -q locale; then
+  candidates=()
+  [[ -n "${DEVSHELL_PRODUCER_LOCALE+set}" ]] \
+    && candidates+=("${DEVSHELL_PRODUCER_LOCALE}")
+  for c in "" "LANG=C.UTF-8" "LC_CTYPE=C.UTF-8"; do
+    [[ -n "${DEVSHELL_PRODUCER_LOCALE+set}" && "$c" == "$DEVSHELL_PRODUCER_LOCALE" ]] \
+      || candidates+=("$c")
+  done
+  found=0
+  for c in "${candidates[@]}"; do
+    probe_log=$(as_dev mktemp)
+    unset_args=(); for v in "${locale_vars[@]}"; do unset_args+=(-u "$v"); done
+    (cd "$build" && rm -f "$sanity_tu" \
+      && as_dev env "${unset_args[@]}" $c CCACHE_READONLY=1 \
+           CCACHE_LOGFILE="$probe_log" ninja "$sanity_tu" >/dev/null 2>&1) || true
+    if producer_hit "$probe_log"; then
+      chosen="$c"; found=1; rm -f "$probe_log"; break
+    fi
+    rm -f "$probe_log"
+  done
+  if [[ $found == 1 ]]; then
+    echo "devshell: producer ccache keyed with locale '${chosen:-<none set>}'; exporting it."
+    if [[ -n "${DEVSHELL_PRODUCER_LOCALE+set}" && "$chosen" != "$DEVSHELL_PRODUCER_LOCALE" ]]; then
+      echo "::warning title=devshell::manifest records locale '${DEVSHELL_PRODUCER_LOCALE:-<none>}' but the cache answered under '${chosen:-<none set>}'."
+    fi
+  fi
+fi
+write_locale "$chosen"
+grep -qF "$env_file" /etc/bash.bashrc 2>/dev/null \
+  || printf '[ -r %s ] && . %s\n' "$env_file" "$env_file" >> /etc/bash.bashrc
+
+# The note an interactive shell opens with. Written here, read at shell
+# start, so it reflects the container as it is (Claude installed yet,
+# .git read-only or not) rather than as it was at provisioning.
+welcome=/etc/devshell-welcome.sh
+cat > "$welcome" <<'WELCOME'
+# Written by repro-config; sourced by interactive bash (/etc/bash.bashrc).
+[[ $- == *i* && -z "${DEVSHELL_WELCOMED:-}" ]] || return 0
+export DEVSHELL_WELCOMED=1
+_b=$'\e[1m' _d=$'\e[2m' _r=$'\e[0m'
+echo
+echo "${_b}devshell${_r} ${DEVSHELL_CELL:-} -- ${DEVSHELL_AI_REPO:-your project} is at /patches (you are here)"
+echo "  toolchain   ${DEVSHELL_INSTALL:-}"
+echo "  recipe src  ${DEVSHELL_SRC:-}   build: ${DEVSHELL_BUILD:-}"
+if grep -qE " /patches/\.git [^ ]+ ro[, ]" /proc/mounts 2>/dev/null; then
+  echo "  ${_d}.git is read-only here: edit in the container, commit and push on the host${_r}"
+fi
+if ! command -v claude >/dev/null 2>&1; then
+  echo "  Claude Code is not installed. Install it with:"
+  echo "    curl -fsSL https://claude.ai/install.sh | bash"
+fi
+echo
+unset _b _d _r
+WELCOME
+chmod 0644 "$welcome"
+grep -qF "$welcome" /etc/bash.bashrc 2>/dev/null \
+  || printf '[ -r %s ] && . %s\n' "$welcome" "$welcome" >> /etc/bash.bashrc
+
 # Sanity check: smoke-compile one TU every LLVM build has
 # (lib/Support/Allocator.cpp) and verify ccache hits the producer's
 # cache. Zero hits => the producer's cache doesn't reach this
-# environment (libstdc++ / compile-flag / compiler-version drift the
-# earlier checks didn't catch). Surface as ::warning:: rather than
-# exiting -- the dev may still want to iterate, just on a cold cache.
-sanity_tu="lib/Support/CMakeFiles/LLVMSupport.dir/Allocator.cpp.o"
-if [[ -f "$build/build.ninja" ]] \
-   && (cd "$build" && ninja -t commands "$sanity_tu" >/dev/null 2>&1); then
-  as_dev ccache --zero-stats
+# environment (libstdc++ / compile-flag / compiler-version / locale
+# drift the earlier checks didn't catch). Surface as ::warning:: rather
+# than exiting -- the dev may still want to iterate, just on a cold cache.
+#
+# Counts only a hit on one of the producer's entries (producer_hit): the
+# dev's own earlier compiles of this TU would otherwise pass the check
+# for a cache the producer's entries never reach.
+if have_sanity_tu; then
   rm -f "$build/$sanity_tu"
-  if (cd "$build" && as_dev ninja "$sanity_tu" >/dev/null 2>&1); then
-    sanity_hits=$(ccache --show-stats \
-      | awk '/^[[:space:]]*Hits:[[:space:]]+[0-9]/ { print $2; exit }')
-    : "${sanity_hits:=0}"
-    if [[ "$sanity_hits" == "0" ]]; then
-      echo "::warning title=ccache sanity::smoke-compile of ${sanity_tu##*/} produced 0 ccache hits; producer cache likely won't apply to your builds. Compare 'ccache --show-config' to manifest.build_env.ccache and the recorded CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES."
+  sanity_log=$(as_dev mktemp)
+  if (cd "$build" && as_dev env CCACHE_LOGFILE="$sanity_log" \
+        bash -c '. "$1"; exec ninja "$2"' _ "$env_file" "$sanity_tu" \
+        >/dev/null 2>&1); then
+    if producer_hit "$sanity_log"; then
+      echo "ccache sanity: Allocator.cpp hit the producer's cache -- it is reaching this consumer."
+    elif (cd "$build" && ninja -t commands "$sanity_tu" | grep -q -- -include-pch) \
+         && ! python3 -c 'import json,sys; sys.exit("sloppiness" not in (json.load(open(sys.argv[1])).get("build_env") or {}).get("ccache", {}))' "$manifest"; then
+      echo "::warning title=ccache sanity::the producer's cache has no entry for ${sanity_tu##*/}: this build uses precompiled headers, and the cell was published before publish-recipe let ccache cache those (sloppiness pch_defines,time_macros), so it holds almost nothing. Republish the cell to get a useful cache; this devshell's own rebuilds are cached either way."
     else
-      echo "ccache sanity: ${sanity_hits} hit(s) on Allocator.cpp -- producer cache is reaching this consumer."
+      echo "::warning title=ccache sanity::smoke-compile of ${sanity_tu##*/} missed the producer's cache under every candidate locale; its entries likely won't apply to your builds. Compare 'ccache --show-config' to manifest.build_env.ccache, 'ninja -t commands' to manifest.cmake_args, and the recorded CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES."
     fi
   fi
+  rm -f "$sanity_log"
 fi
 
 cat <<EOF

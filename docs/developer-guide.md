@@ -493,7 +493,8 @@ The sibling ccache has a second consumer, in CI rather than at a
 prompt: `setup-llvm`'s `fetch-ccache` restores it into a workflow, for
 a row that has to compile the recipe's sources again in a
 configuration the install tree cannot express. It mirrors the
-producer's `hash_dir`/`base_dir` settings the way `repro-config` does,
+producer's `hash_dir`/`base_dir` settings and its locale (`LANG`/`LC_*`,
+which ccache hashes into every key) the way `repro-config` does,
 and leaves the two things it cannot control -- the source's relative
 path and the configure flags -- to the consumer. See the README
 section for what a row has to match.
@@ -566,28 +567,39 @@ rather than 404'ing on Releases.
 
 ### Storage model — hermetic by default
 
-The host sees only two paths from the running container:
+The host sees only these paths from the running container:
 
-1. **`$PWD` bound at `/patches` (rw).** Always on. AI inside writes
-   `git format-patch -o /patches …`; you `git am` from `$PWD` on
-   the host with your own identity. Refuses to launch if `$PWD ==
-   $HOME` or resolves to `/`.
-2. **`<host-cache>` bound at `/cache` (rw).** Opt-in via
-   `--devshell-host-cache`. Carries persistent per-cell state
-   AND the user's AI tooling. Layout:
+1. **`$PWD` bound at `/patches` (rw), its `.git` read-only.** Always
+   on. Edit in the container; commit, push and `git am` on the host
+   with your own identity. `.git` is read-only because git on the host
+   acts on its config and hooks (`--devshell-writable-git` to opt out).
+   Patches of the recipe's *own* source go the same way:
+   `git -C $DEVSHELL_SRC format-patch -o /patches …`. Refuses to launch
+   if `$PWD == $HOME` or resolves to `/`.
+2. **Parts of `<host-cache>`.** Opt-in via `--devshell-host-cache`:
+   the cell's working data as the workspace, and the AI tooling under
+   `/cache` -- skills and settings read-only, and only this project's
+   memory directory read-write. Nothing else of the host cache is
+   mounted: not other cells, not other projects' memory, and not
+   `manifests/`, the copies the host itself acts on. Layout:
 
    ```
    <host-cache>/                            default: ~/.cache/ci-workflows/devshell-cache/
-     cells/<cell-id>/                       per-cell working data
+     cells/<cell-id>/                       this cell's working data -> the workspace (rw)
        _recipe_out/install/                 install tree (LLVM_PREFIX)
        .ccache/                             producer's sibling ccache
        _recipe_work/llvm-project/           shallow llvm-project @ SRC_COMMIT
-       manifest.json                        producer manifest
+       manifest.json                        the container's copy of the manifest
+     manifests/<key>.json                   the host's copy; never mounted
      ai/
-       skills/                              user-curated skills (consumed inside via ~/.claude/skills symlink)
-       settings.json                        user-curated settings (~/.claude/settings.json symlink)
-       memory/<repo>/<encoded-host-path>/   per-project AI memory (~/.claude/projects/-patches/memory symlink)
+       skills/                              -> /cache/ai/skills (ro; ~/.claude/skills symlink)
+       settings.json                        -> /cache/ai/settings.json (ro; ~/.claude/settings.json)
+       memory/<repo>/<encoded-host-path>/   -> the same path under /cache (rw; ~/.claude/projects/-patches/memory)
    ```
+
+   bin/repro refuses to bind a path with a symlink in it below the host
+   cache, and runs git on the host only to create a checkout; an
+   existing one is updated from inside the container.
 
 Everything else — sources, build dir, ccache when host-cache is off,
 shell history, container HOME — lives in a per-cell named docker
@@ -598,6 +610,35 @@ reclaim with `docker volume rm devshell-<cell-id>`.
 Inside the container the workspace is bind-mounted at the recipe's
 runner workspace path (read from `manifest.build_env.ccache.base_dir`),
 so ccache's recorded paths match the producer.
+
+### Container restrictions
+
+The devshell runs the AI with the user's source tree in reach, so the
+container is restricted by default. All of it is built in one place,
+`bin/sandbox.py` plus `_devshell_security` / `_devshell_mounts` in
+`bin/repro`, and `scripts/devshell-posture-check` verifies it from the
+inside (verify.yml's devshell-smoke job runs it):
+
+- `dev` has no sudo, and the container runs under `no-new-privileges`.
+  `repro-config` installs what the devshell needs as root before the
+  shell starts; `--devshell-sudo` restores passwordless sudo (and lifts
+  `no-new-privileges`, which sudo cannot work under).
+- All capabilities are dropped except `CHOWN`, `DAC_OVERRIDE`,
+  `FOWNER`, `FSETID`, `KILL`, `SETGID` and `SETUID` -- what the init
+  script, apt and the switch to `dev` need -- and processes are limited.
+- No Docker socket, and the mounts above, nothing else.
+- Changing any of these re-creates the container; the restrictions it
+  was created with are recorded in a label.
+- Output of the non-interactive steps (`repro-config`, the init
+  self-check, `--devshell-script`) reaches your terminal with every
+  control sequence but colour removed, so nothing in the container can
+  retitle, reprogram or write the clipboard of the terminal it runs in.
+  The interactive shell is a real terminal session and is not filtered.
+
+Not covered: the network is open (the AI needs its API, git and package
+mirrors), so the container can reach what the machine can. Put the
+devshell on a restricted network through `--devshell-docker-options`
+if that matters for the work at hand.
 
 ### Reaching the rest of the host
 
@@ -718,7 +759,11 @@ Idempotent — runs once per fetch, no-ops on rebuild:
 4. **ccache `compiler_check`**: applies the producer's value
    verbatim (exported by `bin/repro` from
    `manifest.build_env.ccache.compiler_check`). Warns when the
-   consumer's `$CC --version` diverges.
+   consumer's `$CC --version` diverges. Also sets `sloppiness` to the
+   producer's recorded value plus `pch_defines,time_macros`: LLVM >= 23
+   builds with precompiled headers, which ccache refuses to cache
+   without them. Sloppiness is not part of the key, so adding to it
+   costs no hits.
 5. **recipe host deps**: runs
    `recipes/<recipe>/devshell-setup.sh` off the read-only
    `/ci-workflows` bind, when the recipe ships one. Step 1 installs
@@ -741,10 +786,24 @@ Idempotent — runs once per fetch, no-ops on rebuild:
    and clears the `CMakeCache.txt` cmake leaves behind on abort so a
    later session retries — a devshell whose *recipe* source is not
    configured is still a working devshell.
-7. **smoke compile**: builds
-   `lib/Support/CMakeFiles/LLVMSupport.dir/Allocator.cpp.o`. Zero
-   ccache hits ⇒ producer cache isn't reaching the consumer (drift
-   the earlier checks didn't catch); surfaces a `::warning::`
+7. **locale**: ccache hashes `LANG`, `LC_ALL`, `LC_CTYPE` and
+   `LC_MESSAGES` into every key. Replays the smoke compile below
+   read-only under each candidate -- the manifest's recorded
+   `build_env.ccache.locale` first, then none, `LANG=C.UTF-8`,
+   `LC_CTYPE=C.UTF-8` -- and keeps the first the producer's cache
+   answers. A hit only counts when the entry predates the manifest's
+   `built_at`, so the devshell's own earlier compiles cannot pass for
+   the producer's. The winner is written to `/etc/devshell-env.sh`,
+   sourced through `BASH_ENV` (non-interactive shells, the AI's tool
+   calls) and `/etc/bash.bashrc` (interactive ones). Warns when the
+   recorded value is not the one that hit. `build_manifest.py` records
+   the locale from its own Python process on purpose: `build.py`'s
+   compiles inherit Python's PEP 538 coercion (`LC_CTYPE=C.UTF-8` when
+   `LANG` is unset), and so does it.
+8. **smoke compile**: builds
+   `lib/Support/CMakeFiles/LLVMSupport.dir/Allocator.cpp.o`. A miss
+   on the producer's entries ⇒ its cache isn't reaching the consumer
+   (drift the earlier checks didn't catch); surfaces a `::warning::`
    rather than aborting.
 
 ### Limits

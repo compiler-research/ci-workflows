@@ -172,6 +172,14 @@ runs:
         ccache --set-config="compiler_check=string:$cc_version"
         ccache --set-config="hash_dir=false"
         ccache --set-config="base_dir=$WS"
+        # LLVM >= 23 builds with precompiled headers, and ccache refuses
+        # every PCH compile ("could_not_use_precompiled_header") without
+        # these -- the llvm-release 23 cell cached 196 TUs of a build of
+        # thousands. LLVM's own LLVM_CCACHE_BUILD sets the same pair (with
+        # -fno-pch-timestamp, which LLVM already passes). Sloppiness gates
+        # what may be cached; it is not part of the key, so cells built
+        # without it stay valid. Recorded in the manifest for consumers.
+        ccache --set-config="sloppiness=pch_defines,time_macros"
 
     # Only github-Releases backends need a Release object created up
     # front. file:// backends just need the directory to exist; the

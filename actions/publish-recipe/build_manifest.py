@@ -106,10 +106,30 @@ def _installed_packages() -> dict:
     return out
 
 
+#: Environment ccache hashes into every key, unless sloppiness has
+#: `locale`: these localise compiler diagnostics, which ccache caches.
+#: A devshell that differs in any of them misses the whole cache, so the
+#: producer's values are recorded for it to reproduce.
+CCACHE_LOCALE_VARS = ("LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES")
+
+
 def _ccache_config() -> dict:
-    """Snapshot the ccache knobs that decide off-runner reuse."""
-    keys = ("compiler_check", "hash_dir", "base_dir")
-    out: dict[str, str] = {}
+    """Snapshot the ccache knobs that decide off-runner reuse.
+
+    `locale` maps each CCACHE_LOCALE_VARS entry that was set to its
+    value; an empty map means none were -- as distinct from a manifest
+    without the field, which predates recording it.
+
+    Read from this process's own environment, which is only right
+    because this is a Python process launched like build.py: with LANG
+    unset, Python's PEP 538 locale coercion exports LC_CTYPE=C.UTF-8,
+    and build.py's compiles inherit that. Do not run this under
+    PYTHONCOERCECLOCALE=0. A build.sh recipe (none today) compiles
+    without that coercion, so its record could name an LC_CTYPE its
+    ccache never saw; the devshell's locale probe catches that case.
+    """
+    keys = ("compiler_check", "hash_dir", "base_dir", "sloppiness")
+    out: dict = {}
     for k in keys:
         try:
             r = subprocess.run(
@@ -119,6 +139,8 @@ def _ccache_config() -> dict:
             out[k] = r.stdout.strip()
         except (FileNotFoundError, subprocess.CalledProcessError):
             out[k] = "unknown"
+    out["locale"] = {v: os.environ[v] for v in CCACHE_LOCALE_VARS
+                     if v in os.environ}
     return out
 
 
