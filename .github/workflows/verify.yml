@@ -326,6 +326,52 @@ jobs:
               --devshell-script scripts/devshell-posture-check \
               "$COORD"
 
+      # A second session after the container has rewritten everything it
+      # may: the workspace's manifest copy, and the recipe checkout's git
+      # hooks and config, each set to leave a marker on the host if the
+      # host ever acts on them. Re-opening the devshell must not.
+      - name: Devshell leaves the host alone after tampering
+        env:
+          COORD: ${{ steps.cell.outputs.coord }}
+        run: |
+          set -euo pipefail
+          marker="$RUNNER_TEMP/HOST-MARKER"
+          hc="$RUNNER_TEMP/devshell-cache"
+          cat > "$RUNNER_TEMP/tamper.sh" <<SH
+          set -uo pipefail
+          ws="\${DEVSHELL_BUILD%/_recipe_work*}"
+          src="\$DEVSHELL_SRC"
+          printf '#!/bin/sh\ntouch %s\n' '$marker' > /tmp/m.sh; chmod +x /tmp/m.sh
+          python3 - "\$ws/manifest.json" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          m.setdefault("source", {})["commit"] = "--upload-pack=/tmp/m.sh"
+          json.dump(m, open(sys.argv[1], "w"))
+          PY
+          if [ -d "\$src/.git" ]; then
+            cp /tmp/m.sh "\$src/.git/hooks/post-checkout"
+            # Relative, so it names the same file wherever git runs.
+            git -C "\$src" config core.fsmonitor .git/hooks/post-checkout
+          fi
+          # The checkout's own .git is read-only; this must fail.
+          if touch /patches/.git/HOST-WRITE 2>/dev/null; then
+            echo "FAIL: /patches/.git is writable"; exit 1
+          fi
+          SH
+          # The host's own manifest copy, before the container gets a go.
+          before=$(sha256sum "$hc"/manifests/*.json)
+          ./bin/repro --devshell --devshell-host-cache-dir "$hc" \
+              --devshell-script "$RUNNER_TEMP/tamper.sh" "$COORD"
+          ./bin/repro --devshell --devshell-host-cache-dir "$hc" \
+              --devshell-script scripts/devshell-posture-check "$COORD"
+          if [ -e "$marker" ]; then
+            echo "::error::the host ran something the container left behind"
+            exit 1
+          fi
+          [ "$(sha256sum "$hc"/manifests/*.json)" = "$before" ]
+          [ ! -e .git/HOST-WRITE ]
+          echo "host untouched after tampering"
+
   # setup-llvm's system flavor adds apt-llvm.org only when the distro
   # archive does not serve the major. Ask that with the installed
   # packages counted in and a runner already carrying llvm-N reads as an

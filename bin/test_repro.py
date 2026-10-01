@@ -17,6 +17,7 @@ import signal as _signal
 import subprocess
 import sys
 import json
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -1572,6 +1573,106 @@ class DevshellHostTrustTests(unittest.TestCase):
             self.repro._devshell_refuse_symlinks(
                 root / "ai" / "memory" / "r" / "e", root)
         self.repro._devshell_refuse_symlinks(root / "ai" / "skills", root)
+
+
+@unittest.skipIf(sys.platform == "win32" or not shutil.which("git"),
+                 "needs git and POSIX hooks")
+class DevshellTamperedWorkspaceTests(unittest.TestCase):
+    """A second session after a container has rewritten what it can.
+
+    Each case leaves a harmless marker trigger where a container could
+    put one, then runs the host-side step bin/repro runs on the next
+    session and asserts the marker never appears. Where it makes sense,
+    a control shows the same step without the protection would fire it,
+    so the test cannot pass vacuously.
+    """
+
+    GOOD = {"source": {"repo": "https://github.com/llvm/llvm-project",
+                       "commit": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"}}
+
+    def setUp(self):
+        self.repro = _load_repro()
+        self.root = Path(tempfile.mkdtemp())
+        self.marker = self.root / "MARKER"
+
+    def _tampered_repo(self) -> Path:
+        repo = self.root / "cell" / "_recipe_work" / "llvm-project"
+        repo.mkdir(parents=True)
+        run = lambda *a: subprocess.run(["git", "-C", str(repo), *a],  # noqa: E731
+                                        check=True, capture_output=True)
+        run("init", "-q")
+        run("-c", "user.email=t@t", "-c", "user.name=t",
+            "commit", "-q", "--allow-empty", "-m", "x")
+        hook = repo / ".git" / "hooks" / "post-checkout"
+        hook.write_text(f"#!/bin/sh\ntouch '{self.marker}'\n")
+        hook.chmod(0o755)
+        mon = self.root / "fsmonitor.sh"
+        mon.write_text(f"#!/bin/sh\ntouch '{self.marker}'\n")
+        mon.chmod(0o755)
+        run("config", "core.fsmonitor", str(mon))
+        return repo
+
+    def _fires(self, argv) -> bool:
+        """Does running `argv` leave the marker?"""
+        self.marker.unlink(missing_ok=True)
+        subprocess.run(argv, capture_output=True)
+        return self.marker.exists()
+
+    def test_hooks_and_fsmonitor_in_the_checkout_do_not_run_on_the_host(self):
+        repo = str(self._tampered_repo())
+        # One control per mechanism: plain git runs each of them, so
+        # neither protected assertion below can pass vacuously.
+        status = ("-C", repo, "status")                        # fsmonitor
+        checkout = ("-C", repo, "checkout", "-q", "--detach")  # hook
+        self.assertTrue(self._fires(["git", *status]))
+        self.assertTrue(self._fires(["git", *checkout]))
+        self.assertFalse(self._fires(self.repro._host_git(*status)))
+        self.assertFalse(self._fires(self.repro._host_git(*checkout)))
+        # And the next session does not run git there at all.
+        with mock.patch.object(self.repro.subprocess, "run") as run:
+            self.repro._devshell_source(self.root / "cell", self.GOOD)
+        run.assert_not_called()
+
+    def test_rewritten_workspace_manifest_is_not_acted_on(self):
+        base = self.root / "backend"; base.mkdir()
+        (base / "k.manifest.json").write_text(json.dumps(self.GOOD))
+        work, trusted = self.root / "cell", self.root / "manifests" / "k.json"
+        for sub in ("_recipe_out/install", ".ccache"):
+            (work / sub).mkdir(parents=True)
+        self.repro._devshell_fetch(f"file://{base}", "k", work, False,
+                                   trusted=trusted)
+        tampered = {"source": {"repo": "https://h/x", "commit": "0" * 40}}
+        (work / "manifest.json").write_text(json.dumps(tampered))
+        got = self.repro._devshell_fetch(f"file://{base}", "k", work, False,
+                                         trusted=trusted)
+        self.assertEqual(got, self.GOOD)
+        self.assertEqual(json.loads(trusted.read_text()), self.GOOD)
+
+    def test_manifest_copy_is_not_written_through_a_planted_symlink(self):
+        base = self.root / "backend"; base.mkdir()
+        (base / "k.manifest.json").write_text(json.dumps(self.GOOD))
+        work, trusted = self.root / "cell", self.root / "manifests" / "k.json"
+        for sub in ("_recipe_out/install", ".ccache"):
+            (work / sub).mkdir(parents=True)
+        victim = self.root / "host-file"
+        victim.write_text("untouched")
+        (work / "manifest.json").symlink_to(victim)
+        self.repro._devshell_fetch(f"file://{base}", "k", work, False,
+                                   trusted=trusted)
+        self.assertEqual(victim.read_text(), "untouched")
+        self.assertFalse((work / "manifest.json").is_symlink())
+
+    def test_symlinks_in_the_shared_cache_are_refused_before_binding(self):
+        cache = self.root / "hc"
+        elsewhere = self.root / "elsewhere"; elsewhere.mkdir()
+        (cache / "ai" / "memory").mkdir(parents=True)
+        (cache / "ai" / "memory" / "proj").symlink_to(elsewhere)
+        (cache / "cells").mkdir()
+        (cache / "cells" / "x").symlink_to(elsewhere)
+        for p in (cache / "ai" / "memory" / "proj" / "enc", cache / "cells" / "x"):
+            with self.assertRaises(SystemExit):
+                self.repro._devshell_refuse_symlinks(p, cache)
+
 
 
 class DevshellRestrictionsTests(unittest.TestCase):
