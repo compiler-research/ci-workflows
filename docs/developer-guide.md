@@ -622,7 +622,13 @@ inside (verify.yml's devshell-smoke job runs it):
 - `dev` has no sudo, and the container runs under `no-new-privileges`.
   `repro-config` installs what the devshell needs as root before the
   shell starts; `--devshell-sudo` restores passwordless sudo (and lifts
-  `no-new-privileges`, which sudo cannot work under).
+  `no-new-privileges`, which sudo cannot work under). Other packages go
+  in from the host: `bin/repro --devshell --devshell-install PKG... <cell>`,
+  or `docker exec -u 0 <container> apt-get install -y PKG`. Inside,
+  `apt-get`, `apt` and `sudo` are wrappers in `/usr/local/bin` that run
+  the real tool and, when a package change fails, print both commands
+  for this container below the tool's own error. Python packages need no
+  root (a venv), nor does conda (micromamba).
 - All capabilities are dropped except `CHOWN`, `DAC_OVERRIDE`,
   `FOWNER`, `FSETID`, `KILL`, `SETGID` and `SETUID` -- what the init
   script, apt and the switch to `dev` need -- and processes are limited.

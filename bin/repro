@@ -233,6 +233,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="with --devshell: run as root inside the "
                         "container. Escape hatch; files written to "
                         "/patches will be root-owned on the host.")
+    p.add_argument("--devshell-install", nargs="+", action="extend",
+                   metavar="PKG",
+                   help="with --devshell: apt-install PKG... into the devshell "
+                        "as root, then exit. The way to add packages while "
+                        "the shell itself has no sudo; `apt-get install` "
+                        "inside prints this command for you.")
     p.add_argument("--devshell-sudo", action="store_true",
                    help="with --devshell: give the dev user passwordless "
                         "sudo (e.g. to apt-install packages from the "
@@ -1501,6 +1507,53 @@ DEVSHELL_CAPS = ("CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID",
                  "SETUID", "SETGID", "KILL")
 
 
+#: Bumped when a container needs something only `docker run` can give it
+#: (2: the DEVSHELL_REOPEN / DEVSHELL_CONTAINER env the apt wrappers
+#: read). Part of the recorded profile, so older containers re-create.
+DEVSHELL_LAYOUT = "2"
+
+#: An apt package name, optionally :arch and =version. Checked before it
+#: reaches apt-get, so an "option" cannot arrive as a package.
+_APT_PACKAGE = re.compile(r"^[a-z0-9][a-z0-9+.-]*(:[a-z0-9]+)?(=[A-Za-z0-9.:~+-]+)?$")
+
+
+def _devshell_reopen_argv(args: argparse.Namespace,
+                          patches_out: Path) -> List[str]:
+    """The bin/repro command that re-enters this devshell unchanged.
+
+    Every flag that decides how the container is created goes in, or the
+    command would re-create it differently; the cell is given as a coord.
+    """
+    opt = lambda k: getattr(args, k, None)  # noqa: E731
+    argv = [str(REPO_ROOT / "bin" / "repro"), "--devshell"]
+    if opt("devshell_host_cache_dir"):
+        argv += ["--devshell-host-cache-dir",
+                 str(Path(opt("devshell_host_cache_dir")).expanduser())]
+    elif opt("devshell_host_cache"):
+        argv.append("--devshell-host-cache")
+    argv += ["--devshell-patches-out", str(patches_out)]
+    for flag in ("devshell_sudo", "devshell_writable_git"):
+        if opt(flag):
+            argv.append("--" + flag.replace("_", "-"))
+    if opt("devshell_docker_options"):
+        argv.append(f"--devshell-docker-options={opt('devshell_docker_options')}")
+    return argv + [_matrix_get(opt("matrix") or [], "name") or "<cell>"]
+
+
+def _devshell_install(name: str, packages: List[str]) -> int:
+    """apt-get install `packages` in the devshell, as root."""
+    bad = [p for p in packages if not _APT_PACKAGE.match(p)]
+    if bad:
+        sys.exit(f"error: --devshell-install: not a package name: {' '.join(bad)}")
+    _log(f"repro: installing {' '.join(packages)} into {name}...")
+    return sandbox.exec_(name, [
+        "bash", "-c",
+        'export DEBIAN_FRONTEND=noninteractive; '
+        'i() { apt-get install -y --no-install-recommends -- "$@"; }; '
+        'i "$@" || { apt-get update -qq && i "$@"; }',
+        "_", *packages], user="0").returncode
+
+
 def _devshell_security(sudo: bool) -> List[str]:
     """Container-level restrictions for the devshell (see sandbox.py).
 
@@ -1585,7 +1638,8 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
     security = _devshell_security(sudo)
     # The .git mode too: toggling it adds or drops a mount, which the
     # bind comparison below only notices in one direction.
-    profile = " ".join(security + (["writable-git"] if writable_git else []))
+    profile = " ".join(security + (["writable-git"] if writable_git else [])
+                       + [f"layout={DEVSHELL_LAYOUT}"])
     if _devshell_container_exists(name):
         # Mounts are fixed at creation: docker cannot remount a
         # container that already exists. So a container left over from
@@ -1659,6 +1713,10 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
         ("DEVSHELL_AI_REPO", f"{repo}"),
         ("DEVSHELL_CELL", name[len("devshell-"):]
                           if name.startswith("devshell-") else name),
+        # For the apt wrappers repro-config installs: how a package gets
+        # into this container from the host.
+        ("DEVSHELL_CONTAINER", name),
+        ("DEVSHELL_REOPEN", shlex.join(_devshell_reopen_argv(args, patches_out))),
         ("DEVSHELL_AI_REPO_ENCODED", f"{encoded}"),
     ]
     if host_cache is not None:
@@ -1875,6 +1933,9 @@ def cmd_devshell(args: argparse.Namespace) -> int:
     _log("")
 
     exec_user = "0" if args.devshell_as_root else "dev"
+
+    if args.devshell_install:
+        return _devshell_install(name, args.devshell_install)
 
     if args.devshell_script:
         # /tmp keeps the script out of the workspace volume -- the
