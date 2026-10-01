@@ -26,24 +26,29 @@ on:
     # dispatch-validate job rejects anything that isn't a declared cell, so
     # "supported" == "in cells.yaml" -- every matrix entry, every OS/arch.
     inputs:
+      cells:
+        description: "Several cells at once, instead of the four fields below: recipe/version/os/arch patterns, space- or comma-separated, * globs (e.g. '*/23/*/*' for every LLVM 23 cell)."
+        type: string
+        required: false
+        default: ''
       recipe:
-        description: 'Recipe as in cells.yaml (e.g. llvm-release, llvm-asan, llvm-root, llvm-wasm).'
+        description: 'Recipe as in cells.yaml (e.g. llvm-release, llvm-asan, llvm-root, llvm-wasm). Ignored when cells is set.'
         type: string
-        required: true
+        required: false
       version:
-        description: "Version/flavor as in cells.yaml (e.g. '22', 'ROOT-llvm22', 'cling-llvm22')."
+        description: "Version/flavor as in cells.yaml (e.g. '22', 'ROOT-llvm22', 'cling-llvm22'). Ignored when cells is set."
         type: string
-        required: true
+        required: false
         default: '22'
       os:
-        description: 'Runner OS as in cells.yaml (e.g. ubuntu-24.04, windows-2025, macos-26, ubuntu-24.04-arm).'
+        description: 'Runner OS as in cells.yaml (e.g. ubuntu-24.04, windows-2025, macos-26, ubuntu-24.04-arm). Ignored when cells is set.'
         type: string
-        required: true
+        required: false
         default: ubuntu-24.04
       arch:
-        description: 'Arch as in cells.yaml (x86_64, arm64, or x86 for 32-bit Windows).'
+        description: 'Arch as in cells.yaml (x86_64, arm64, or x86 for 32-bit Windows). Ignored when cells is set.'
         type: string
-        required: true
+        required: false
         default: x86_64
       force:
         description: 'Rebuild and overwrite even if the cell is already published (otherwise a present asset is left untouched).'
@@ -78,50 +83,100 @@ jobs:
   dispatch-validate:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
+    outputs:
+      bootstrap_matrix: ${{ steps.select.outputs.bootstrap_matrix }}
+      dependent_matrix: ${{ steps.select.outputs.dependent_matrix }}
+      bootstrap_empty:  ${{ steps.select.outputs.bootstrap_empty }}
+      dependent_empty:  ${{ steps.select.outputs.dependent_empty }}
     steps:
       - uses: actions/checkout@v4
-      - name: Reject cells not declared in cells.yaml
+      # Resolve the request to cells declared in cells.yaml: the `cells`
+      # patterns when given, else the single recipe/version/os/arch. A
+      # pattern or coordinate that matches no cell fails the run, so a typo
+      # cannot quietly publish nothing. Split like the push path: cells
+      # whose recipe bootstraps from another cell build after the rest.
+      - id: select
         env:
+          CELLS: ${{ inputs.cells }}
           RECIPE: ${{ inputs.recipe }}
           VERSION: ${{ inputs.version }}
           OS: ${{ inputs.os }}
           ARCH: ${{ inputs.arch }}
         run: |
           set -euo pipefail
-          match=$(yq -o=json -I=0 '.cells[]' cells.yaml \
-            | jq -rc --arg r "$RECIPE" --arg v "$VERSION" \
-                     --arg o "$OS" --arg a "$ARCH" \
-                'select(.recipe==$r and (.version|tostring)==$v
-                        and .os==$o and .arch==$a)')
-          if [ -z "$match" ]; then
-            echo "::error::{recipe=$RECIPE version=$VERSION os=$OS arch=$ARCH} is not a cell in cells.yaml"
-            {
-              echo "Supported cells (recipe version os arch):"
-              yq -o=json -I=0 '.cells[]' cells.yaml \
-                | jq -r '"  \(.recipe) \(.version) \(.os) \(.arch)"'
-            } >&2
-            exit 1
-          fi
-          echo "::notice::reissuing supported cell: $RECIPE $VERSION $OS $ARCH"
+          yq -o=json '.cells' cells.yaml > "$RUNNER_TEMP/cells.json"
+          python3 - "$RUNNER_TEMP/cells.json" >> "$GITHUB_OUTPUT" <<'PY'
+          import fnmatch, json, os, re, subprocess, sys
+          cells = json.load(open(sys.argv[1]))
+          coord = lambda c: "/".join(str(c[k]) for k in ("recipe", "version", "os", "arch"))
+          pats = [p for p in re.split(r"[\s,]+", os.environ["CELLS"]) if p]
+          if not pats:
+              one = "/".join(os.environ[k] for k in ("RECIPE", "VERSION", "OS", "ARCH"))
+              if not os.environ["RECIPE"]:
+                  sys.exit("::error::give `cells`, or recipe/version/os/arch")
+              pats = [one]
+          chosen, bad = [], []
+          for p in pats:
+              hit = [c for c in cells if fnmatch.fnmatchcase(coord(c), p)]
+              if not hit:
+                  bad.append(p)
+              chosen += [c for c in hit if c not in chosen]
+          if bad:
+              print("::error::no cell in cells.yaml matches: " + " ".join(bad), file=sys.stderr)
+              print("Cells (recipe/version/os/arch):", *("  " + coord(c) for c in cells), sep="\n", file=sys.stderr)
+              sys.exit(1)
+          boot, dep = [], []
+          for c in chosen:
+              has_boot = subprocess.run(["yq", "-e", ".bootstrap", f"recipes/{c['recipe']}/recipe.yaml"],
+                                        capture_output=True).returncode == 0
+              (dep if has_boot else boot).append({k: str(c[k]) for k in ("recipe", "version", "os", "arch")})
+              print(f"::notice::publishing {coord(c)}", file=sys.stderr)
+          for name, cs in (("bootstrap", boot), ("dependent", dep)):
+              print(f"{name}_matrix=" + json.dumps({"include": cs}, separators=(",", ":")))
+              print(f"{name}_empty=" + ("true" if not cs else "false"))
+          PY
 
   publish-dispatch:
-    if: github.event_name == 'workflow_dispatch'
     needs: dispatch-validate
-    # No templated `name:`. When the gate is false (push / pull_request),
-    # GitHub still enumerates the job and renders any `${{ inputs.* }}`
-    # in `name:` literally, producing a phantom Skipped row that reads
-    # like a real failure. Letting GHA fall back to the job id keeps the
-    # Skipped row clean.
-    runs-on: ${{ inputs.os }}
+    if: github.event_name == 'workflow_dispatch' && needs.dispatch-validate.outputs.bootstrap_empty != 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.dispatch-validate.outputs.bootstrap_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/install-build-deps
       - uses: ./actions/publish-recipe
         with:
-          recipe: ${{ inputs.recipe }}
-          version: ${{ inputs.version }}
-          os: ${{ inputs.os }}
-          arch: ${{ inputs.arch }}
+          recipe: ${{ matrix.recipe }}
+          version: ${{ matrix.version }}
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
+          force: ${{ inputs.force }}
+
+  # Cells whose recipe builds with another cell's install (llvm-msan with
+  # llvm-release's clang) run after the bootstrap set, as on push, so a
+  # bootstrap republished in the same run is the one they fetch.
+  publish-dispatch-dependent:
+    needs: [dispatch-validate, publish-dispatch]
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      needs.dispatch-validate.outputs.dependent_empty != 'true' &&
+      (needs.publish-dispatch.result == 'success' ||
+       needs.publish-dispatch.result == 'skipped')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.dispatch-validate.outputs.dependent_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/install-build-deps
+      - uses: ./actions/publish-recipe
+        with:
+          recipe: ${{ matrix.recipe }}
+          version: ${{ matrix.version }}
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
           force: ${{ inputs.force }}
 
   read-cells:
