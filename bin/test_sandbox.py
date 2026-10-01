@@ -41,6 +41,9 @@ class ArgvTest(unittest.TestCase):
             sandbox.exec_argv("c", ["bash"], user="dev", workdir="/w",
                               tty=True),
             ["docker", "exec", "-it", "-u", "dev", "-w", "/w", "c", "bash"])
+        self.assertEqual(
+            sandbox.exec_argv("c", ["true"], env=[("A", "1")]),
+            ["docker", "exec", "-e", "A=1", "c", "true"])
 
     def test_spec_order_puts_caller_options_last(self):
         spec = sandbox.DevshellSpec(

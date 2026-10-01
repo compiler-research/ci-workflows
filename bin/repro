@@ -1733,9 +1733,15 @@ def _devshell_run_config(name: str, ws: str,
                   "/usr/local/bin/devshell-init")
     if before_config is not None:
         # Needs the `dev` user, which devshell-init creates; it is
-        # idempotent, and repro-config runs it again anyway.
-        sandbox.exec_(name, ["bash", "/usr/local/bin/devshell-init"],
-                      user="0", check=True, quiet=True)
+        # idempotent, and repro-config runs it again -- the full run, with
+        # the AI CLI installer. Silent unless it fails.
+        r = sandbox.exec_(name, ["bash", "/usr/local/bin/devshell-init"],
+                          user="0", env=[("DEVSHELL_INIT_USER_ONLY", "1")],
+                          capture=True)
+        if r.returncode != 0:
+            sys.stderr.write(sandbox.clean_terminal_output(r.stdout + r.stderr))
+            sys.exit(f"error: devshell-init failed (exit {r.returncode}) "
+                     f"in container {name}")
         before_config()
     sandbox.exec_(name, ["bash", "/usr/local/bin/devshell-repro-config"],
                   user="0", workdir=ws, check=True)

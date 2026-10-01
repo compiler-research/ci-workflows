@@ -108,7 +108,8 @@ def oneshot(image: str, command: Sequence[str], *,
 
 def exec_argv(name: str, command: Sequence[str], *,
               user: Optional[str] = None, workdir: Optional[str] = None,
-              tty: bool = False) -> List[str]:
+              tty: bool = False,
+              env: Sequence[Tuple[str, str]] = ()) -> List[str]:
     argv = [DOCKER, "exec"]
     if tty:
         argv.append("-it")
@@ -116,6 +117,8 @@ def exec_argv(name: str, command: Sequence[str], *,
         argv += ["-u", user]
     if workdir is not None:
         argv += ["-w", workdir]
+    for k, v in env:
+        argv += ["-e", f"{k}={v}"]
     return argv + [name, *command]
 
 
