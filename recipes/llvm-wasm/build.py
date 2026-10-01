@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import glob
 import os
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -86,10 +85,17 @@ COMMON_FLAGS: list[str] = [
 WASM_TARGETS: list[str] = ["libclang", "clangInterpreter", "clangStaticAnalyzerCore"]
 
 
+WINDOWS = sys.platform == "win32"
+EXE = ".exe" if WINDOWS else ""
+
+
 def install_emsdk(work_dir: Path, version: str) -> Path:
     """Clone emsdk into work_dir, install + activate the requested version.
 
     Returns the emsdk install root. Idempotent on a re-run with cache.
+    emsdk.py is run directly: the `emsdk` launcher is a shell script
+    Windows cannot execute, and emsdk.bat would put cmd's quoting
+    between us and it.
     """
     emsdk_dir = work_dir / "emsdk"
     if not emsdk_dir.exists():
@@ -99,10 +105,42 @@ def install_emsdk(work_dir: Path, version: str) -> Path:
             check=True,
         )
     # `emsdk install` / `activate` are idempotent and quick on a hit.
-    emsdk = str(emsdk_dir / "emsdk")
-    subprocess.run([emsdk, "install", version], check=True, cwd=emsdk_dir)
-    subprocess.run([emsdk, "activate", version], check=True, cwd=emsdk_dir)
+    emsdk = [sys.executable, str(emsdk_dir / "emsdk.py")]
+    subprocess.run([*emsdk, "install", version], check=True, cwd=emsdk_dir)
+    subprocess.run([*emsdk, "activate", version], check=True, cwd=emsdk_dir)
     return emsdk_dir
+
+
+def emsdk_env(emsdk_dir: Path, **extra: str) -> dict[str, str]:
+    """The environment emcmake / emmake need, without sourcing a shell
+    script: what emsdk_env.sh / .ps1 export that emscripten reads.
+
+    `emsdk activate` writes the config (compiler, node and binaryen
+    paths) to <emsdk>/.emscripten; EM_CONFIG points emscripten at it.
+    EMSDK_PYTHON makes emcc's launchers run this interpreter, not
+    whichever python or python3 is first on PATH. The ccache launcher
+    publish-recipe sets is dropped on Windows: there the compiler is
+    emcc.bat, which ccache cannot be relied on to run.
+    """
+    env = dict(os.environ)
+    emscripten = emsdk_dir / "upstream" / "emscripten"
+    env["EMSDK"] = str(emsdk_dir)
+    env["EM_CONFIG"] = str(emsdk_dir / ".emscripten")
+    env["EMSDK_PYTHON"] = sys.executable
+    env["PATH"] = os.pathsep.join([str(emsdk_dir), str(emscripten),
+                                   env.get("PATH", "")])
+    if WINDOWS:
+        for k in ("CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER"):
+            env.pop(k, None)
+    env.update(extra)
+    return env
+
+
+def em_tool(emsdk_dir: Path, tool: str) -> list[str]:
+    """argv prefix for emscripten's `tool` (emcmake, emmake): its .py
+    entry point under this interpreter, the same on every OS."""
+    return [sys.executable,
+            str(emsdk_dir / "upstream" / "emscripten" / f"{tool}.py")]
 
 
 def apply_patches(repo: Path, version: str) -> None:
@@ -123,21 +161,13 @@ def apply_patches(repo: Path, version: str) -> None:
         subprocess.run(["git", "apply", "-v", patch], check=True, cwd=repo)
 
 
-def run_in_emsdk(cmd: list[str], emsdk_dir: Path, cwd: Path) -> None:
-    """Run `cmd` (a shell-friendly list) under a shell that has sourced
-    emsdk_env.sh. emcmake / emmake rely on EMSDK / PATH set by that
-    script; subprocess starts a fresh shell each call, so source-then-run
-    via bash -c is the simplest cross-cell idiom on Linux/macOS.
-
-    shlex.quote every arg: cmake values like LLVM_ENABLE_PROJECTS=clang;lld
-    contain shell metacharacters and bash would otherwise split them.
-    """
-    env_sh = shlex.quote(str(emsdk_dir / "emsdk_env.sh"))
-    joined = " ".join(shlex.quote(c) for c in cmd)
-    subprocess.run(
-        ["bash", "-c", f"source {env_sh} && {joined}"],
-        check=True, cwd=cwd,
-    )
+def run_in_emsdk(tool: str, args: list[str], emsdk_dir: Path, cwd: Path,
+                 **extra_env: str) -> None:
+    """Run emscripten's `tool` (emcmake / emmake) with `args`, in the
+    emsdk environment. No shell in between, so cmake values such as
+    LLVM_ENABLE_PROJECTS=clang;lld reach cmake as they are."""
+    subprocess.run([*em_tool(emsdk_dir, tool), *args], check=True, cwd=cwd,
+                   env=emsdk_env(emsdk_dir, **extra_env))
 
 
 def _walk_built_libs(build_dir: Path) -> list[str]:
@@ -268,38 +298,29 @@ def main() -> int:
     # as a defensive measure if any other nested configure still fires.
     cmake_args = list(COMMON_FLAGS) + [
         f"-DCMAKE_INSTALL_PREFIX={wasm_install}",
-        f"-DLLVM_TABLEGEN={native_install / 'bin' / 'llvm-tblgen'}",
-        f"-DCLANG_TABLEGEN={native_install / 'bin' / 'clang-tblgen'}",
+        f"-DLLVM_TABLEGEN={native_install / 'bin' / ('llvm-tblgen' + EXE)}",
+        f"-DCLANG_TABLEGEN={native_install / 'bin' / ('clang-tblgen' + EXE)}",
         "-DCROSS_TOOLCHAIN_FLAGS_NATIVE=-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
         "../llvm",
     ]
     llvm_build.record_cmake_args(["emcmake", "cmake", *cmake_args])
-    run_in_emsdk(["emcmake", "cmake", *cmake_args], emsdk_dir, build)
+    run_in_emsdk("emcmake", ["cmake", *cmake_args], emsdk_dir, build)
 
     # Smoke-test hook: emmake the demangle library only and exit. emcmake
     # configure is the wasm-side regression surface (toolchain file, patch
     # apply); running just one wasm target keeps the dry-run minutes
     # instead of hours.
     if os.environ.get("RECIPE_QUICK_CHECK") == "1":
-        run_in_emsdk(
-            ["emmake", "ninja", "-j", ncpus, "LLVMDemangle"],
-            emsdk_dir, build,
-        )
+        run_in_emsdk("emmake", ["ninja", "-j", ncpus, "LLVMDemangle"],
+                     emsdk_dir, build)
         print("build.py: RECIPE_QUICK_CHECK=1 -> built LLVMDemangle, exiting.",
               flush=True)
         return 0
 
     # EMCC_CFLAGS=-fwasm-exceptions: wasm exception ABI for the targets
     # CppInterOp links against. Build_LLVM_WASM passes this same flag.
-    env_sh = shlex.quote(str(emsdk_dir / "emsdk_env.sh"))
-    targets = " ".join(shlex.quote(t) for t in WASM_TARGETS)
-    subprocess.run(
-        ["bash", "-c",
-         f"source {env_sh} && "
-         f"EMCC_CFLAGS=-fwasm-exceptions "
-         f"emmake ninja -j {shlex.quote(ncpus)} {targets}"],
-        check=True, cwd=build,
-    )
+    run_in_emsdk("emmake", ["ninja", "-j", ncpus, *WASM_TARGETS],
+                 emsdk_dir, build, EMCC_CFLAGS="-fwasm-exceptions")
 
     # Install wasm tree. install rules are pure file/cmake-config
     # operations -- no emcc invocation needed beyond what WASM_TARGETS
