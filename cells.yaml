@@ -59,15 +59,13 @@ cells:
   # exists at all). verify.yml's bootstrap-cells-exist check enforces
   # the pairing at PR time rather than 30 minutes into a publish.
   - { recipe: llvm-msan,  version: '23',            os: ubuntu-24.04,    arch: x86_64 }
-  # llvm-wasm: cells cover CppInterOp's Unix emscripten rows.
-  # build.py's emsdk install/activate goes through `subprocess.run`
-  # against the extensionless `emsdk` script, which only resolves
-  # under bash; the per-major patch glob is OS-agnostic. The Windows
-  # row in CppInterOp's matrix still inline-builds via build-on-miss
-  # until the recipe grows `emsdk.bat`/`.ps1` plumbing.
+  # llvm-wasm: cells cover CppInterOp's emscripten rows, Windows
+  # included -- build.py runs emsdk and emcmake/emmake through their
+  # .py entry points, not the shell launchers.
   - { recipe: llvm-wasm,  version: '22',            os: ubuntu-24.04,    arch: x86_64 }
   - { recipe: llvm-wasm,  version: '22',            os: ubuntu-24.04-arm, arch: arm64  }
   - { recipe: llvm-wasm,  version: '22',            os: macos-26,        arch: arm64  }
+  - { recipe: llvm-wasm,  version: '22',            os: windows-2025,    arch: x86_64 }
   # llvm-wheel: the wheel-building toolchain (static-only, assertions
   # off; see the recipe). Linux cells build inside the per-arch manylinux
   # container for the glibc 2.28 floor; macOS cells build at deployment

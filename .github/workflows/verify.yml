@@ -492,6 +492,10 @@ jobs:
         shell: bash
         working-directory: recipes/biodynamo
         run: python3 -W error::ResourceWarning -m unittest discover -p 'test_*.py' -v
+      - name: recipes/llvm-wasm unit tests
+        shell: bash
+        working-directory: recipes/llvm-wasm
+        run: python3 -W error::ResourceWarning -m unittest discover -p 'test_*.py' -v
       - name: scripts/ unit tests
         shell: bash
         working-directory: scripts
