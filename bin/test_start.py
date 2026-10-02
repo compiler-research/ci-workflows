@@ -442,6 +442,25 @@ class ResolveCheckoutTest(unittest.TestCase):
             run.return_value = mock.Mock(returncode=128)
             self.assertIsNone(start.resolve_checkout(self.PROJECT))
 
+    def test_default_is_the_current_directory(self):
+        here = Path(tempfile.mkdtemp()).resolve()
+        with mock.patch("builtins.input", side_effect=["", "n"]), \
+                mock.patch.object(start.Path, "cwd", return_value=here), \
+                redirect_stdout(io.StringIO()) as out:
+            start.resolve_checkout(self.PROJECT)
+        self.assertIn(f"clone to    {here / 'CARTopiaX'}", out.getvalue())
+
+    def test_default_inside_a_checkout_is_beside_it(self):
+        # ci-workflows itself is the case the README sends people into;
+        # a dotfiles repository at $HOME must not send clones to /Users.
+        root = Path(tempfile.mkdtemp()).resolve()
+        (root / "ci-workflows" / ".git").mkdir(parents=True)
+        (root / "ci-workflows" / "bin").mkdir()
+        self.assertEqual(start.default_clone_parent(root / "ci-workflows" / "bin"), root)
+        (root / ".git").mkdir()
+        with mock.patch.object(start.Path, "home", return_value=root):
+            self.assertEqual(start.default_clone_parent(root), root)
+
     def test_eof_at_the_path_prompt_is_not_a_traceback(self):
         with mock.patch("builtins.input", side_effect=EOFError), \
                 redirect_stdout(io.StringIO()):

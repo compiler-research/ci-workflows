@@ -57,8 +57,6 @@ sys.path.insert(0, str(REPO_ROOT / "bin"))
 import cells  # noqa: E402
 import gha  # noqa: E402
 PROJECTS_YAML = REPO_ROOT / "projects.yaml"
-#: Where a project gets cloned when the user accepts the default.
-DEFAULT_SRC_PARENT = Path.home() / "src"
 #: Mirrors bin/repro's DEVSHELL_HOST_CACHE_DEFAULT, which is what
 #: --devshell-host-cache resolves to and where the cell is unpacked.
 DEVSHELL_HOST_CACHE = Path.home() / ".cache" / "ci-workflows" / "devshell-cache"
@@ -367,6 +365,19 @@ def _confirm(prompt: str, default: bool = True) -> bool:
 # -------------------------------------------------------------- checkout
 
 
+def default_clone_parent(cwd: Optional[Path] = None) -> Path:
+    """Where a project is cloned when the user accepts the default: the
+    directory bin/start runs in or, inside a checkout -- ci-workflows
+    itself, in the README's `cd ci-workflows && ./bin/start` -- beside
+    that checkout rather than in it. A git repository at $HOME (dotfiles)
+    is not such a checkout: beside it is /home or /Users."""
+    cwd = (cwd or Path.cwd()).resolve()
+    top = _git_toplevel(cwd)
+    if top is None or top == Path.home().resolve():
+        return cwd
+    return top.parent
+
+
 def resolve_checkout(project: Dict[str, str]) -> Optional[Path]:
     """Find or create the project's checkout; return its path.
 
@@ -374,7 +385,7 @@ def resolve_checkout(project: Dict[str, str]) -> Optional[Path]:
     the user's working copy, and this tool has no business pulling or
     resetting it.
     """
-    default = DEFAULT_SRC_PARENT / project["name"]
+    default = default_clone_parent() / project["name"]
     print()
     print(f"  {project['name']}")
     print(f"    clone to    {default}            [enter to accept]")
