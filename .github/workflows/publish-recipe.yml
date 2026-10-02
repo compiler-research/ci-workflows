@@ -27,7 +27,7 @@ on:
     # "supported" == "in cells.yaml" -- every matrix entry, every OS/arch.
     inputs:
       cells:
-        description: "Several cells at once, instead of the four fields below: recipe/version/os/arch patterns, space- or comma-separated, * globs (e.g. '*/23/*/*' for every LLVM 23 cell)."
+        description: "Several cells at once, instead of the four fields below: recipe/version/os/arch patterns, space- or comma-separated, * globbing within a part (e.g. 'llvm-*/23/ubuntu-24.04/*'). Mind that Windows cells publish no ccache."
         type: string
         required: false
         default: ''
@@ -105,40 +105,17 @@ jobs:
         run: |
           set -euo pipefail
           yq -o=json '.cells' cells.yaml > "$RUNNER_TEMP/cells.json"
-          python3 - "$RUNNER_TEMP/cells.json" >> "$GITHUB_OUTPUT" <<'PY'
-          import fnmatch, json, os, re, subprocess, sys
-          cells = json.load(open(sys.argv[1]))
-          coord = lambda c: "/".join(str(c[k]) for k in ("recipe", "version", "os", "arch"))
-          pats = [p for p in re.split(r"[\s,]+", os.environ["CELLS"]) if p]
-          if not pats:
-              one = "/".join(os.environ[k] for k in ("RECIPE", "VERSION", "OS", "ARCH"))
-              if not os.environ["RECIPE"]:
-                  sys.exit("::error::give `cells`, or recipe/version/os/arch")
-              pats = [one]
-          chosen, bad = [], []
-          for p in pats:
-              hit = [c for c in cells if fnmatch.fnmatchcase(coord(c), p)]
-              if not hit:
-                  bad.append(p)
-              chosen += [c for c in hit if c not in chosen]
-          if bad:
-              print("::error::no cell in cells.yaml matches: " + " ".join(bad), file=sys.stderr)
-              print("Cells (recipe/version/os/arch):", *("  " + coord(c) for c in cells), sep="\n", file=sys.stderr)
-              sys.exit(1)
-          boot, dep = [], []
-          for c in chosen:
-              has_boot = subprocess.run(["yq", "-e", ".bootstrap", f"recipes/{c['recipe']}/recipe.yaml"],
-                                        capture_output=True).returncode == 0
-              (dep if has_boot else boot).append({k: str(c[k]) for k in ("recipe", "version", "os", "arch")})
-              print(f"::notice::publishing {coord(c)}", file=sys.stderr)
-          for name, cs in (("bootstrap", boot), ("dependent", dep)):
-              print(f"{name}_matrix=" + json.dumps({"include": cs}, separators=(",", ":")))
-              print(f"{name}_empty=" + ("true" if not cs else "false"))
-          PY
+          python3 actions/publish-recipe/select_cells.py \
+            "$RUNNER_TEMP/cells.json" >> "$GITHUB_OUTPUT"
 
   publish-dispatch:
     needs: dispatch-validate
     if: github.event_name == 'workflow_dispatch' && needs.dispatch-validate.outputs.bootstrap_empty != 'true'
+    # No templated `name:`. When the gate is false (push / pull_request),
+    # GitHub still enumerates the job and renders any `${{ inputs.* }}`
+    # or `${{ matrix.* }}` in `name:` literally, producing a phantom
+    # Skipped row that reads like a real failure. Letting GHA fall back to
+    # the job id keeps the Skipped row clean. Same for the job below.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
