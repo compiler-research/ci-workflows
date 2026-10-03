@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -43,6 +44,19 @@ class EmsdkPlumbingTests(unittest.TestCase):
                     env = build.emsdk_env(Path("emsdk"))
                 for k in launchers:
                     self.assertEqual(k in env, not windows, (k, windows))
+
+
+    def test_static_libraries_are_found_under_both_naming_schemes(self):
+        # MSVC builds the Windows native stage: LLVMSupport.lib, not
+        # libLLVMSupport.a. Missing it shipped a native tree without libs.
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "lib").mkdir()
+            for name in ("libLLVMSupport.a", "LLVMTableGen.lib", "libclang.lib",
+                         "lldWasm.lib", "libz.a", "LLVMSupport.pdb"):
+                (Path(d) / "lib" / name).touch()
+            self.assertEqual(sorted(build._walk_built_libs(Path(d))),
+                             ["LLVMSupport", "LLVMTableGen", "libclang",
+                              "lldWasm"])
 
 
 if __name__ == "__main__":

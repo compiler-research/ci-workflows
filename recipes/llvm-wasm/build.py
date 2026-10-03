@@ -171,17 +171,19 @@ def run_in_emsdk(tool: str, args: list[str], emsdk_dir: Path, cwd: Path,
 
 
 def _walk_built_libs(build_dir: Path) -> list[str]:
-    """Return clang*/LLVM* component names for every .a in build_dir/lib/."""
+    """Return clang*/LLVM* component names for every static library in
+    build_dir/lib/: libLLVMSupport.a from emcc, gcc and clang, and
+    LLVMSupport.lib from MSVC, which builds the Windows native stage."""
     out: list[str] = []
     lib = build_dir / "lib"
     if not lib.is_dir():
         return out
     for f in sorted(lib.iterdir()):
-        name = f.name
-        if not name.endswith(".a"):
+        if f.suffix not in (".a", ".lib"):
             continue
-        base = name[3:] if name.startswith("lib") else name
-        base = base[:-2]
+        base = f.stem
+        if f.suffix == ".a" and base.startswith("lib"):
+            base = base[3:]
         # libclang.a's cmake target is `libclang` (lib prefix is part of
         # the target name). Stripping it collapses to bare `clang`, which
         # cmake then resolves to the clang-driver executable component
