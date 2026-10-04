@@ -118,9 +118,10 @@ def emsdk_env(emsdk_dir: Path, **extra: str) -> dict[str, str]:
     `emsdk activate` writes the config (compiler, node and binaryen
     paths) to <emsdk>/.emscripten; EM_CONFIG points emscripten at it.
     EMSDK_PYTHON makes emcc's launchers run this interpreter, not
-    whichever python or python3 is first on PATH. The ccache launcher
-    publish-recipe sets is dropped on Windows: there the compiler is
-    emcc.bat, which ccache cannot be relied on to run.
+    whichever python or python3 is first on PATH. On Windows the ccache
+    launcher publish-recipe sets moves to EM_COMPILER_WRAPPER: cmake's
+    compiler there is emcc.bat, which ccache cannot be relied on to run,
+    while emcc puts the wrapper in front of its own clang.exe.
     """
     env = dict(os.environ)
     emscripten = emsdk_dir / "upstream" / "emscripten"
@@ -130,8 +131,10 @@ def emsdk_env(emsdk_dir: Path, **extra: str) -> dict[str, str]:
     env["PATH"] = os.pathsep.join([str(emsdk_dir), str(emscripten),
                                    env.get("PATH", "")])
     if WINDOWS:
-        for k in ("CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER"):
-            env.pop(k, None)
+        launcher = env.pop("CMAKE_CXX_COMPILER_LAUNCHER", None)
+        env.pop("CMAKE_C_COMPILER_LAUNCHER", None)
+        if launcher:
+            env["EM_COMPILER_WRAPPER"] = launcher
     env.update(extra)
     return env
 
@@ -171,17 +174,19 @@ def run_in_emsdk(tool: str, args: list[str], emsdk_dir: Path, cwd: Path,
 
 
 def _walk_built_libs(build_dir: Path) -> list[str]:
-    """Return clang*/LLVM* component names for every .a in build_dir/lib/."""
+    """Return clang*/LLVM* component names for every static library in
+    build_dir/lib/: libLLVMSupport.a from emcc, gcc and clang, and
+    LLVMSupport.lib from MSVC, which builds the Windows native stage."""
     out: list[str] = []
     lib = build_dir / "lib"
     if not lib.is_dir():
         return out
     for f in sorted(lib.iterdir()):
-        name = f.name
-        if not name.endswith(".a"):
+        if f.suffix not in (".a", ".lib"):
             continue
-        base = name[3:] if name.startswith("lib") else name
-        base = base[:-2]
+        base = f.stem
+        if f.suffix == ".a" and base.startswith("lib"):
+            base = base[3:]
         # libclang.a's cmake target is `libclang` (lib prefix is part of
         # the target name). Stripping it collapses to bare `clang`, which
         # cmake then resolves to the clang-driver executable component

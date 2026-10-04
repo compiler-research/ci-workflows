@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -22,7 +23,8 @@ _SPEC.loader.exec_module(build)
 
 class EmsdkPlumbingTests(unittest.TestCase):
     """What the Windows port depends on: no shell between build.py and
-    cmake, and no ccache in front of emcc.bat."""
+    cmake, ccache behind emcc rather than in front of emcc.bat, and
+    MSVC's library names."""
 
     def test_cmake_lists_reach_cmake_unsplit(self):
         with mock.patch.object(subprocess, "run") as run:
@@ -34,7 +36,7 @@ class EmsdkPlumbingTests(unittest.TestCase):
                          ["-DLLVM_ENABLE_PROJECTS=clang;lld",
                           "-DCMAKE_C_FLAGS_RELEASE=-Oz -g0 -DNDEBUG"])
 
-    def test_ccache_launcher_is_dropped_only_on_windows(self):
+    def test_ccache_moves_behind_emcc_on_windows_only(self):
         launchers = {"CMAKE_C_COMPILER_LAUNCHER": "ccache",
                      "CMAKE_CXX_COMPILER_LAUNCHER": "ccache"}
         with mock.patch.dict(os.environ, launchers):
@@ -43,6 +45,20 @@ class EmsdkPlumbingTests(unittest.TestCase):
                     env = build.emsdk_env(Path("emsdk"))
                 for k in launchers:
                     self.assertEqual(k in env, not windows, (k, windows))
+                self.assertEqual(env.get("EM_COMPILER_WRAPPER"),
+                                 "ccache" if windows else None)
+
+    def test_static_libraries_are_found_under_both_naming_schemes(self):
+        # MSVC builds the Windows native stage: LLVMSupport.lib, not
+        # libLLVMSupport.a. Missing it shipped a native tree without libs.
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "lib").mkdir()
+            for name in ("libLLVMSupport.a", "LLVMTableGen.lib", "libclang.lib",
+                         "lldWasm.lib", "libz.a", "LLVMSupport.pdb"):
+                (Path(d) / "lib" / name).touch()
+            self.assertEqual(sorted(build._walk_built_libs(Path(d))),
+                             ["LLVMSupport", "LLVMTableGen", "libclang",
+                              "lldWasm"])
 
 
 if __name__ == "__main__":
