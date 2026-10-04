@@ -118,9 +118,10 @@ def emsdk_env(emsdk_dir: Path, **extra: str) -> dict[str, str]:
     `emsdk activate` writes the config (compiler, node and binaryen
     paths) to <emsdk>/.emscripten; EM_CONFIG points emscripten at it.
     EMSDK_PYTHON makes emcc's launchers run this interpreter, not
-    whichever python or python3 is first on PATH. The ccache launcher
-    publish-recipe sets is dropped on Windows: there the compiler is
-    emcc.bat, which ccache cannot be relied on to run.
+    whichever python or python3 is first on PATH. On Windows the ccache
+    launcher publish-recipe sets moves to EM_COMPILER_WRAPPER: cmake's
+    compiler there is emcc.bat, which ccache cannot be relied on to run,
+    while emcc puts the wrapper in front of its own clang.exe.
     """
     env = dict(os.environ)
     emscripten = emsdk_dir / "upstream" / "emscripten"
@@ -130,8 +131,10 @@ def emsdk_env(emsdk_dir: Path, **extra: str) -> dict[str, str]:
     env["PATH"] = os.pathsep.join([str(emsdk_dir), str(emscripten),
                                    env.get("PATH", "")])
     if WINDOWS:
-        for k in ("CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER"):
-            env.pop(k, None)
+        launcher = env.pop("CMAKE_CXX_COMPILER_LAUNCHER", None)
+        env.pop("CMAKE_C_COMPILER_LAUNCHER", None)
+        if launcher:
+            env["EM_COMPILER_WRAPPER"] = launcher
     env.update(extra)
     return env
 
