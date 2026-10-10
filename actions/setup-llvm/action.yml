@@ -383,6 +383,21 @@ runs:
         cmake --build . --parallel "${ncpus}"
         cmake --install .
 
+        # Stage cling's runtime headers and modulemaps as ROOT,
+        # so we can run cling with -fmodules.
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          cling_etc="$LLVM_PREFIX/etc/cling"
+          mkdir -p "$cling_etc/Interpreter"
+          cp ../include/cling/std.modulemap  "$cling_etc/"
+          cp ../include/cling/libc.modulemap "$cling_etc/"
+          cp ../include/cling/module.modulemap.build "$cling_etc/module.modulemap"
+          for hdr in DynamicExprInfo DynamicLookupRuntimeUniverse \
+                     DynamicLookupLifetimeHandler Exception RuntimePrintValue \
+                     RuntimeUniverse RuntimeOptions Value Visibility; do
+            cp "../include/cling/Interpreter/${hdr}.h" "$cling_etc/Interpreter/"
+          done
+        fi
+
     - name: Cling-on-top (Windows)
       if: inputs.flavor == 'cling' && runner.os == 'Windows'
       shell: pwsh
