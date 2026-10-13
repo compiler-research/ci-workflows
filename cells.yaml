@@ -129,12 +129,13 @@ cells:
   # a whole is the default-flavor cell for consumers that want the
   # released 23 line without pinning a tag.
   #
-  # Narrower than the 22 set below on purpose: these four are the
+  # Narrower than the 22 set below on purpose: these five are the
   # platforms a consumer asks for today. The 32-bit windows-2025 x86 and
   # windows-11-arm rows that 22 carries are not duplicated here -- each
   # is a full LLVM build, and the win32 row that motivates the x86 cell
   # is still on 22. Add them when a matrix row actually requests 23.
   - { recipe: llvm-release, version: '23',         os: ubuntu-24.04,     arch: x86_64 }
+  - { recipe: llvm-release, version: '23',         os: ubuntu-24.04-arm, arch: arm64  }
   - { recipe: llvm-release, version: '23',         os: macos-26,         arch: arm64  }
   - { recipe: llvm-release, version: '23',         os: macos-26-intel,   arch: x86_64 }
   - { recipe: llvm-release, version: '23',         os: windows-2025,     arch: x86_64 }
