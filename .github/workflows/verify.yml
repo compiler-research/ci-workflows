@@ -556,6 +556,10 @@ jobs:
   # setup-llvm flavor=system smoke. Matrix covers both install paths:
   #   - version 20 → not in noble archive → falls through to apt-llvm.org
   #   - version 14 → in noble archive → exercises the direct-apt branch
+  # and both Homebrew cases on Intel, where Homebrew no longer upgrades
+  # from bottles:
+  #   - version 19 → not on the image → installed from its bottle
+  #   - version 18 → on the image → kept as it is, not upgraded
   # Asserts source output reports package-manager, prefix is a symlink
   # (regression test for "install lands at a real path"), and
   # LLVMConfig.cmake is reachable. The second invocation step is a
@@ -592,19 +596,23 @@ jobs:
           fi
 
   setup-llvm-system-smoke:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        version: ['20', '14']
+        include:
+          - { os: ubuntu-24.04, version: '20' }
+          - { os: ubuntu-24.04, version: '14' }
+          - { os: macos-15-intel, version: '19' }
+          - { os: macos-15-intel, version: '18' }
     steps:
       - uses: actions/checkout@v4
-      - name: flavor=system smoke (llvm-${{ matrix.version }})
+      - name: flavor=system smoke (llvm-${{ matrix.version }}, ${{ matrix.os }})
         id: first
         uses: ./actions/setup-llvm
         with:
           version: ${{ matrix.version }}
-          os: ubuntu-24.04
+          os: ${{ matrix.os }}
           arch: x86_64
           flavor: system
       - name: Assert source=package-manager + symlink + LLVMConfig.cmake
@@ -645,7 +653,7 @@ jobs:
         uses: ./actions/setup-llvm
         with:
           version: ${{ matrix.version }}
-          os: ubuntu-24.04
+          os: ${{ matrix.os }}
           arch: x86_64
           flavor: system
       - name: Assert second invocation also reports source=package-manager
