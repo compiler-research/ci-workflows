@@ -556,10 +556,10 @@ jobs:
   # setup-llvm flavor=system smoke. Matrix covers both install paths:
   #   - version 20 → not in noble archive → falls through to apt-llvm.org
   #   - version 14 → in noble archive → exercises the direct-apt branch
-  # and both Homebrew cases on Intel, where Homebrew no longer upgrades
-  # from bottles:
-  #   - version 19 → not on the image → installed from its bottle
-  #   - version 18 → on the image → kept as it is, not upgraded
+  # and both Homebrew cases. Homebrew has no Intel bottles for current
+  # LLVMs, so an install is only tested on ARM:
+  #   - version 19 on macos-26 → not on the image → installed from its bottle
+  #   - version 18 on macos-15-intel → on the image → used without brew install
   # Asserts source output reports package-manager, prefix is a symlink
   # (regression test for "install lands at a real path"), and
   # LLVMConfig.cmake is reachable. The second invocation step is a
@@ -603,7 +603,7 @@ jobs:
         include:
           - { os: ubuntu-24.04, version: '20' }
           - { os: ubuntu-24.04, version: '14' }
-          - { os: macos-15-intel, version: '19' }
+          - { os: macos-26, version: '19' }
           - { os: macos-15-intel, version: '18' }
     steps:
       - uses: actions/checkout@v4
@@ -613,7 +613,6 @@ jobs:
         with:
           version: ${{ matrix.version }}
           os: ${{ matrix.os }}
-          arch: x86_64
           flavor: system
       - name: Assert source=package-manager + symlink + LLVMConfig.cmake
         shell: bash
@@ -654,7 +653,6 @@ jobs:
         with:
           version: ${{ matrix.version }}
           os: ${{ matrix.os }}
-          arch: x86_64
           flavor: system
       - name: Assert second invocation also reports source=package-manager
         shell: bash
