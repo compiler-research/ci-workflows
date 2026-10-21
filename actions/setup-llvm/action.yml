@@ -306,11 +306,15 @@ runs:
         # `brew install` exits non-zero on unknown formula; let it
         # propagate to fail the action — the consumer asked for a
         # flavor the host can't satisfy, and there's no fallback.
-        # A formula the image already has stays as it is: upgrading it
-        # where Homebrew no longer ships bottles (Intel) builds it from
-        # source. A missing one still installs, from a bottle where
-        # there is one.
-        HOMEBREW_NO_INSTALL_UPGRADE=1 brew install "llvm@${VERSION}"
+        # A formula the image already has is used as it is, on every
+        # host: upgrading it where Homebrew no longer ships bottles
+        # (Intel) builds it from source. Asking brew install not to
+        # upgrade it would still annotate the job with an error when it
+        # is outdated, so it is not asked at all. A missing one is
+        # installed, from a bottle where there is one.
+        if ! brew list --versions "llvm@${VERSION}" >/dev/null 2>&1; then
+          brew install "llvm@${VERSION}"
+        fi
         prefix="$(brew --prefix "llvm@${VERSION}")"
         # `brew --prefix` names the path whether or not the formula is
         # there; without this the failure surfaces only when the
