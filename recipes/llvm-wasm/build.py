@@ -22,9 +22,9 @@ Both trees use cmake --install with relocatable cmake configs
 so the asset extracts to any consumer workspace path correctly.
 
 Inputs (env): see actions/lib/llvm_build.py docstring.
-  RECIPE_VERSION         major LLVM version (release/{version}.x).
-  EMSDK_VERSION          emsdk tag to install/activate. Defaulted from
-                         recipe.yaml's `emsdk_version`.
+  RECIPE_VERSION         major LLVM version (release/{major}.x),
+                         optionally naming the emsdk to build with:
+                         '22' (DEFAULT_EMSDK) or '22-emsdk6.0.8'.
 
 Outputs (env, written to GITHUB_ENV when present):
   SRC_COMMIT             sha of llvm-project HEAD that was built
@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -85,8 +86,39 @@ COMMON_FLAGS: list[str] = [
 WASM_TARGETS: list[str] = ["libclang", "clangInterpreter", "clangStaticAnalyzerCore"]
 
 
+# The emsdk a bare major builds with. Changing it moves every such cell's
+# key, since the key hashes this file.
+DEFAULT_EMSDK = "4.0.9"
+
 WINDOWS = sys.platform == "win32"
 EXE = ".exe" if WINDOWS else ""
+
+
+def parse_version(version: str) -> tuple[str, str]:
+    """Split RECIPE_VERSION into (LLVM major, emsdk version).
+
+    The emsdk is part of the version, not a separate knob, so that it is
+    part of the cache key and of the ccache's: emcc's clang is not the
+    compiler ccache's compiler_check sees, so objects from one emsdk would
+    otherwise be served to a build with another.
+    """
+    m = re.fullmatch(r"(\d+)(?:-emsdk(\d+\.\d+\.\d+))?", version)
+    if not m:
+        raise ValueError(
+            f"llvm-wasm expects an LLVM major ('22') or a major and an "
+            f"emsdk ('22-emsdk6.0.8'); got '{version}'")
+    return m.group(1), m.group(2) or DEFAULT_EMSDK
+
+
+def _record_src_ref(ref: str) -> None:
+    """Publish the cloned ref as SRC_REF for the manifest step, which
+    otherwise substitutes the whole version into recipe.yaml's
+    branch_template."""
+    github_env = os.environ.get("GITHUB_ENV", "")
+    if not github_env:
+        return
+    with open(github_env, "a") as f:
+        f.write(f"SRC_REF={ref}\n")
 
 
 def install_emsdk(work_dir: Path, version: str) -> Path:
@@ -240,20 +272,23 @@ def main() -> int:
     llvm_build.setup_env()
     work_dir = Path(os.environ["WORK_DIR"])
     out_dir = Path(os.environ["OUT_DIR"])
-    version = os.environ["RECIPE_VERSION"]
+    try:
+        version, emsdk_version = parse_version(os.environ["RECIPE_VERSION"])
+    except ValueError as e:
+        print(f"::error::{e}", file=sys.stderr)
+        return 1
     ncpus = os.environ["NCPUS"]
-    # Default mirrors recipe.yaml's emsdk_version; publish-recipe could
-    # also set it from a cell-level override later if needed.
-    emsdk_version = os.environ.get("EMSDK_VERSION", "4.0.9")
 
     os.chdir(work_dir)
     emsdk_dir = install_emsdk(work_dir, emsdk_version)
 
+    ref = f"release/{version}.x"
     llvm_build.clone_shallow(
         "https://github.com/llvm/llvm-project.git",
-        f"release/{version}.x",
+        ref,
         work_dir / "llvm-project",
     )
+    _record_src_ref(ref)
     src_commit = llvm_build.record_src_commit(work_dir / "llvm-project")
 
     repo = work_dir / "llvm-project"

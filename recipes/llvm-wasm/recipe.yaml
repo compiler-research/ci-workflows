@@ -1,8 +1,10 @@
 recipe: llvm-wasm
 description: |
   LLVM/Clang cross-compiled for wasm32-unknown-emscripten via emsdk,
-  against release/{version}.x. Consumed today by CppInterOp's
-  emscripten matrix.
+  against release/{major}.x. The version is the LLVM major, optionally
+  with the emsdk it is built with: '22-emsdk6.0.8'; a bare '22' uses
+  build.py's DEFAULT_EMSDK. Consumed today by CppInterOp's emscripten
+  matrix, which passes its EM_VERSION that way.
 
   Two stages: (1) host llvm-tblgen + clang-tblgen under
   install/native_build/ -- the wasm clang cannot build host binaries,

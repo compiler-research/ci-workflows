@@ -61,5 +61,14 @@ class EmsdkPlumbingTests(unittest.TestCase):
                               "lldWasm"])
 
 
+class VersionTests(unittest.TestCase):
+    def test_emsdk_is_named_by_the_version(self):
+        self.assertEqual(build.parse_version("22"), ("22", build.DEFAULT_EMSDK))
+        self.assertEqual(build.parse_version("22-emsdk6.0.8"), ("22", "6.0.8"))
+        for bad in ("22.1", "22-emsdk", "22-emsdk6", "22-emsdklatest"):
+            with self.assertRaises(ValueError, msg=bad):
+                build.parse_version(bad)
+
+
 if __name__ == "__main__":
     unittest.main()

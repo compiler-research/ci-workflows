@@ -61,11 +61,17 @@ cells:
   - { recipe: llvm-msan,  version: '23',            os: ubuntu-24.04,    arch: x86_64 }
   # llvm-wasm: cells cover CppInterOp's emscripten rows, Windows
   # included -- build.py runs emsdk and emcmake/emmake through their
-  # .py entry points, not the shell launchers.
+  # .py entry points, not the shell launchers. A version names the
+  # emsdk it is built with ('22-emsdk6.0.8'); a bare major builds with
+  # build.py's DEFAULT_EMSDK.
   - { recipe: llvm-wasm,  version: '22',            os: ubuntu-24.04,    arch: x86_64 }
   - { recipe: llvm-wasm,  version: '22',            os: ubuntu-24.04-arm, arch: arm64  }
   - { recipe: llvm-wasm,  version: '22',            os: macos-26,        arch: arm64  }
   - { recipe: llvm-wasm,  version: '22',            os: windows-2025,    arch: x86_64 }
+  - { recipe: llvm-wasm,  version: '22-emsdk6.0.8', os: ubuntu-24.04,    arch: x86_64 }
+  - { recipe: llvm-wasm,  version: '22-emsdk6.0.8', os: ubuntu-24.04-arm, arch: arm64  }
+  - { recipe: llvm-wasm,  version: '22-emsdk6.0.8', os: macos-26,        arch: arm64  }
+  - { recipe: llvm-wasm,  version: '22-emsdk6.0.8', os: windows-2025,    arch: x86_64 }
   # llvm-wheel: the wheel-building toolchain (static-only, assertions
   # off; see the recipe). Linux cells build inside the per-arch manylinux
   # container for the glibc 2.28 floor; macOS cells build at deployment
