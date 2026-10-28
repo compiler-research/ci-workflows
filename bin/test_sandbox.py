@@ -132,8 +132,12 @@ class DevshellRunTest(unittest.TestCase):
                 ["base_dir"], manifest, volume_name=None,
                 work_host_bind=Path("/hc/cells/x"), host_cache=Path("/hc"),
                 patches_out=Path("/Users/me/src/clad"),
-                docker_platform="linux/amd64")
+                docker_platform="linux/amd64", cell_id="x")
         argv = run.call_args[0][0]
+        # repro-config's banner and out-of-tree scripts read the cell
+        # out of this variable; it must stay the bare cell id, not the
+        # container name.
+        self.assertIn("DEVSHELL_CELL=x", argv)
         ws = "/home/runner/work/ci-workflows/ci-workflows"
         mounts = [argv[i + 1] for i, a in enumerate(argv) if a == "-v"]
         self.assertEqual(mounts, [
