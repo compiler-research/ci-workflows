@@ -20,6 +20,13 @@ workflows are read instead: every setup-llvm /
 setup-recipe call is evaluated against every matrix row (bin/cells.py),
 and the cells a dev container can serve are offered, plainest first.
 
+A repository whose CI does not use ci-workflows at all -- a website,
+a paper, a tool's docs -- has nothing to read, so it gets its own
+option, and the toolchain is picked from every cell a dev container
+can serve:
+
+    ./bin/start --any-repo compiler-research/compiler-research.github.io
+
 Why a second entry point rather than a `bin/repro` flag: repro's
 audience already knows what a matrix row is and why they want to
 reproduce one. This one's audience has been handed a link by a
@@ -614,6 +621,8 @@ def start_checkout(repro, base: str, catalog: List[Dict[str, str]],
               f"ci-workflows: no action or workflow of ours is referenced "
               f"under .github/, so there is no cached toolchain to set "
               f"up.")
+        print(f"  bin/start --any-repo {checkout} opens it with a "
+              f"toolchain you pick.")
         return None
     usable, unusable = repo_cells(repro, checkout, catalog)
     statuses = [cell_status(repro, base, coord, catalog)
@@ -633,6 +642,42 @@ def start_checkout(repro, base: str, catalog: List[Dict[str, str]],
         return QUIT
     coord = dict(usable[index][0])
     return {"name": name, "repo": str(checkout)}, coord
+
+
+def _any_repo_order(coord: Dict[str, str]) -> Tuple[int, ...]:
+    """cells.plainest_first, then a purely numeric version before
+    one that is not ('23' before '23.1.0-rc2'): offered with no CI row
+    to go by, the newest final release is the safest default."""
+    return cells.plainest_first(coord, 0) + (
+        int(not coord["version"].isdigit()),)
+
+
+def start_any_checkout(repro, base: str, catalog: List[Dict[str, str]],
+                       checkout: Path
+                       ) -> Optional[Tuple[Dict[str, str], Dict[str, str]]]:
+    """Pick a cell for a checkout whose CI need not use ci-workflows.
+
+    Same returns as start_checkout. The checkout's workflows are not
+    read: the user chooses from every published cell a dev container
+    can serve.
+    """
+    name = checkout.name
+    offer = sorted((c for c in catalog if _devshell_servable(repro, c)),
+                   key=_any_repo_order)
+    if not offer:
+        print("  no published cell can be opened in a dev container")
+        return None
+    print(f"  {name} ({checkout}): its CI is not read; pick the toolchain "
+          f"the container should have.")
+    print()
+    for i, coord in enumerate(offer, start=1):
+        print(f"  {i:>2}  {coord_str(coord)}")
+        print(f"      {cell_status(repro, base, coord, catalog)}")
+    print()
+    index = select(len(offer), "a toolchain", default=0)
+    if index is None:
+        return QUIT
+    return {"name": name, "repo": str(checkout)}, dict(offer[index])
 
 
 # ------------------------------------------------------------------ main
@@ -685,13 +730,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--list", action="store_true",
         help="print the catalog with cell status and exit (no prompts)",
     )
-    parser.add_argument(
+    which = parser.add_mutually_exclusive_group()
+    which.add_argument(
         "--repo", metavar="REPO",
         help="use this repository instead of the catalog: a path, a clone "
              "URL, or GitHub owner/repo (e.g. yourname/clad). Its "
              "workflows must use ci-workflows",
     )
+    which.add_argument(
+        "--any-repo", metavar="REPO",
+        help="like --repo, for a repository whose CI does not use "
+             "ci-workflows (e.g. compiler-research/"
+             "compiler-research.github.io): its workflows are not read, "
+             "and the toolchain is picked from every published cell",
+    )
     args = parser.parse_args(argv)
+    if args.list and args.any_repo:
+        parser.error("--list does not take --any-repo: the cells it "
+                     "offers are the catalog's, which --list prints")
 
     projects = load_projects()
     if not projects:
@@ -736,11 +792,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     base = cache_io.resolve_cache_base()
     catalog = repro.published_cells()
 
-    if args.repo:
-        checkout = custom_checkout(args.repo)
+    if args.repo or args.any_repo:
+        checkout = custom_checkout(args.repo or args.any_repo)
         if checkout is None:
             return 1
-        return _launch_checkout(repro, base, catalog, checkout)
+        return _launch_checkout(
+            repro, base, catalog, checkout,
+            pick=start_any_checkout if args.any_repo else start_checkout)
 
     detected = detect_project(repro, projects)
     here = _git_toplevel(Path.cwd())
@@ -801,9 +859,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 def _launch_checkout(repro, base: str, catalog: List[Dict[str, str]],
-                     checkout: Path) -> int:
-    """--repo / `o` / an uncatalogued cwd: scan, pick a cell, launch."""
-    picked = start_checkout(repro, base, catalog, checkout)
+                     checkout: Path, pick=start_checkout) -> int:
+    """--repo / --any-repo / `o` / an uncatalogued cwd: pick a cell
+    (start_checkout scans the workflows; start_any_checkout does not),
+    launch."""
+    picked = pick(repro, base, catalog, checkout)
     if picked is None:
         return 1
     if picked is QUIT:
