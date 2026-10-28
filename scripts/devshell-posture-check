@@ -72,6 +72,10 @@ if [[ -d "${DEVSHELL_CACHE_MOUNT:-/nonexistent}" ]]; then
   check "this project's AI memory writable" 'probe "$mem"'
   check "no other project's AI memory" \
     '[ "$(ls -A "$c/ai/memory")" = "${DEVSHELL_AI_REPO:-default}" ] && [ "$(ls -A "$c/ai/memory/${DEVSHELL_AI_REPO:-default}")" = "${DEVSHELL_AI_REPO_ENCODED:--patches}" ]'
+  tr="$c/ai/transcripts/${DEVSHELL_AI_REPO:-default}/${DEVSHELL_AI_REPO_ENCODED:--patches}"
+  check "this project's AI transcripts writable" 'probe "$tr"'
+  check "no other project's AI transcripts" \
+    '[ "$(ls -A "$c/ai/transcripts")" = "${DEVSHELL_AI_REPO:-default}" ] && [ "$(ls -A "$c/ai/transcripts/${DEVSHELL_AI_REPO:-default}")" = "${DEVSHELL_AI_REPO_ENCODED:--patches}" ]'
 fi
 
 echo
