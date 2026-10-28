@@ -44,6 +44,15 @@ cd ~/src/my-fork && ~/src/ci-workflows/bin/start
 It reads the repository's own workflows, lists the toolchains its CI
 rows pull, and offers the plainest one first.
 
+A repository whose CI does not use ci-workflows -- the
+compiler-research website, say -- has no rows to read. Name it with
+`--any-repo` instead, and pick the toolchain from every cell a dev
+container can serve:
+
+```bash
+./bin/start --any-repo compiler-research/compiler-research.github.io
+```
+
 `./bin/start --list` prints the catalog without prompting
 (`--list --repo <path>` does the same for a checkout). See
 [Onboarding a contributor](docs/developer-guide.md#onboarding-a-contributor-binstart)
