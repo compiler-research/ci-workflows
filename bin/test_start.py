@@ -658,6 +658,72 @@ class AnyRepositoryTest(unittest.TestCase):
             cell, start.cells.load_catalog()))
 
 
+class AnyRepoOptionTest(unittest.TestCase):
+    """--any-repo: a repository whose CI does not use ci-workflows, the
+    compiler-research website as the example."""
+
+    def test_any_servable_cell_is_offered_and_its_ci_is_not_read(self):
+        with mock.patch("builtins.input", side_effect=[""]), \
+                mock.patch.object(start, "_asset_size", return_value=None), \
+                mock.patch.object(start.cells, "scan",
+                                  side_effect=AssertionError("no scan")), \
+                redirect_stdout(io.StringIO()) as out:
+            got = start.start_any_checkout(_fake_repro(), "file:///x", _CELLS,
+                                           _checkout(ci=None))
+        project, coord = got
+        self.assertEqual(coord, _CELLS[0])  # llvm-release before asan
+        self.assertEqual(project["name"], "clad")
+        text = out.getvalue()
+        self.assertIn("llvm-asan/23/ubuntu-24.04/x86_64", text)
+        self.assertNotIn("macos-26", text)  # no dev container for it
+        self.assertEqual(text.count("not published yet"), 2)
+
+    def test_a_release_candidate_comes_after_its_release(self):
+        rc = dict(_CELLS[0], version="23.1.0-rc2")
+        final = dict(_CELLS[0], version="23")
+        with mock.patch("builtins.input", side_effect=[""]), \
+                mock.patch.object(start, "_asset_size", return_value=None), \
+                redirect_stdout(io.StringIO()):
+            _project, coord = start.start_any_checkout(
+                _fake_repro(), "file:///x", [rc, final], _checkout(ci=None))
+        self.assertEqual(coord, final)
+
+    def test_quit_at_the_toolchain_prompt(self):
+        with mock.patch("builtins.input", side_effect=["q"]), \
+                redirect_stdout(io.StringIO()):
+            got = start.start_any_checkout(_fake_repro(), "file:///x",
+                                           _CELLS, _checkout(ci=None))
+        self.assertIs(got, start.QUIT)
+
+    def test_repo_refusal_points_at_any_repo(self):
+        with redirect_stdout(io.StringIO()) as out:
+            start.start_checkout(_fake_repro(), "file:///x", _CELLS,
+                                 _checkout(ci=None))
+        self.assertIn("--any-repo", out.getvalue())
+
+    def test_main_launches_the_picked_cell(self):
+        co = _checkout(ci=None)
+        repro = _fake_repro()
+        repro.published_cells = mock.Mock(return_value=_CELLS)
+        with mock.patch.object(start, "preflight", return_value=True), \
+                mock.patch.object(start, "_load_repro", return_value=repro), \
+                mock.patch.object(start, "_asset_size", return_value=None), \
+                mock.patch("builtins.input", side_effect=["2"]), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(start.main(["--any-repo", str(co)]), 0)
+        ns = repro.cmd_devshell.call_args[0][0]
+        self.assertEqual(ns.matrix,
+                         ["name:llvm-asan/23/ubuntu-24.04/x86_64"])
+        self.assertEqual(ns.devshell_patches_out, str(co))
+
+    def test_repo_and_any_repo_are_exclusive(self):
+        for argv in (["--repo", "a/b", "--any-repo", "c/d"],
+                     ["--list", "--any-repo", "c/d"]):
+            with self.assertRaises(SystemExit), \
+                    redirect_stderr(io.StringIO()):
+                start.main(argv)
+
+
 class InterruptTest(unittest.TestCase):
     def test_ctrl_c_at_the_menu_exits_quietly(self):
         with mock.patch.object(start, "preflight", return_value=True), \
