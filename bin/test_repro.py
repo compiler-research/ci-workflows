@@ -1791,7 +1791,7 @@ class DevshellContainerNamingTests(unittest.TestCase):
         with mock.patch.object(self.repro, "_devshell_container_exists",
                                side_effect=lambda n: n == "devshell-c"), \
              mock.patch.object(self.repro, "_devshell_container_binds",
-                               return_value={"/patches": "/src/clad"}), \
+                               return_value={"/patches": str(Path("/src/clad"))}), \
              mock.patch.object(self.repro.sandbox, "rm") as rm, \
              redirect_stderr(io.StringIO()):
             self.repro._devshell_remove_legacy_container(
@@ -1804,7 +1804,7 @@ class DevshellContainerNamingTests(unittest.TestCase):
         with mock.patch.object(self.repro, "_devshell_container_exists",
                                side_effect=lambda n: n == "devshell-c"), \
              mock.patch.object(self.repro, "_devshell_container_binds",
-                               return_value={"/patches": "/src/llvm-23"}), \
+                               return_value={"/patches": str(Path("/src/llvm-23"))}), \
              mock.patch.object(self.repro.sandbox, "rm") as rm:
             self.repro._devshell_remove_legacy_container(
                 "c", Path("/src/clad"))
