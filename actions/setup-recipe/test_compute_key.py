@@ -332,3 +332,28 @@ class BootstrapTests(unittest.TestCase):
                     "dep", "22", "ubuntu-24.04", "x86_64",
                     recipe_root=str(recipes), lib_root=str(d / "lib"))
 
+
+
+class PatchGlobTests(unittest.TestCase):
+    """A cell is keyed on the patches it applies, not on every patch.
+
+    #155 added a clang 23 patch to llvm-wasm and moved the key of every
+    llvm-wasm cell, the 22 ones included.
+    """
+
+    def test_only_the_selected_patches_move_the_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            _make_recipe(Path(d), "r",
+                         yaml="recipe: r\npatches:\n  glob: 'p{major}-*'\n",
+                         patches={"p22-1": "a"})
+            patches = Path(d) / "r" / "patches"
+
+            def key():
+                return compute_key.compute_key(
+                    "r", "22-emsdk6.0.8", "ubuntu-24.04", "x86_64", d)
+
+            before = key()
+            (patches / "p23-1").write_text("b")
+            self.assertEqual(before, key())
+            (patches / "p22-2").write_text("c")
+            self.assertNotEqual(before, key())

@@ -13,7 +13,8 @@ suitable for appending to $GITHUB_OUTPUT.
 Hash inputs that *should* invalidate when changed:
   - recipe.yaml  (declarative metadata)
   - build.sh or build.py  (imperative build; whichever exists)
-  - patches/**   (any local patches applied to the source)
+  - patches/**   (the local patches applied to the source: all of them,
+    or those recipe.yaml's `patches: glob:` selects for the version)
   - actions/lib/**.py  (shared build helpers — install-distribution
     component list, smoke checks. Reshape these and the published
     artifact reshapes too; the key must move so old cells stop
@@ -41,6 +42,7 @@ import sys
 from pathlib import Path
 
 import bootstrap_block
+import recipe_patches
 from typing import Optional
 
 
@@ -109,18 +111,13 @@ def compute_key(recipe: str, version: str, os_: str, arch: str,
     parts.append(_file_hash(recipe_dir / "recipe.yaml") + "\n")
     parts.append(_file_hash(_build_script(recipe_dir)) + "\n")
 
+    # Only the patches this version applies: one added for another major
+    # must not republish this cell. relpath with `./` prefix and forward
+    # slashes matches `find . -type f` output under LC_ALL=C sort.
     patches_dir = recipe_dir / "patches"
-    if patches_dir.is_dir():
-        # relpath with `./` prefix and forward slashes matches
-        # `find . -type f` output under LC_ALL=C sort.
-        rel_files = []
-        for p in patches_dir.rglob("*"):
-            if p.is_file():
-                rel = "./" + p.relative_to(patches_dir).as_posix()
-                rel_files.append((rel, p))
-        rel_files.sort(key=lambda x: x[0])
-        for rel, path in rel_files:
-            parts.append(f"{rel} {_file_hash(path)}\n")
+    for path in recipe_patches.selected_patches(recipe_dir, version):
+        rel = "./" + path.relative_to(patches_dir).as_posix()
+        parts.append(f"{rel} {_file_hash(path)}\n")
 
     parts.extend(_lib_hash_lines(Path(lib_root)))
 

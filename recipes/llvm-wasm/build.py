@@ -32,7 +32,6 @@ Outputs (env, written to GITHUB_ENV when present):
 
 from __future__ import annotations
 
-import glob
 import os
 import re
 import subprocess
@@ -41,8 +40,11 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR / ".." / ".." / "actions" / "lib"))
+# compute_key hashes the patches this build applies; one selection for both.
+sys.path.insert(0, str(SCRIPT_DIR / ".." / ".." / "actions" / "setup-recipe"))
 
 import llvm_build  # noqa: E402
+import recipe_patches  # noqa: E402
 
 
 # Wasm cmake flags. List form is what record_cmake_args expects.
@@ -179,21 +181,21 @@ def em_tool(emsdk_dir: Path, tool: str) -> list[str]:
 
 
 def apply_patches(repo: Path, version: str) -> None:
-    """Apply patches/emscripten-clang{version}-*.patch in lexical order.
+    """Apply the patches recipe.yaml selects for `version`, in lexical order.
 
     No-op when the major has no matching patches (LLVM 19 today). Skip
     is a notice, not an error -- adding a new major without patches is
     a valid state.
     """
-    pattern = str(SCRIPT_DIR / "patches" / f"emscripten-clang{version}-*.patch")
-    patches = sorted(glob.glob(pattern))
+    patches = recipe_patches.selected_patches(SCRIPT_DIR, version)
     if not patches:
-        print(f"build.py: no patches matched {pattern}; "
+        print(f"build.py: no patches selected for {version}; "
               "proceeding without -- valid if the major needs none.",
               file=sys.stderr)
         return
     for patch in patches:
-        subprocess.run(["git", "apply", "-v", patch], check=True, cwd=repo)
+        subprocess.run(["git", "apply", "-v", str(patch)], check=True,
+                       cwd=repo)
 
 
 def run_in_emsdk(tool: str, args: list[str], emsdk_dir: Path, cwd: Path,
