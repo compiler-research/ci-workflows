@@ -111,6 +111,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import os
 import platform
 import re
@@ -191,8 +192,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "automated smoke tests; the interactive shell is "
                         "the default when this flag is omitted.")
     p.add_argument("--devshell-rm", action="store_true",
-                   help="with --devshell: remove the persistent container "
-                        "and exit. Named volumes are kept (use "
+                   help="with --devshell: remove this checkout's container "
+                        "for the cell and exit; other checkouts' containers "
+                        "are untouched. Named volumes are kept (use "
                         "`docker volume rm devshell-<cell>` to reclaim).")
     # Deliberately store_true rather than nargs="?" with an optional
     # DIR: argparse binds an optional's nargs="?" value greedily, so
@@ -1392,12 +1394,55 @@ def _devshell_workspace(manifest: Dict) -> str:
     return DEVSHELL_RUNNER_WORKSPACE
 
 
-def _devshell_container_name(cell_id: str) -> str:
-    return f"devshell-{cell_id}"
+def _devshell_workdir_tag(patches_out: PurePath) -> str:
+    """Name-safe tag for the checkout a devshell serves: its basename,
+    sanitized to docker's name alphabet, plus a digest of the full path
+    so two checkouts with the same basename still get distinct tags."""
+    digest = hashlib.sha256(
+        patches_out.as_posix().encode("utf-8")).hexdigest()[:8]
+    base = re.sub(r"[^A-Za-z0-9_.-]", "-", patches_out.name) or "root"
+    return f"{base}-{digest}"
+
+
+def _devshell_container_name(cell_id: str, patches_out: PurePath) -> str:
+    """devshell-<cell>-<checkout tag>.
+
+    The checkout is part of the name: the same cell opened from two
+    directories is two containers. With one name per cell, a second
+    checkout found the first one's container, saw its /patches bind as
+    stale, and `docker rm -f`ed a live session -- and picking a
+    different project did not help, because projects share cells (clad
+    and llvm-23 resolve to the same one).
+    """
+    return f"devshell-{cell_id}-{_devshell_workdir_tag(patches_out)}"
 
 
 def _devshell_volume_name(cell_id: str) -> str:
+    # Per cell, not per checkout: the volume holds the recipe's
+    # workspace (toolchain, source, ccache), which checkouts share.
     return f"devshell-{cell_id}"
+
+
+def _devshell_remove_legacy_container(cell_id: str,
+                                      patches_out: Path) -> None:
+    """Remove this checkout's pre-tag container, if one is left.
+
+    Containers used to be named devshell-<cell> alone. A leftover one
+    whose /patches bind is this run's checkout would linger unused next
+    to the tagged container this run makes; re-creating is cheap (every
+    durable byte lives in the volume, the host cache, or the image).
+    One bound elsewhere belongs to another checkout -- leave it
+    running. Transitional: drop once pre-tag containers have aged out.
+    """
+    legacy = f"devshell-{cell_id}"
+    if not _devshell_container_exists(legacy):
+        return
+    if _devshell_container_binds(legacy).get(DEVSHELL_PATCHES_MOUNT) \
+            != str(patches_out):
+        return
+    _log(f"repro: removing container {legacy}, created before container "
+         f"names carried the checkout")
+    sandbox.rm(legacy)
 
 
 _devshell_container_running = sandbox.container_running
@@ -1660,7 +1705,8 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
                                work_host_bind: Optional[Path],
                                host_cache: Optional[Path],
                                patches_out: Path,
-                               docker_platform: str) -> None:
+                               docker_platform: str,
+                               cell_id: str = "") -> None:
     """Idempotently start the devshell container.
 
     `volume_name` and `work_host_bind` are mutually exclusive: the
@@ -1685,11 +1731,12 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
     if _devshell_container_exists(name):
         # Mounts are fixed at creation: docker cannot remount a
         # container that already exists. So a container left over from
-        # an invocation with a different --devshell-host-cache, a
-        # different $PWD, or an older cache layout keeps pointing at
-        # the paths it was born with -- while this run provisions the
-        # ones it just computed. The tree the shell sees would then
-        # silently not be the tree repro just fetched into.
+        # an invocation with a different --devshell-host-cache or an
+        # older cache layout keeps pointing at the paths it was born
+        # with -- while this run provisions the ones it just computed.
+        # The tree the shell sees would then silently not be the tree
+        # repro just fetched into. (A different checkout is a different
+        # container name, so it never reaches this comparison.)
         #
         # Re-creating is cheap and safe: every durable byte lives in
         # the named volume, the host cache, or the image. HOME is in
@@ -1755,8 +1802,7 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
         ("DEVSHELL_DEV_GID", f"{gid}"),
         ("DEVSHELL_PATCHES_MOUNT", f"{DEVSHELL_PATCHES_MOUNT}"),
         ("DEVSHELL_AI_REPO", f"{repo}"),
-        ("DEVSHELL_CELL", name[len("devshell-"):]
-                          if name.startswith("devshell-") else name),
+        ("DEVSHELL_CELL", cell_id or name),
         # For the apt wrappers repro-config installs: how a package gets
         # into this container from the host.
         ("DEVSHELL_CONTAINER", name),
@@ -1873,9 +1919,11 @@ def cmd_devshell(args: argparse.Namespace) -> int:
     base = cache_io.resolve_cache_base()
 
     cell_id = "-".join(coord[k] for k in ("recipe", "version", "os", "arch"))
-    name = _devshell_container_name(cell_id)
+    patches_out = _devshell_resolve_patches_out(args)
+    name = _devshell_container_name(cell_id, patches_out)
     volume = _devshell_volume_name(cell_id)
     host_cache = _devshell_resolve_host_cache(args)
+    _devshell_remove_legacy_container(cell_id, patches_out)
 
     if args.devshell_rm:
         if _devshell_container_exists(name):
@@ -1889,8 +1937,6 @@ def cmd_devshell(args: argparse.Namespace) -> int:
         if host_cache is not None:
             _log(f"repro: host cache {host_cache} preserved")
         return 0
-
-    patches_out = _devshell_resolve_patches_out(args)
 
     using_host_cache = host_cache is not None
     update_in_container = False
@@ -1956,6 +2002,7 @@ def cmd_devshell(args: argparse.Namespace) -> int:
         host_cache=host_cache,
         patches_out=patches_out,
         docker_platform=docker_platform,
+        cell_id=cell_id,
     )
     _devshell_run_config(
         name, ws, before_config=(

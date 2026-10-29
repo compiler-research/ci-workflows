@@ -1753,6 +1753,100 @@ class DevshellRestrictionsTests(unittest.TestCase):
                       [(m.target, m.readonly) for m in mounts])
 
 
+class DevshellContainerNamingTests(unittest.TestCase):
+    """The container name carries the checkout: the same cell opened
+    from two directories is two containers, and opening the second one
+    can no longer `docker rm -f` the first one's live session."""
+
+    def setUp(self):
+        self.repro = _load_repro()
+
+    def test_same_cell_two_checkouts_two_names(self):
+        n = self.repro._devshell_container_name
+        cell = "llvm-release-23-ubuntu-24.04-x86_64"
+        a = n(cell, Path("/src/clad"))
+        b = n(cell, Path("/src/llvm-23"))
+        self.assertNotEqual(a, b)
+        # Deterministic: re-entry from the same checkout finds the
+        # container it made last time.
+        self.assertEqual(a, n(cell, Path("/src/clad")))
+
+    def test_same_basename_different_path_still_distinct(self):
+        n = self.repro._devshell_container_name
+        self.assertNotEqual(n("c", Path("/a/clad")), n("c", Path("/b/clad")))
+
+    def test_name_fits_dockers_alphabet(self):
+        name = self.repro._devshell_container_name(
+            "llvm-release-23-ubuntu-24.04-x86_64",
+            Path("/src/weird dir (x)"))
+        self.assertRegex(name, r"^[a-zA-Z0-9][a-zA-Z0-9_.-]+$")
+
+    def test_volume_stays_per_cell(self):
+        # The workspace volume (toolchain, source, ccache) is the
+        # recipe's, shared across checkouts of the same cell.
+        self.assertEqual(self.repro._devshell_volume_name("c"),
+                         "devshell-c")
+
+    def test_legacy_container_of_this_checkout_is_removed(self):
+        with mock.patch.object(self.repro, "_devshell_container_exists",
+                               side_effect=lambda n: n == "devshell-c"), \
+             mock.patch.object(self.repro, "_devshell_container_binds",
+                               return_value={"/patches": str(Path("/src/clad"))}), \
+             mock.patch.object(self.repro.sandbox, "rm") as rm, \
+             redirect_stderr(io.StringIO()):
+            self.repro._devshell_remove_legacy_container(
+                "c", Path("/src/clad"))
+        rm.assert_called_once_with("devshell-c")
+
+    def test_legacy_container_of_another_checkout_is_left_running(self):
+        # The bug this naming scheme fixes: the other checkout's
+        # container must not be removed.
+        with mock.patch.object(self.repro, "_devshell_container_exists",
+                               side_effect=lambda n: n == "devshell-c"), \
+             mock.patch.object(self.repro, "_devshell_container_binds",
+                               return_value={"/patches": str(Path("/src/llvm-23"))}), \
+             mock.patch.object(self.repro.sandbox, "rm") as rm:
+            self.repro._devshell_remove_legacy_container(
+                "c", Path("/src/clad"))
+        rm.assert_not_called()
+
+    def test_legacy_container_with_unreadable_binds_is_left_alone(self):
+        # `docker inspect` lost a race with a dying container: no
+        # binds, so no proof the container is this checkout's.
+        with mock.patch.object(self.repro, "_devshell_container_exists",
+                               side_effect=lambda n: n == "devshell-c"), \
+             mock.patch.object(self.repro, "_devshell_container_binds",
+                               return_value={}), \
+             mock.patch.object(self.repro.sandbox, "rm") as rm:
+            self.repro._devshell_remove_legacy_container(
+                "c", Path("/src/clad"))
+        rm.assert_not_called()
+
+    def test_devshell_rm_removes_only_this_checkouts_container(self):
+        # --devshell-rm acts on the container of the checkout it is
+        # run from (or given with --devshell-patches-out), nothing
+        # else.
+        proj = Path(tempfile.mkdtemp())
+        args = self.repro.parse_args(
+            ["--devshell", "--devshell-rm",
+             "--devshell-patches-out", str(proj),
+             "llvm-release/23/ubuntu-24.04/x86_64"])
+        args.matrix = ["name:llvm-release/23/ubuntu-24.04/x86_64"]
+        name = self.repro._devshell_container_name(
+            "llvm-release-23-ubuntu-24.04-x86_64", proj.resolve())
+        removed = []
+        with mock.patch.object(self.repro, "_devshell_container_exists",
+                               side_effect=lambda n: n == name), \
+             mock.patch.object(self.repro.sandbox, "rm",
+                               side_effect=lambda n, **kw: removed.append(n)), \
+             mock.patch.object(self.repro, "_devshell_volume_exists",
+                               return_value=False), \
+             redirect_stderr(io.StringIO()):
+            rc = self.repro.cmd_devshell(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(removed, [name])
+
+
 class DevshellInstallTests(unittest.TestCase):
     """Packages get into a sudo-less devshell from the host."""
 

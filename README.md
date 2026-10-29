@@ -215,7 +215,10 @@ ccache and source live in a per-cell docker volume `devshell-<cell-id>`
 `--devshell-host-cache`, on the host under
 `~/.cache/ci-workflows/devshell-cache/cells/<cell-id>/`, where they
 survive `docker volume rm` ([storage model](docs/developer-guide.md#storage-model--hermetic-by-default)).
-The container has the same name and persists across invocations.
+The container's name adds a tag for the checkout it serves
+(`devshell-<cell-id>-<dir>-<hash>`), so each checkout gets its own
+container, persistent across invocations; two checkouts opened on the
+same cell run side by side instead of fighting over one name.
 Common knobs:
 
 | flag | effect |
