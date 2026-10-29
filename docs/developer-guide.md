@@ -588,8 +588,9 @@ The host sees only these paths from the running container:
 2. **Parts of `<host-cache>`.** Opt-in via `--devshell-host-cache`:
    the cell's working data as the workspace, and the AI tooling under
    `/cache` -- skills and settings read-only, and only this project's
-   memory directory read-write. Nothing else of the host cache is
-   mounted: not other cells, not other projects' memory, and not
+   memory and session transcript directories read-write. Nothing else
+   of the host cache is mounted: not other cells, not other projects'
+   memory or transcripts, and not
    `manifests/`, the copies the host itself acts on. Layout:
 
    ```
@@ -604,6 +605,8 @@ The host sees only these paths from the running container:
        skills/                              -> /cache/ai/skills (ro; ~/.claude/skills symlink)
        settings.json                        -> /cache/ai/settings.json (ro; ~/.claude/settings.json)
        memory/<repo>/<encoded-host-path>/   -> the same path under /cache (rw; ~/.claude/projects/-patches/memory)
+       transcripts/<repo>/<encoded-host-path>/
+                                            -> the same path under /cache (rw; its -patches/ is ~/.claude/projects/-patches)
    ```
 
    bin/repro refuses to bind a path with a symlink in it below the host
@@ -702,7 +705,7 @@ matrix-row name or `recipe/version/os/arch` coord, and
 ```bash
 # --- one-time host setup ------------------------------------------------
 # Seed the host cache with your existing AI tooling. The container
-# symlinks ~/.claude/{skills,settings.json,projects/-patches/memory}
+# symlinks ~/.claude/{skills,settings.json,projects/-patches{,/memory}}
 # into this tree, so anything you put here is what the AI sees.
 HOST_CACHE=~/.cache/ci-workflows/devshell-cache
 mkdir -p "$HOST_CACHE/ai/skills" "$HOST_CACHE/ai/memory"
@@ -732,6 +735,16 @@ What this gets you:
 - `ai/memory/<repo>/<encoded-path>/` accumulates your AI's per-project
   knowledge on the host. It survives image rebuilds, machine moves,
   and `docker volume rm`. Treat it as part of your dotfiles.
+- `ai/transcripts/<repo>/<encoded-path>/` keeps the AI's session
+  transcripts, so `claude --resume` still finds a session after the
+  container is re-created. Only sessions started in `/patches`, the
+  workspace or `$HOME` are kept there (memory is linked for the same
+  three); one started in a subdirectory, say `/patches/src`, is
+  written to the container and goes with it. They hold everything a
+  session saw --
+  command output, file contents, anything printed -- so treat them
+  like shell history: private, and not something to copy into a host
+  `~/.claude`, where a host session would trust them.
 - `ai/skills/` and `ai/settings.json` are the AI's personality. Curate
   them on the host; the container picks them up via symlink and stays
   hermetic.

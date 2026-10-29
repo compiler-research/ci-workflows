@@ -10,7 +10,8 @@
 #   DEVSHELL_PATCHES_MOUNT               /patches (the $PWD bind)
 #   DEVSHELL_CACHE_MOUNT                 /cache (only set when bound)
 #   DEVSHELL_BUILD                       drives workspace chown target
-#   DEVSHELL_AI_REPO / *_ENCODED         host project key for memory dir
+#   DEVSHELL_AI_REPO / *_ENCODED         host project key for memory and
+#                                        transcripts dirs
 
 set -e
 
@@ -19,6 +20,62 @@ dev_gid="${DEVSHELL_DEV_GID:-1000}"
 dev_home="${DEVSHELL_DEV_HOME:-/home/dev}"
 patches="${DEVSHELL_PATCHES_MOUNT:-/patches}"
 cache="${DEVSHELL_CACHE_MOUNT:-/cache}"
+
+# Host-cache bind, if any. Symlink claude's lookup paths into /cache
+# so the AI picks up host-curated state without any other host bind.
+# Memory is symlinked at every plausible session cwd (claude derives
+# its project key from `getcwd()` at startup): /patches, $ws, and
+# $HOME -- otherwise the link is silently inert when the user launches
+# from a different directory.
+link_ai_state() {
+  [[ -d "${DEVSHELL_CACHE_MOUNT:-/cache}" ]] || return 0
+  local cache repo encoded mem_dir tr_dir claude_root cwd enc link d
+  cache="${DEVSHELL_CACHE_MOUNT:-/cache}"
+  # bin/repro binds pieces of the host cache, not all of it: skills
+  # (and settings.json) read-only, and this project's memory and
+  # session transcript directories. Create only what is missing -- the
+  # mount points exist, and chown on a read-only one would abort this
+  # script.
+  repo="${DEVSHELL_AI_REPO:-default}"
+  encoded="${DEVSHELL_AI_REPO_ENCODED:--patches}"
+  mem_dir="$cache/ai/memory/$repo/$encoded"
+  tr_dir="$cache/ai/transcripts/$repo/$encoded"
+  for d in "$cache/ai" "$cache/ai/skills" "$cache/ai/memory" "$mem_dir" \
+           "$cache/ai/transcripts" "$tr_dir"; do
+    [[ -d "$d" ]] || install -d -o "$dev_uid" -g "$dev_gid" "$d"
+  done
+
+  claude_root="$dev_home/.claude"
+  install -d -o "$dev_uid" -g "$dev_gid" \
+    "$claude_root" "$claude_root/projects"
+  ln -sfn "$cache/ai/skills" "$claude_root/skills"
+  if [[ -f "$cache/ai/settings.json" ]]; then
+    ln -sfn "$cache/ai/settings.json" "$claude_root/settings.json"
+  fi
+  # The project dir itself (claude writes each session's transcript
+  # there) lives in the host cache, so `claude --resume` survives the
+  # container being re-created.
+  for cwd in "${DEVSHELL_PATCHES_MOUNT:-/patches}" "$ws" "$dev_home"; do
+    [[ -z "$cwd" ]] && continue
+    enc="${cwd//\//-}"
+    link="$claude_root/projects/$enc"
+    install -d -o "$dev_uid" -g "$dev_gid" "$tr_dir/$enc"
+    ln -sfn "$tr_dir/$enc" "$link"
+    ln -sfn "$mem_dir" "$tr_dir/$enc/memory"
+    chown -h "$dev_uid:$dev_gid" "$link" "$tr_dir/$enc/memory"
+  done
+  chown -h "$dev_uid:$dev_gid" \
+    "$claude_root/skills" "$claude_root/settings.json" 2>/dev/null || true
+}
+
+# `devshell-init --link-ai` lays down only those links, as
+# the calling user: what a test can run without a container.
+if [[ "${1:-}" == "--link-ai" ]]; then
+  dev_uid="$(id -u)"; dev_gid="$(id -g)"
+  ws="${DEVSHELL_BUILD:+${DEVSHELL_BUILD%/_recipe_work*}}"
+  link_ai_state
+  exit 0
+fi
 
 # `devshell-init --verify` runs assertions about the post-init state
 # instead of re-running init. Catches regressions in this script
@@ -47,6 +104,8 @@ if [[ "${1:-}" == "--verify" ]]; then
     fi
     check "memory dir under $repo/$encoded" \
       test -d "$cache/ai/memory/$repo/$encoded"
+    check "transcripts dir under $repo/$encoded" \
+      test -d "$cache/ai/transcripts/$repo/$encoded"
     # Three encoded cwd keys must all resolve; init lays them down
     # in one loop so a regression would silently break some-but-
     # not-all and leave the AI mute depending on launch dir.
@@ -56,6 +115,9 @@ if [[ "${1:-}" == "--verify" ]]; then
       enc="${cwd//\//-}"
       check "memory symlink at $enc resolves" \
         test -e "$dev_home/.claude/projects/$enc/memory"
+      check "transcripts of $enc kept in the host cache" \
+        test "$(readlink "$dev_home/.claude/projects/$enc")" = \
+          "$cache/ai/transcripts/$repo/$encoded/$enc"
     done
   fi
   exit "$errs"
@@ -139,41 +201,7 @@ if [[ -n "${DEVSHELL_BUILD:-}" ]]; then
   fi
 fi
 
-# Host-cache bind, if any. Symlink claude's lookup paths into /cache
-# so the AI picks up host-curated state without any other host bind.
-# Memory is symlinked at every plausible session cwd (claude derives
-# its project key from `getcwd()` at startup): /patches, $ws, and
-# $HOME -- otherwise the link is silently inert when the user launches
-# from a different directory.
-if [[ -d "${DEVSHELL_CACHE_MOUNT:-/cache}" ]]; then
-  cache="${DEVSHELL_CACHE_MOUNT:-/cache}"
-  # bin/repro binds pieces of the host cache, not all of it: skills
-  # (and settings.json) read-only, and this project's memory directory.
-  # Create only what is missing -- the mount points exist, and chown on
-  # a read-only one would abort this script.
-  repo="${DEVSHELL_AI_REPO:-default}"
-  encoded="${DEVSHELL_AI_REPO_ENCODED:--patches}"
-  mem_dir="$cache/ai/memory/$repo/$encoded"
-  for d in "$cache/ai" "$cache/ai/skills" "$cache/ai/memory" "$mem_dir"; do
-    [[ -d "$d" ]] || install -d -o "$dev_uid" -g "$dev_gid" "$d"
-  done
-
-  claude_root="$dev_home/.claude"
-  install -d -o "$dev_uid" -g "$dev_gid" \
-    "$claude_root" "$claude_root/projects"
-  ln -sfn "$cache/ai/skills" "$claude_root/skills"
-  if [[ -f "$cache/ai/settings.json" ]]; then
-    ln -sfn "$cache/ai/settings.json" "$claude_root/settings.json"
-  fi
-  for cwd in "${DEVSHELL_PATCHES_MOUNT:-/patches}" "$ws" "$dev_home"; do
-    [[ -z "$cwd" ]] && continue
-    enc="${cwd//\//-}"
-    install -d -o "$dev_uid" -g "$dev_gid" "$claude_root/projects/$enc"
-    ln -sfn "$mem_dir" "$claude_root/projects/$enc/memory"
-  done
-  chown -h "$dev_uid:$dev_gid" \
-    "$claude_root/skills" "$claude_root/settings.json" 2>/dev/null || true
-fi
+link_ai_state
 
 # Forkable AI-CLI installer. repro-config runs this script as a child
 # process rather than sourcing it, so an override reaches us only the

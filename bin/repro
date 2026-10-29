@@ -204,7 +204,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "devshell-cache/ at /cache for persistence and "
                         "AI tooling. Expected layout: "
                         "cells/<cell-id>/{src,build,ccache}, "
-                        "ai/{skills,settings.json,memory/<repo>/<encoded>}. "
+                        "ai/{skills,settings.json,memory/<repo>/<encoded>,"
+                        "transcripts/<repo>/<encoded>}. "
                         "Use --devshell-host-cache-dir to bind a "
                         "different directory.")
     p.add_argument("--devshell-host-cache-dir", metavar="DIR",
@@ -997,7 +998,8 @@ def remove_container(cid: str) -> None:
 
 # Default location for --devshell-host-cache (bare flag). Layout:
 #   cells/<cell-id>/{src,build,ccache}
-#   ai/{skills,settings.json,memory/<repo>/<encoded-path>/}
+#   ai/{skills,settings.json,memory/<repo>/<encoded-path>/,
+#       transcripts/<repo>/<encoded-path>/}
 DEVSHELL_HOST_CACHE_DEFAULT = (
     Path.home() / ".cache" / "ci-workflows" / "devshell-cache"
 )
@@ -1527,11 +1529,14 @@ def _devshell_refuse_symlinks(path: Path, root: Path) -> None:
 
 
 def _devshell_ai_paths(host_cache: Path, patches_out: PurePath
-                       ) -> Tuple[Path, Path, Path]:
-    """(skills, settings.json, this project's memory dir) in the host cache."""
+                       ) -> Tuple[Path, Path, Path, Path]:
+    """(skills, settings.json, this project's memory dir, this project's
+    session transcripts dir) in the host cache."""
     repo, encoded = _devshell_ai_repo_key(patches_out)
     ai = host_cache / "ai"
-    return ai / "skills", ai / "settings.json", ai / "memory" / repo / encoded
+    return (ai / "skills", ai / "settings.json",
+            ai / "memory" / repo / encoded,
+            ai / "transcripts" / repo / encoded)
 
 
 #: Capabilities the container keeps. Everything else is dropped: these
@@ -1612,9 +1617,10 @@ def _devshell_mounts(ws: str, *, volume_name: Optional[str],
 
     The host cache is not mounted whole: the container sees its own
     cell's workspace (work_host_bind), the AI skills and settings
-    read-only, and only this project's AI memory directory read-write.
-    Everything else the host keeps there -- other cells, the manifests
-    the host acts on, other projects' memory -- stays out of reach.
+    read-only, and only this project's AI memory and session transcript
+    directories read-write. Everything else the host keeps there --
+    other cells, the manifests the host acts on, other projects' memory
+    and transcripts -- stays out of reach.
     """
     mounts = [
         sandbox.Mount(volume_name if volume_name is not None
@@ -1630,7 +1636,8 @@ def _devshell_mounts(ws: str, *, volume_name: Optional[str],
                                     f"{DEVSHELL_PATCHES_MOUNT}/.git",
                                     readonly=True))
     if host_cache is not None:
-        skills, settings, memory = _devshell_ai_paths(host_cache, patches_out)
+        skills, settings, memory, transcripts = _devshell_ai_paths(
+            host_cache, patches_out)
         inside = PurePath(DEVSHELL_CACHE_MOUNT)
         rel = lambda p: (inside / p.relative_to(host_cache)).as_posix()  # noqa: E731
         mounts.append(sandbox.Mount(str(skills), rel(skills), readonly=True))
@@ -1638,6 +1645,7 @@ def _devshell_mounts(ws: str, *, volume_name: Optional[str],
             mounts.append(sandbox.Mount(str(settings), rel(settings),
                                         readonly=True))
         mounts.append(sandbox.Mount(str(memory), rel(memory)))
+        mounts.append(sandbox.Mount(str(transcripts), rel(transcripts)))
     return mounts
 
 
@@ -1684,7 +1692,9 @@ def _devshell_ensure_container(args: argparse.Namespace, name: str,
         # silently not be the tree repro just fetched into.
         #
         # Re-creating is cheap and safe: every durable byte lives in
-        # the named volume, the host cache, or the image.
+        # the named volume, the host cache, or the image. HOME is in
+        # the container's own layer and goes with it, which is why the
+        # AI's session transcripts are bound from the host cache.
         actual = _devshell_container_binds(name)
         stale = sorted(d for d, src in desired.items()
                        if actual.get(d) != src)
@@ -1886,8 +1896,9 @@ def cmd_devshell(args: argparse.Namespace) -> int:
     update_in_container = False
     if using_host_cache:
         stage = host_cache / "cells" / cell_id
-        skills, _settings, memory = _devshell_ai_paths(host_cache, patches_out)
-        for d in (stage, skills, memory):
+        skills, _settings, memory, transcripts = _devshell_ai_paths(
+            host_cache, patches_out)
+        for d in (stage, skills, memory, transcripts):
             _devshell_refuse_symlinks(d, host_cache)
             try:
                 d.mkdir(parents=True, exist_ok=True)

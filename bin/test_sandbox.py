@@ -143,6 +143,8 @@ class DevshellRunTest(unittest.TestCase):
             f"{Path('/hc/ai/skills')}:/cache/ai/skills:ro",
             f"{Path('/hc/ai/memory/clad/-Users-me-src-clad')}"
             ":/cache/ai/memory/clad/-Users-me-src-clad",
+            f"{Path('/hc/ai/transcripts/clad/-Users-me-src-clad')}"
+            ":/cache/ai/transcripts/clad/-Users-me-src-clad",
         ])
         self.assertEqual(argv[:7], ["docker", "run", "-d", "--platform",
                                     "linux/amd64", "--name", "devshell-x"])

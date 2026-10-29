@@ -2282,12 +2282,15 @@ class DevshellEnsureContainerArgvTests(unittest.TestCase):
         )
         self.assertIn(f"{bind}:/home/runner/work/x/x", argv)
         # Not the whole host cache: its AI skills read-only and this
-        # project's memory directory, nothing else of it.
+        # project's memory and transcripts directories, nothing else of it.
         self.assertNotIn(f"{cache}:{self.repro.DEVSHELL_CACHE_MOUNT}", argv)
         self.assertIn(f"{cache / 'ai' / 'skills'}:/cache/ai/skills:ro", argv)
         self.assertTrue(any(a.startswith(f"{cache / 'ai' / 'memory'}")
                             and a.endswith(":rw") is False
                             and ":/cache/ai/memory/proj/" in a for a in argv))
+        self.assertTrue(any(a.startswith(f"{cache / 'ai' / 'transcripts'}")
+                            and ":/cache/ai/transcripts/proj/" in a
+                            for a in argv))
         self.assertIn(f"{patches}:{self.repro.DEVSHELL_PATCHES_MOUNT}",
                       argv)
         self.assertFalse(any(a.startswith("devshell-x:") for a in argv))
