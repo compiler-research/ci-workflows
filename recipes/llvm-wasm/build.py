@@ -369,8 +369,10 @@ def main() -> int:
     # and rebuilt most of the tree without EMCC_CFLAGS, shipping objects
     # with no exception handling.
     os.chdir(build)
+    # emsdk_env() copies os.environ, so build it before clearing.
+    env = emsdk_env(emsdk_dir, EMCC_CFLAGS="-fwasm-exceptions")
     os.environ.clear()
-    os.environ.update(emsdk_env(emsdk_dir, EMCC_CFLAGS="-fwasm-exceptions"))
+    os.environ.update(env)
     llvm_build.run_install_distribution(";".join(_wasm_dist_components(build)))
 
     print(f"build.py: done. SRC_COMMIT={src_commit}", flush=True)
