@@ -14,11 +14,11 @@ description: |
   cmake configs (LLVMTargets.cmake uses ${CMAKE_CURRENT_LIST_DIR})
   -- consumers extracting to any path get a working find_package(LLVM).
 
-  Per-LLVM-major patches under patches/ apply by file glob
-  (`emscripten-clang{N}-*.patch`); adding a new major needs no
-  build.py change. Cling+wasm cells are not built today -- a follow-up
-  gates the cling clone + LookupHelper patch + wider target list on a
-  cell-level field.
+  Per-LLVM-major patches under patches/ apply by the glob below
+  (`emscripten-clang{major}-*.patch`); adding a new major needs no
+  build.py change, and leaves the other majors' keys alone. Cling+wasm
+  cells are not built today -- a follow-up gates the cling clone +
+  LookupHelper patch + wider target list on a cell-level field.
 
   Consumer cmake contract:
     -DLLVM_DIR=$LLVM/install/build/lib/cmake/llvm
@@ -26,8 +26,13 @@ description: |
     -DCMAKE_TOOLCHAIN_FILE=$EMSDK/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake
     -DLLVM_NATIVE_TOOL_DIR=$LLVM/install/native_build/bin
 
-# Only fields read by build_manifest.py live here. The cmake invocation,
-# patch glob, and emsdk version pin are authoritative in build.py.
+# Only fields read by build_manifest.py and the patch glob live here. The
+# cmake invocation and emsdk version pin are authoritative in build.py.
 source:
   repo: https://github.com/llvm/llvm-project
   branch_template: release/{version}.x
+
+# The patches a cell applies, and the only ones its key hashes. Read by
+# actions/setup-recipe/recipe_patches.py for both.
+patches:
+  glob: 'emscripten-clang{major}-*.patch'
