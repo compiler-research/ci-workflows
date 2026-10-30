@@ -364,10 +364,17 @@ def main() -> int:
     run_in_emsdk("emmake", ["ninja", "-j", ncpus, *WASM_TARGETS],
                  emsdk_dir, build, EMCC_CFLAGS="-fwasm-exceptions")
 
-    # Install wasm tree. install rules are pure file/cmake-config
-    # operations -- no emcc invocation needed beyond what WASM_TARGETS
-    # already built, so plain ninja (not emmake) is sufficient.
+    # Install wasm tree, in the environment it was built in.
+    # run_install_distribution reconfigures first, and on Windows
+    # emsdk_env() moves the ccache launcher out of the environment: a
+    # reconfigure that saw it again put ccache in front of every compile
+    # and rebuilt most of the tree without EMCC_CFLAGS, shipping objects
+    # with no exception handling.
     os.chdir(build)
+    # emsdk_env() copies os.environ, so build it before clearing.
+    env = emsdk_env(emsdk_dir, EMCC_CFLAGS="-fwasm-exceptions")
+    os.environ.clear()
+    os.environ.update(env)
     llvm_build.run_install_distribution(";".join(_wasm_dist_components(build)))
 
     print(f"build.py: done. SRC_COMMIT={src_commit}", flush=True)
