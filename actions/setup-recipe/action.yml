@@ -173,11 +173,16 @@ runs:
         cd __ci_workflows__
         base="$(python3 actions/lib/cache_io.py resolve-base "${EXPLICIT_BASE}")"
         echo "base=$base" >> "$GITHUB_OUTPUT"
-        if python3 actions/lib/cache_io.py probe "$base" "$KEY"; then
-          echo "hit=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "hit=false" >> "$GITHUB_OUTPUT"
-        fi
+        # A cache that does not answer is not a miss: building on it, or
+        # failing with "no prebuilt", would both be wrong.
+        rc=0
+        python3 actions/setup-recipe/probe.py "$base" "$KEY" || rc=$?
+        case "$rc" in
+          0) echo "hit=true" >> "$GITHUB_OUTPUT" ;;
+          1) echo "hit=false" >> "$GITHUB_OUTPUT" ;;
+          *) echo "::error::the cache at ${base} did not answer for key=${KEY}"
+             exit 1 ;;
+        esac
 
     # The recipe build's own ccache, published beside the install tree under
     # the same key. A consumer that has to compile the recipe's sources again
