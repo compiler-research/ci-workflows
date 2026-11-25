@@ -223,7 +223,7 @@ runs:
         fi
         rm -rf _ccache_dl
         mkdir -p _ccache_dl
-        python3 actions/lib/cache_io.py download "$BASE" "${KEY}.ccache" _ccache_dl
+        python3 actions/setup-recipe/download.py "$BASE" "${KEY}.ccache" _ccache_dl
         dir="${GITHUB_WORKSPACE}/.ccache"
         rm -rf "$dir"
         mv _ccache_dl/.ccache "$dir"
@@ -330,7 +330,7 @@ runs:
         set -euo pipefail
         cd __ci_workflows__
         mkdir -p _llvm_dl
-        python3 actions/lib/cache_io.py download "$BASE" "$KEY" _llvm_dl
+        python3 actions/setup-recipe/download.py "$BASE" "$KEY" _llvm_dl
         # Recipe's tarball root is `install/`; surface at $GITHUB_WORKSPACE.
         # `rm -rf ../install` first so the step is idempotent: a
         # re-run in the same workspace (act with reused containers, or
